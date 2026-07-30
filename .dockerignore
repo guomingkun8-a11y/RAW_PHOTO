@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+data
+legacy
+frontend/node_modules
+frontend/dist
+**/__pycache__
+**/*.pyc

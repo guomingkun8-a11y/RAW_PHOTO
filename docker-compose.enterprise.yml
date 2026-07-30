@@ -1,0 +1,106 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    command: ["mysqld", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-raw_photo}
+      MYSQL_USER: ${MYSQL_USER:-raw_photo}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass '$$REDIS_PASSWORD'"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a '$$REDIS_PASSWORD' ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  schema-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raw-photo:enterprise
+    command: ["uv", "run", "python", "backend/scripts/init_enterprise_schema.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment: &app-environment
+      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:?CHATGPT2API_AUTH_KEY is required}
+      CHATGPT2API_STRICT_SECRET_SOURCES: "true"
+      CHATGPT2API_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
+      MYSQL_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
+      IMAGE_TASK_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
+      IMAGE_TASK_DB_POOL_SIZE: ${IMAGE_TASK_DB_POOL_SIZE:-10}
+      IMAGE_TASK_DB_MAX_OVERFLOW: ${IMAGE_TASK_DB_MAX_OVERFLOW:-20}
+      IMAGE_TASK_QUEUE_ENABLED: "true"
+      IMAGE_TASK_EXECUTOR: celery
+      IMAGE_TASK_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      IMAGE_TASK_TOTAL_CONCURRENCY: ${IMAGE_TASK_TOTAL_CONCURRENCY:-5}
+      IMAGE_TASK_WORKER_CONCURRENCY: ${IMAGE_TASK_WORKER_CONCURRENCY:-5}
+      IMAGE_TASK_OWNER_CONCURRENCY: ${IMAGE_TASK_OWNER_CONCURRENCY:-2}
+      IMAGE_TASK_OWNER_PENDING_LIMIT: ${IMAGE_TASK_OWNER_PENDING_LIMIT:-30}
+      CHATGPT2API_OPENAI_RELAY_ENABLED: ${CHATGPT2API_OPENAI_RELAY_ENABLED:-false}
+      CHATGPT2API_OPENAI_RELAY_BASE_URL: ${CHATGPT2API_OPENAI_RELAY_BASE_URL:-}
+      CHATGPT2API_OPENAI_RELAY_API_KEY: ${CHATGPT2API_OPENAI_RELAY_API_KEY:-}
+      CHATGPT2API_QINIU_ACCESS_KEY: ${CHATGPT2API_QINIU_ACCESS_KEY:?CHATGPT2API_QINIU_ACCESS_KEY is required}
+      CHATGPT2API_QINIU_SECRET_KEY: ${CHATGPT2API_QINIU_SECRET_KEY:?CHATGPT2API_QINIU_SECRET_KEY is required}
+      CHATGPT2API_QINIU_BUCKET: ${CHATGPT2API_QINIU_BUCKET:?CHATGPT2API_QINIU_BUCKET is required}
+      CHATGPT2API_QINIU_DOMAIN: ${CHATGPT2API_QINIU_DOMAIN:?CHATGPT2API_QINIU_DOMAIN is required}
+      CHATGPT2API_QINIU_PREFIX: ${CHATGPT2API_QINIU_PREFIX:-chatgpt2api/reference}
+      CHATGPT2API_QINIU_TASK_PREFIX: ${CHATGPT2API_QINIU_TASK_PREFIX:-chatgpt2api/task-assets}
+      CHATGPT2API_QINIU_UPLOAD_URL: ${CHATGPT2API_QINIU_UPLOAD_URL:-https://upload-z0.qiniup.com}
+      CHATGPT2API_QINIU_REGION: ${CHATGPT2API_QINIU_REGION:-z0}
+      CHATGPT2API_QINIU_PRIVATE: "false"
+      CHATGPT2API_IMAGE_STORAGE_ENABLED: "true"
+      CHATGPT2API_IMAGE_STORAGE_MODE: qiniu
+      CHATGPT2API_IMAGE_STORAGE_PROVIDER: qiniu
+
+  app:
+    image: raw-photo:enterprise
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:80"
+    environment: *app-environment
+    volumes:
+      - ./data:/app/data
+
+  worker:
+    image: raw-photo:enterprise
+    restart: unless-stopped
+    command: ["uv", "run", "python", "worker.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    environment: *app-environment
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  mysql-data:
+  redis-data:

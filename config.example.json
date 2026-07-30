@@ -1,0 +1,121 @@
+{
+  "auth-key": "",
+  "refresh_account_interval_minute": 5,
+  "image_retention_days": 30,
+  "image_poll_timeout_secs": 120,
+  "image_account_concurrency": 3,
+  "image_parallel_generation": true,
+  "image_poll_interval_secs": 10,
+  "image_poll_initial_wait_secs": 10,
+  "auto_remove_rate_limited_accounts": false,
+  "auto_remove_invalid_accounts": false,
+  "auto_relogin_after_refresh": false,
+  "log_levels": ["info", "warning", "error"],
+  "proxy": "",
+  "proxy_runtime": {
+    "enabled": false,
+    "egress_mode": "direct",
+    "proxy_url": "",
+    "resource_proxy_url": "",
+    "skip_ssl_verify": false,
+    "clearance": {
+      "enabled": false,
+      "mode": "none",
+      "cf_cookies": "",
+      "cf_clearance": "",
+      "flaresolverr_url": ""
+    }
+  },
+  "base_url": "",
+  "sensitive_words": [],
+  "global_system_prompt": "",
+  "ai_review": {
+    "enabled": false,
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "fail_open": true
+  },
+  "backup": {
+    "enabled": false,
+    "provider": "cloudflare_r2",
+    "account_id": "",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "bucket": "",
+    "prefix": "backups",
+    "encrypt": false,
+    "passphrase": ""
+  },
+  "image_reference_upload": {
+    "enabled": false,
+    "provider": "qiniu",
+    "qiniu_access_key": "",
+    "qiniu_secret_key": "",
+    "qiniu_bucket": "",
+    "qiniu_domain": "",
+    "qiniu_upload_url": "https://upload-z0.qiniup.com",
+    "qiniu_prefix": "chatgpt2api/reference",
+    "timeout_sec": 20,
+    "persistent_cache_enabled": true
+  },
+  "image_storage": {
+    "enabled": false,
+    "mode": "local",
+    "provider": "webdav",
+    "webdav_url": "",
+    "webdav_username": "",
+    "webdav_password": "",
+    "webdav_root_path": "chatgpt2api/images",
+    "minio_endpoint": "",
+    "minio_access_key": "",
+    "minio_secret_key": "",
+    "minio_bucket": "",
+    "minio_region": "us-east-1",
+    "minio_secure": true,
+    "minio_root_path": "chatgpt2api/images",
+    "qiniu_access_key": "",
+    "qiniu_secret_key": "",
+    "qiniu_bucket": "",
+    "qiniu_domain": "",
+    "qiniu_upload_url": "https://upload-z0.qiniup.com",
+    "qiniu_prefix": "chatgpt2api/task-assets",
+    "qiniu_region": "z0",
+    "qiniu_private": false,
+    "public_base_url": ""
+  },
+  "image_task_queue": {
+    "enabled": false,
+    "executor": "redis",
+    "redis_url": "redis://127.0.0.1:6379/0",
+    "queue_name": "ai_image_tasks",
+    "database_url": "",
+    "max_retries": 2,
+    "worker_poll_timeout_secs": 5,
+    "stale_running_timeout_secs": 1800,
+    "total_concurrency": 5,
+    "worker_concurrency": 5,
+    "owner_concurrency": 3,
+    "owner_pending_limit": 30,
+    "slot_lease_secs": 7200
+  },
+  "third_party_apps": {
+    "infinite_canvas": {
+      "enabled": false,
+      "url": "https://canvas.best"
+    }
+  },
+  "openai_relay": {
+    "enabled": false,
+    "base_url": "",
+    "api_key": "",
+    "api_keys": [],
+    "api_key_concurrency": 1,
+    "api_key_pool_distributed": false,
+    "api_key_pool_acquire_timeout_secs": 5,
+    "api_key_pool_lease_secs": 600,
+    "api_key_pool_cooldown_secs": 60,
+    "api_key_pool_max_attempts": 3,
+    "prompt_analysis_model": "gpt-4o"
+  }
+}
