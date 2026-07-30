@@ -1,18 +1,18 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import base64
 import os
 import unittest
 from unittest import mock
 
-os.environ.setdefault("CHATGPT2API_AUTH_KEY", "chatgpt2api")
+os.environ.setdefault("GMKRAW_AUTH_KEY", "gmkraw")
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
+AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
 PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(b"fake-png").decode("ascii")
 JPEG_DATA_URL = "data:image/jpeg;base64," + base64.b64encode(b"fake-jpeg").decode("ascii")
 

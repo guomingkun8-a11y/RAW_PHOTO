@@ -52,7 +52,7 @@ class SecurityConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
             self._write_config(path)
-            with patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=True):
+            with patch.dict(os.environ, {"GMKRAW_AUTH_KEY": "env-auth"}, clear=True):
                 store = ConfigStore(path)
                 public = store.get()
 
@@ -83,8 +83,8 @@ class SecurityConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             environment = {
-                "CHATGPT2API_AUTH_KEY": "env-auth",
-                "CHATGPT2API_OPENAI_RELAY_API_KEY": "env-relay",
+                "GMKRAW_AUTH_KEY": "env-auth",
+                "GMKRAW_OPENAI_RELAY_API_KEY": "env-relay",
                 "IMAGE_TASK_DATABASE_URL": "mysql+pymysql://user:password@db/test",
             }
             with patch.dict(os.environ, environment, clear=False):
@@ -102,8 +102,8 @@ class SecurityConfigTests(unittest.TestCase):
             path = Path(tmp_dir) / "config.json"
             self._write_config(path)
             environment = {
-                "CHATGPT2API_AUTH_KEY": "env-auth",
-                "CHATGPT2API_STRICT_SECRET_SOURCES": "true",
+                "GMKRAW_AUTH_KEY": "env-auth",
+                "GMKRAW_STRICT_SECRET_SOURCES": "true",
             }
             with patch.dict(os.environ, environment, clear=False):
                 with self.assertRaisesRegex(ValueError, "embedded secrets are not allowed"):

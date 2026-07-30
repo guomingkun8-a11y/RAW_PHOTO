@@ -40,20 +40,20 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_url": "",
     "webdav_username": "",
     "webdav_password": "",
-    "webdav_root_path": "chatgpt2api/images",
+    "webdav_root_path": "gmkraw/images",
     "minio_endpoint": "",
     "minio_access_key": "",
     "minio_secret_key": "",
     "minio_bucket": "",
     "minio_region": "us-east-1",
     "minio_secure": True,
-    "minio_root_path": "chatgpt2api/images",
+    "minio_root_path": "gmkraw/images",
     "qiniu_access_key": "",
     "qiniu_secret_key": "",
     "qiniu_bucket": "",
     "qiniu_domain": "",
     "qiniu_upload_url": "https://upload-z0.qiniup.com",
-    "qiniu_prefix": "chatgpt2api/task-assets",
+    "qiniu_prefix": "gmkraw/task-assets",
     "qiniu_region": "z0",
     "qiniu_private": False,
     "public_base_url": "",
@@ -67,7 +67,7 @@ DEFAULT_IMAGE_REFERENCE_UPLOAD = {
     "qiniu_bucket": "",
     "qiniu_domain": "",
     "qiniu_upload_url": "https://upload-z0.qiniup.com",
-    "qiniu_prefix": "chatgpt2api/reference",
+    "qiniu_prefix": "gmkraw/reference",
     "timeout_sec": 20,
     "persistent_cache_enabled": True,
 }
@@ -188,20 +188,20 @@ def _clear_nested_value(data: dict[str, object], path: tuple[str, ...], replacem
 
 def _strip_environment_managed_secrets(data: dict[str, object]) -> dict[str, object]:
     mappings: tuple[tuple[tuple[str, ...], tuple[str, ...], object], ...] = (
-        (("CHATGPT2API_AUTH_KEY",), ("auth-key",), ""),
-        (("CHATGPT2API_AI_REVIEW_API_KEY",), ("ai_review", "api_key"), ""),
-        (("CHATGPT2API_BACKUP_ACCESS_KEY_ID",), ("backup", "access_key_id"), ""),
-        (("CHATGPT2API_BACKUP_SECRET_ACCESS_KEY",), ("backup", "secret_access_key"), ""),
-        (("CHATGPT2API_BACKUP_PASSPHRASE",), ("backup", "passphrase"), ""),
-        (("CHATGPT2API_QINIU_ACCESS_KEY", "QINIU_ACCESS_KEY"), ("image_reference_upload", "qiniu_access_key"), ""),
-        (("CHATGPT2API_QINIU_SECRET_KEY", "QINIU_SECRET_KEY"), ("image_reference_upload", "qiniu_secret_key"), ""),
-        (("CHATGPT2API_WEBDAV_PASSWORD", "WEBDAV_PASSWORD"), ("image_storage", "webdav_password"), ""),
-        (("CHATGPT2API_MINIO_ACCESS_KEY", "MINIO_ACCESS_KEY"), ("image_storage", "minio_access_key"), ""),
-        (("CHATGPT2API_MINIO_SECRET_KEY", "MINIO_SECRET_KEY"), ("image_storage", "minio_secret_key"), ""),
-        (("CHATGPT2API_OPENAI_RELAY_API_KEY",), ("openai_relay", "api_key"), ""),
-        (("CHATGPT2API_OPENAI_RELAY_API_KEYS",), ("openai_relay", "api_keys"), []),
-        (("CHATGPT2API_CF_COOKIES",), ("proxy_runtime", "clearance", "cf_cookies"), ""),
-        (("CHATGPT2API_CF_CLEARANCE",), ("proxy_runtime", "clearance", "cf_clearance"), ""),
+        (("GMKRAW_AUTH_KEY",), ("auth-key",), ""),
+        (("GMKRAW_AI_REVIEW_API_KEY",), ("ai_review", "api_key"), ""),
+        (("GMKRAW_BACKUP_ACCESS_KEY_ID",), ("backup", "access_key_id"), ""),
+        (("GMKRAW_BACKUP_SECRET_ACCESS_KEY",), ("backup", "secret_access_key"), ""),
+        (("GMKRAW_BACKUP_PASSPHRASE",), ("backup", "passphrase"), ""),
+        (("GMKRAW_QINIU_ACCESS_KEY", "QINIU_ACCESS_KEY"), ("image_reference_upload", "qiniu_access_key"), ""),
+        (("GMKRAW_QINIU_SECRET_KEY", "QINIU_SECRET_KEY"), ("image_reference_upload", "qiniu_secret_key"), ""),
+        (("GMKRAW_WEBDAV_PASSWORD", "WEBDAV_PASSWORD"), ("image_storage", "webdav_password"), ""),
+        (("GMKRAW_MINIO_ACCESS_KEY", "MINIO_ACCESS_KEY"), ("image_storage", "minio_access_key"), ""),
+        (("GMKRAW_MINIO_SECRET_KEY", "MINIO_SECRET_KEY"), ("image_storage", "minio_secret_key"), ""),
+        (("GMKRAW_OPENAI_RELAY_API_KEY",), ("openai_relay", "api_key"), ""),
+        (("GMKRAW_OPENAI_RELAY_API_KEYS",), ("openai_relay", "api_keys"), []),
+        (("GMKRAW_CF_COOKIES",), ("proxy_runtime", "clearance", "cf_cookies"), ""),
+        (("GMKRAW_CF_CLEARANCE",), ("proxy_runtime", "clearance", "cf_clearance"), ""),
         (("IMAGE_TASK_REDIS_URL", "REDIS_URL"), ("image_task_queue", "redis_url"), DEFAULT_IMAGE_TASK_QUEUE["redis_url"]),
         (("IMAGE_TASK_DATABASE_URL", "MYSQL_DATABASE_URL"), ("image_task_queue", "database_url"), ""),
     )
@@ -221,35 +221,35 @@ def _normalize_backup_include(value: object) -> dict[str, bool]:
 
 def _normalize_backup_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    enabled_env = os.getenv("CHATGPT2API_BACKUP_ENABLED")
-    encrypt_env = os.getenv("CHATGPT2API_BACKUP_ENCRYPT")
+    enabled_env = os.getenv("GMKRAW_BACKUP_ENABLED")
+    encrypt_env = os.getenv("GMKRAW_BACKUP_ENCRYPT")
     return {
         "enabled": _normalize_bool(enabled_env if enabled_env is not None else source.get("enabled"), False),
         "provider": "cloudflare_r2",
-        "account_id": str(os.getenv("CHATGPT2API_BACKUP_ACCOUNT_ID") or source.get("account_id") or "").strip(),
+        "account_id": str(os.getenv("GMKRAW_BACKUP_ACCOUNT_ID") or source.get("account_id") or "").strip(),
         "access_key_id": str(
-            os.getenv("CHATGPT2API_BACKUP_ACCESS_KEY_ID") or source.get("access_key_id") or ""
+            os.getenv("GMKRAW_BACKUP_ACCESS_KEY_ID") or source.get("access_key_id") or ""
         ).strip(),
         "secret_access_key": str(
-            os.getenv("CHATGPT2API_BACKUP_SECRET_ACCESS_KEY") or source.get("secret_access_key") or ""
+            os.getenv("GMKRAW_BACKUP_SECRET_ACCESS_KEY") or source.get("secret_access_key") or ""
         ).strip(),
-        "bucket": str(os.getenv("CHATGPT2API_BACKUP_BUCKET") or source.get("bucket") or "").strip(),
+        "bucket": str(os.getenv("GMKRAW_BACKUP_BUCKET") or source.get("bucket") or "").strip(),
         "prefix": str(
-            os.getenv("CHATGPT2API_BACKUP_PREFIX") or source.get("prefix") or "backups"
+            os.getenv("GMKRAW_BACKUP_PREFIX") or source.get("prefix") or "backups"
         ).strip().strip("/") or "backups",
         "interval_minutes": _normalize_positive_int(
-            os.getenv("CHATGPT2API_BACKUP_INTERVAL_MINUTES") or source.get("interval_minutes"),
+            os.getenv("GMKRAW_BACKUP_INTERVAL_MINUTES") or source.get("interval_minutes"),
             360,
             1,
         ),
         "rotation_keep": _normalize_positive_int(
-            os.getenv("CHATGPT2API_BACKUP_ROTATION_KEEP") or source.get("rotation_keep"),
+            os.getenv("GMKRAW_BACKUP_ROTATION_KEEP") or source.get("rotation_keep"),
             10,
             0,
         ),
         "encrypt": _normalize_bool(encrypt_env if encrypt_env is not None else source.get("encrypt"), False),
         "passphrase": str(
-            os.getenv("CHATGPT2API_BACKUP_PASSPHRASE") or source.get("passphrase") or ""
+            os.getenv("GMKRAW_BACKUP_PASSPHRASE") or source.get("passphrase") or ""
         ).strip(),
         "include": _normalize_backup_include(source.get("include")),
     }
@@ -268,10 +268,10 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
 
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    enabled_env = os.getenv("CHATGPT2API_IMAGE_STORAGE_ENABLED")
-    mode = str(os.getenv("CHATGPT2API_IMAGE_STORAGE_MODE") or source.get("mode") or "local").strip().lower()
+    enabled_env = os.getenv("GMKRAW_IMAGE_STORAGE_ENABLED")
+    mode = str(os.getenv("GMKRAW_IMAGE_STORAGE_MODE") or source.get("mode") or "local").strip().lower()
     provider = str(
-        os.getenv("CHATGPT2API_IMAGE_STORAGE_PROVIDER")
+        os.getenv("GMKRAW_IMAGE_STORAGE_PROVIDER")
         or source.get("provider")
         or source.get("remote_provider")
         or ""
@@ -290,7 +290,7 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         has_minio_config = any(
             str(item or "").strip()
             for item in (
-                os.getenv("CHATGPT2API_MINIO_ENDPOINT"),
+                os.getenv("GMKRAW_MINIO_ENDPOINT"),
                 os.getenv("MINIO_ENDPOINT"),
                 source.get("minio_endpoint"),
                 source.get("minio_bucket"),
@@ -316,15 +316,15 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         provider = "qiniu"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
     minio_root_path = str(
-        os.getenv("CHATGPT2API_MINIO_ROOT_PATH")
+        os.getenv("GMKRAW_MINIO_ROOT_PATH")
         or os.getenv("MINIO_ROOT_PATH")
         or source.get("minio_root_path")
         or DEFAULT_IMAGE_STORAGE["minio_root_path"]
     ).strip().strip("/")
-    minio_secure_env = os.getenv("CHATGPT2API_MINIO_SECURE") or os.getenv("MINIO_SECURE")
-    qiniu_private_env = os.getenv("CHATGPT2API_QINIU_PRIVATE") or os.getenv("QINIU_PRIVATE")
+    minio_secure_env = os.getenv("GMKRAW_MINIO_SECURE") or os.getenv("MINIO_SECURE")
+    qiniu_private_env = os.getenv("GMKRAW_QINIU_PRIVATE") or os.getenv("QINIU_PRIVATE")
     public_base_url = str(
-        os.getenv("CHATGPT2API_IMAGE_STORAGE_PUBLIC_BASE_URL")
+        os.getenv("GMKRAW_IMAGE_STORAGE_PUBLIC_BASE_URL")
         or os.getenv("IMAGE_PUBLIC_BASE_URL")
         or source.get("public_base_url")
         or ""
@@ -334,52 +334,52 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "mode": mode,
         "provider": provider,
         "webdav_url": str(
-            os.getenv("CHATGPT2API_WEBDAV_URL") or os.getenv("WEBDAV_URL") or source.get("webdav_url") or ""
+            os.getenv("GMKRAW_WEBDAV_URL") or os.getenv("WEBDAV_URL") or source.get("webdav_url") or ""
         ).strip().rstrip("/"),
         "webdav_username": str(
-            os.getenv("CHATGPT2API_WEBDAV_USERNAME")
+            os.getenv("GMKRAW_WEBDAV_USERNAME")
             or os.getenv("WEBDAV_USERNAME")
             or source.get("webdav_username")
             or ""
         ).strip(),
         "webdav_password": str(
-            os.getenv("CHATGPT2API_WEBDAV_PASSWORD")
+            os.getenv("GMKRAW_WEBDAV_PASSWORD")
             or os.getenv("WEBDAV_PASSWORD")
             or source.get("webdav_password")
             or ""
         ).strip(),
         "webdav_root_path": str(
-            os.getenv("CHATGPT2API_WEBDAV_ROOT_PATH")
+            os.getenv("GMKRAW_WEBDAV_ROOT_PATH")
             or os.getenv("WEBDAV_ROOT_PATH")
             or root_path
             or DEFAULT_IMAGE_STORAGE["webdav_root_path"]
         ).strip().strip("/"),
         "minio_endpoint": str(
-            os.getenv("CHATGPT2API_MINIO_ENDPOINT")
+            os.getenv("GMKRAW_MINIO_ENDPOINT")
             or os.getenv("MINIO_ENDPOINT")
             or source.get("minio_endpoint")
             or ""
         ).strip().rstrip("/"),
         "minio_access_key": str(
-            os.getenv("CHATGPT2API_MINIO_ACCESS_KEY")
+            os.getenv("GMKRAW_MINIO_ACCESS_KEY")
             or os.getenv("MINIO_ACCESS_KEY")
             or source.get("minio_access_key")
             or ""
         ).strip(),
         "minio_secret_key": str(
-            os.getenv("CHATGPT2API_MINIO_SECRET_KEY")
+            os.getenv("GMKRAW_MINIO_SECRET_KEY")
             or os.getenv("MINIO_SECRET_KEY")
             or source.get("minio_secret_key")
             or ""
         ).strip(),
         "minio_bucket": str(
-            os.getenv("CHATGPT2API_MINIO_BUCKET")
+            os.getenv("GMKRAW_MINIO_BUCKET")
             or os.getenv("MINIO_BUCKET")
             or source.get("minio_bucket")
             or ""
         ).strip(),
         "minio_region": str(
-            os.getenv("CHATGPT2API_MINIO_REGION")
+            os.getenv("GMKRAW_MINIO_REGION")
             or os.getenv("MINIO_REGION")
             or source.get("minio_region")
             or DEFAULT_IMAGE_STORAGE["minio_region"]
@@ -390,43 +390,43 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         ),
         "minio_root_path": minio_root_path or str(DEFAULT_IMAGE_STORAGE["minio_root_path"]),
         "qiniu_access_key": str(
-            os.getenv("CHATGPT2API_QINIU_ACCESS_KEY")
+            os.getenv("GMKRAW_QINIU_ACCESS_KEY")
             or os.getenv("QINIU_ACCESS_KEY")
             or source.get("qiniu_access_key")
             or ""
         ).strip(),
         "qiniu_secret_key": str(
-            os.getenv("CHATGPT2API_QINIU_SECRET_KEY")
+            os.getenv("GMKRAW_QINIU_SECRET_KEY")
             or os.getenv("QINIU_SECRET_KEY")
             or source.get("qiniu_secret_key")
             or ""
         ).strip(),
         "qiniu_bucket": str(
-            os.getenv("CHATGPT2API_QINIU_BUCKET")
+            os.getenv("GMKRAW_QINIU_BUCKET")
             or os.getenv("QINIU_BUCKET")
             or source.get("qiniu_bucket")
             or ""
         ).strip(),
         "qiniu_domain": str(
-            os.getenv("CHATGPT2API_QINIU_DOMAIN")
+            os.getenv("GMKRAW_QINIU_DOMAIN")
             or os.getenv("QINIU_DOMAIN")
             or source.get("qiniu_domain")
             or ""
         ).strip().rstrip("/"),
         "qiniu_upload_url": str(
-            os.getenv("CHATGPT2API_QINIU_UPLOAD_URL")
+            os.getenv("GMKRAW_QINIU_UPLOAD_URL")
             or os.getenv("QINIU_UPLOAD_URL")
             or source.get("qiniu_upload_url")
             or DEFAULT_IMAGE_STORAGE["qiniu_upload_url"]
         ).strip().rstrip("/"),
         "qiniu_prefix": str(
-            os.getenv("CHATGPT2API_QINIU_TASK_PREFIX")
+            os.getenv("GMKRAW_QINIU_TASK_PREFIX")
             or os.getenv("QINIU_TASK_PREFIX")
             or source.get("qiniu_prefix")
             or DEFAULT_IMAGE_STORAGE["qiniu_prefix"]
         ).strip().strip("/"),
         "qiniu_region": str(
-            os.getenv("CHATGPT2API_QINIU_REGION")
+            os.getenv("GMKRAW_QINIU_REGION")
             or os.getenv("QINIU_REGION")
             or source.get("qiniu_region")
             or DEFAULT_IMAGE_STORAGE["qiniu_region"]
@@ -441,14 +441,14 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
 
 def _normalize_image_reference_upload_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    qiniu_access_key_env = os.getenv("CHATGPT2API_QINIU_ACCESS_KEY") or os.getenv("QINIU_ACCESS_KEY")
-    qiniu_secret_key_env = os.getenv("CHATGPT2API_QINIU_SECRET_KEY") or os.getenv("QINIU_SECRET_KEY")
-    qiniu_bucket_env = os.getenv("CHATGPT2API_QINIU_BUCKET") or os.getenv("QINIU_BUCKET")
-    qiniu_domain_env = os.getenv("CHATGPT2API_QINIU_DOMAIN") or os.getenv("QINIU_DOMAIN")
-    qiniu_upload_url_env = os.getenv("CHATGPT2API_QINIU_UPLOAD_URL") or os.getenv("QINIU_UPLOAD_URL")
-    qiniu_prefix_env = os.getenv("CHATGPT2API_QINIU_PREFIX") or os.getenv("QINIU_PREFIX")
-    timeout_sec_env = os.getenv("CHATGPT2API_QINIU_TIMEOUT_SEC") or os.getenv("QINIU_TIMEOUT_SEC")
-    persistent_cache_env = os.getenv("CHATGPT2API_QINIU_PERSISTENT_CACHE_ENABLED")
+    qiniu_access_key_env = os.getenv("GMKRAW_QINIU_ACCESS_KEY") or os.getenv("QINIU_ACCESS_KEY")
+    qiniu_secret_key_env = os.getenv("GMKRAW_QINIU_SECRET_KEY") or os.getenv("QINIU_SECRET_KEY")
+    qiniu_bucket_env = os.getenv("GMKRAW_QINIU_BUCKET") or os.getenv("QINIU_BUCKET")
+    qiniu_domain_env = os.getenv("GMKRAW_QINIU_DOMAIN") or os.getenv("QINIU_DOMAIN")
+    qiniu_upload_url_env = os.getenv("GMKRAW_QINIU_UPLOAD_URL") or os.getenv("QINIU_UPLOAD_URL")
+    qiniu_prefix_env = os.getenv("GMKRAW_QINIU_PREFIX") or os.getenv("QINIU_PREFIX")
+    timeout_sec_env = os.getenv("GMKRAW_QINIU_TIMEOUT_SEC") or os.getenv("QINIU_TIMEOUT_SEC")
+    persistent_cache_env = os.getenv("GMKRAW_QINIU_PERSISTENT_CACHE_ENABLED")
     timeout_sec = _normalize_positive_int(
         timeout_sec_env or source.get("timeout_sec"),
         int(DEFAULT_IMAGE_REFERENCE_UPLOAD["timeout_sec"]),
@@ -501,9 +501,9 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
     default_clearance = DEFAULT_PROXY_RUNTIME["clearance"]
     clearance_source = source.get("clearance") if isinstance(source.get("clearance"), dict) else {}
 
-    enabled_env = os.getenv("CHATGPT2API_PROXY_RUNTIME_ENABLED")
+    enabled_env = os.getenv("GMKRAW_PROXY_RUNTIME_ENABLED")
     egress_mode = str(
-        os.getenv("CHATGPT2API_PROXY_EGRESS_MODE")
+        os.getenv("GMKRAW_PROXY_EGRESS_MODE")
         or source.get("egress_mode")
         or DEFAULT_PROXY_RUNTIME["egress_mode"]
     ).strip().lower()
@@ -533,10 +533,10 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
         ),
         "egress_mode": egress_mode,
         "proxy_url": str(
-            os.getenv("CHATGPT2API_PROXY_URL") or source.get("proxy_url") or ""
+            os.getenv("GMKRAW_PROXY_URL") or source.get("proxy_url") or ""
         ).strip(),
         "resource_proxy_url": str(
-            os.getenv("CHATGPT2API_RESOURCE_PROXY_URL") or source.get("resource_proxy_url") or ""
+            os.getenv("GMKRAW_RESOURCE_PROXY_URL") or source.get("resource_proxy_url") or ""
         ).strip(),
         "skip_ssl_verify": _normalize_bool(
             source.get("skip_ssl_verify"),
@@ -546,12 +546,12 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
         "clearance": {
             "enabled": _normalize_bool(clearance_source.get("enabled"), bool(default_clearance["enabled"])),
             "mode": clearance_mode,
-            "cf_cookies": str(os.getenv("CHATGPT2API_CF_COOKIES") or cf_cookies).strip(),
-            "cf_clearance": str(os.getenv("CHATGPT2API_CF_CLEARANCE") or cf_clearance).strip(),
+            "cf_cookies": str(os.getenv("GMKRAW_CF_COOKIES") or cf_cookies).strip(),
+            "cf_clearance": str(os.getenv("GMKRAW_CF_CLEARANCE") or cf_clearance).strip(),
             "user_agent": user_agent or str(default_clearance["user_agent"]),
             "browser": browser or str(default_clearance["browser"]),
             "flaresolverr_url": str(
-                os.getenv("CHATGPT2API_FLARESOLVERR_URL") or clearance_source.get("flaresolverr_url") or ""
+                os.getenv("GMKRAW_FLARESOLVERR_URL") or clearance_source.get("flaresolverr_url") or ""
             ).strip(),
             "timeout_sec": _normalize_positive_int(
                 clearance_source.get("timeout_sec"),
@@ -584,8 +584,8 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
 
 def _normalize_ai_review_settings(value: object) -> dict[str, object]:
     source = dict(value) if isinstance(value, dict) else {}
-    enabled_env = os.getenv("CHATGPT2API_AI_REVIEW_ENABLED")
-    fail_open_env = os.getenv("CHATGPT2API_AI_REVIEW_FAIL_OPEN")
+    enabled_env = os.getenv("GMKRAW_AI_REVIEW_ENABLED")
+    fail_open_env = os.getenv("GMKRAW_AI_REVIEW_FAIL_OPEN")
     source["enabled"] = _normalize_bool(
         enabled_env if enabled_env is not None else source.get("enabled"),
         False,
@@ -595,30 +595,30 @@ def _normalize_ai_review_settings(value: object) -> dict[str, object]:
         True,
     )
     source["base_url"] = str(
-        os.getenv("CHATGPT2API_AI_REVIEW_BASE_URL") or source.get("base_url") or ""
+        os.getenv("GMKRAW_AI_REVIEW_BASE_URL") or source.get("base_url") or ""
     ).strip().rstrip("/")
     source["api_key"] = str(
-        os.getenv("CHATGPT2API_AI_REVIEW_API_KEY") or source.get("api_key") or ""
+        os.getenv("GMKRAW_AI_REVIEW_API_KEY") or source.get("api_key") or ""
     ).strip()
     source["model"] = str(
-        os.getenv("CHATGPT2API_AI_REVIEW_MODEL") or source.get("model") or ""
+        os.getenv("GMKRAW_AI_REVIEW_MODEL") or source.get("model") or ""
     ).strip()
     return source
 
 
 def _normalize_openai_relay_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    enabled_env = os.getenv("CHATGPT2API_OPENAI_RELAY_ENABLED")
-    base_url_env = os.getenv("CHATGPT2API_OPENAI_RELAY_BASE_URL")
-    api_key_env = os.getenv("CHATGPT2API_OPENAI_RELAY_API_KEY")
-    api_keys_env = os.getenv("CHATGPT2API_OPENAI_RELAY_API_KEYS")
-    api_key_concurrency_env = os.getenv("CHATGPT2API_OPENAI_RELAY_API_KEY_CONCURRENCY")
-    pool_distributed_env = os.getenv("CHATGPT2API_OPENAI_RELAY_POOL_DISTRIBUTED")
-    pool_acquire_timeout_env = os.getenv("CHATGPT2API_OPENAI_RELAY_POOL_ACQUIRE_TIMEOUT_SECS")
-    pool_lease_env = os.getenv("CHATGPT2API_OPENAI_RELAY_POOL_LEASE_SECS")
-    pool_cooldown_env = os.getenv("CHATGPT2API_OPENAI_RELAY_POOL_COOLDOWN_SECS")
-    pool_max_attempts_env = os.getenv("CHATGPT2API_OPENAI_RELAY_POOL_MAX_ATTEMPTS")
-    prompt_analysis_model_env = os.getenv("CHATGPT2API_PROMPT_ANALYSIS_MODEL")
+    enabled_env = os.getenv("GMKRAW_OPENAI_RELAY_ENABLED")
+    base_url_env = os.getenv("GMKRAW_OPENAI_RELAY_BASE_URL")
+    api_key_env = os.getenv("GMKRAW_OPENAI_RELAY_API_KEY")
+    api_keys_env = os.getenv("GMKRAW_OPENAI_RELAY_API_KEYS")
+    api_key_concurrency_env = os.getenv("GMKRAW_OPENAI_RELAY_API_KEY_CONCURRENCY")
+    pool_distributed_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_DISTRIBUTED")
+    pool_acquire_timeout_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_ACQUIRE_TIMEOUT_SECS")
+    pool_lease_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_LEASE_SECS")
+    pool_cooldown_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_COOLDOWN_SECS")
+    pool_max_attempts_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_MAX_ATTEMPTS")
+    prompt_analysis_model_env = os.getenv("GMKRAW_PROMPT_ANALYSIS_MODEL")
     return {
         "enabled": _normalize_bool(
             enabled_env if enabled_env is not None else source.get("enabled"),
@@ -668,7 +668,7 @@ def _normalize_openai_relay_settings(value: object) -> dict[str, object]:
 
 def _normalize_image_task_queue_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
-    enabled_env = os.getenv("IMAGE_TASK_QUEUE_ENABLED") or os.getenv("CHATGPT2API_IMAGE_TASK_QUEUE_ENABLED")
+    enabled_env = os.getenv("IMAGE_TASK_QUEUE_ENABLED") or os.getenv("GMKRAW_IMAGE_TASK_QUEUE_ENABLED")
     executor = str(
         os.getenv("IMAGE_TASK_EXECUTOR") or source.get("executor") or DEFAULT_IMAGE_TASK_QUEUE["executor"]
     ).strip().lower()
@@ -822,11 +822,11 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     raw_config = _read_json_object(CONFIG_FILE, name="config.json")
-    auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
+    auth_key = _normalize_auth_key(os.getenv("GMKRAW_AUTH_KEY") or raw_config.get("auth-key"))
     if _is_invalid_auth_key(auth_key):
         raise ValueError(
             "❌ auth-key 未设置！\n"
-            "请在环境变量 CHATGPT2API_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
+            "请在环境变量 GMKRAW_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
         )
 
     try:
@@ -846,7 +846,7 @@ class ConfigStore:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self.embedded_secret_paths = find_embedded_secret_paths(self.data)
-        if _normalize_bool(os.getenv("CHATGPT2API_STRICT_SECRET_SOURCES"), False) and self.embedded_secret_paths:
+        if _normalize_bool(os.getenv("GMKRAW_STRICT_SECRET_SOURCES"), False) and self.embedded_secret_paths:
             joined_paths = ", ".join(self.embedded_secret_paths)
             raise ValueError(f"embedded secrets are not allowed in strict mode: {joined_paths}")
         self._storage_backend: StorageBackend | None = None
@@ -855,7 +855,7 @@ class ConfigStore:
                 "❌ auth-key 未设置！\n"
                 "请按以下任意一种方式解决：\n"
                 "1. 在 Render 的 Environment 变量中添加：\n"
-                "   CHATGPT2API_AUTH_KEY = your_real_auth_key\n"
+                "   GMKRAW_AUTH_KEY = your_real_auth_key\n"
                 "2. 或者在 config.json 中填写：\n"
                 '   "auth-key": "your_real_auth_key"'
             )
@@ -868,7 +868,7 @@ class ConfigStore:
 
     @property
     def auth_key(self) -> str:
-        return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
+        return _normalize_auth_key(os.getenv("GMKRAW_AUTH_KEY") or self.data.get("auth-key"))
 
     @property
     def accounts_file(self) -> Path:
@@ -1029,7 +1029,7 @@ class ConfigStore:
     @property
     def base_url(self) -> str:
         return str(
-            os.getenv("CHATGPT2API_BASE_URL")
+            os.getenv("GMKRAW_BASE_URL")
             or self.data.get("base_url")
             or ""
         ).strip().rstrip("/")
@@ -1170,7 +1170,7 @@ class ConfigStore:
         next_data.pop("backup_state", None)
         next_data = _strip_environment_managed_secrets(next_data)
         embedded_secret_paths = find_embedded_secret_paths(next_data)
-        if _normalize_bool(os.getenv("CHATGPT2API_STRICT_SECRET_SOURCES"), False) and embedded_secret_paths:
+        if _normalize_bool(os.getenv("GMKRAW_STRICT_SECRET_SOURCES"), False) and embedded_secret_paths:
             joined_paths = ", ".join(embedded_secret_paths)
             raise ValueError(f"embedded secrets are not allowed in strict mode: {joined_paths}")
         self.data = next_data

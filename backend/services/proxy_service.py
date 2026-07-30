@@ -570,7 +570,7 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
     try:
         response = session.get(
             "https://chatgpt.com/api/auth/csrf",
-            headers={"user-agent": "Mozilla/5.0 (chatgpt2api proxy test)"},
+            headers={"user-agent": "Mozilla/5.0 (gmkraw proxy test)"},
             timeout=timeout,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)

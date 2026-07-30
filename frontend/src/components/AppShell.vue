@@ -64,7 +64,7 @@ async function loadTaskCount() {
 function toggleTheme() {
   isDark.value = !isDark.value;
   document.documentElement.classList.toggle("dark", isDark.value);
-  localStorage.setItem("chatgpt2api-theme", isDark.value ? "dark" : "light");
+  localStorage.setItem("gmkraw-theme", isDark.value ? "dark" : "light");
 }
 
 async function submitSearch() {

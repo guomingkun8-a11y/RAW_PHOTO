@@ -5,7 +5,7 @@ import App from "@/App.vue";
 import { router } from "@/router";
 import "@/styles.css";
 
-const storedTheme = localStorage.getItem("chatgpt2api-theme");
+const storedTheme = localStorage.getItem("gmkraw-theme");
 const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
 document.documentElement.classList.toggle("dark", storedTheme ? storedTheme === "dark" : prefersDark);
 

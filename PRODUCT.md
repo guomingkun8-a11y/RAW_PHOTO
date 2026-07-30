@@ -10,7 +10,7 @@ Self-hosted image API operators, creators, and ecommerce users who need a compac
 
 ## Product Purpose
 
-ChatGPT2API provides a local image-generation API and web workspace for OpenAI-compatible image generation, image editing, account-pool management, and task history. Success means users can produce usable images quickly while retaining control over authentication, model routing, storage, and image fidelity.
+GMKRAW provides a local image-generation API and web workspace for OpenAI-compatible image generation, image editing, account-pool management, and task history. Success means users can produce usable images quickly while retaining control over authentication, model routing, storage, and image fidelity.
 
 ## Brand Personality
 

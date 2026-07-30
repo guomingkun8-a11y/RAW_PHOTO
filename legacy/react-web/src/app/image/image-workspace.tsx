@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowDown, History, LoaderCircle, Plus, Trash2 } from "lucide-react";
@@ -55,21 +55,21 @@ import {
   type StoredReferenceImage,
 } from "@/store/image-conversations";
 
-const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_single_active_conversation_id";
-const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
-const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
-const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
-const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
-const PRESERVE_SUBJECT_STORAGE_KEY = "chatgpt2api:image_preserve_subject";
+const ACTIVE_CONVERSATION_STORAGE_KEY = "gmkraw:image_single_active_conversation_id";
+const IMAGE_RATIO_STORAGE_KEY = "gmkraw:image_last_ratio";
+const IMAGE_TIER_STORAGE_KEY = "gmkraw:image_last_tier";
+const IMAGE_QUALITY_STORAGE_KEY = "gmkraw:image_last_quality";
+const IMAGE_MODEL_STORAGE_KEY = "gmkraw:image_last_model";
+const PRESERVE_SUBJECT_STORAGE_KEY = "gmkraw:image_preserve_subject";
 const DEFAULT_IMAGE_COUNT = "1";
 const BUILTIN_IMAGE_MODELS: ImageModel[] = [
   "gpt-image-2",
   "gemini-3.1-flash-image-preview",
   "gpt-image-2-guan",
 ];
-const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
-const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "chatgpt2api:image_count_default_one_applied";
-const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
+const IMAGE_COUNT_STORAGE_KEY = "gmkraw:image_last_count";
+const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "gmkraw:image_count_default_one_applied";
+const SCROLL_POSITIONS_STORAGE_KEY = "gmkraw:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
 const BATCH_REPLACE_BASE_PROMPT = [
   "以第一张参考图作为唯一商品主体，逐张处理第二张参考图。",

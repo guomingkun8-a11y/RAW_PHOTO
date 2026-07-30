@@ -86,12 +86,12 @@ export type ImageConversationStats = {
 };
 
 const legacyImageConversationStorage = localforage.createInstance({
-  name: "chatgpt2api",
+  name: "gmkraw",
   storeName: "image_conversations",
 });
 
 const singleImageConversationStorage = localforage.createInstance({
-  name: "chatgpt2api",
+  name: "gmkraw",
   storeName: "image_single_conversations",
 });
 

@@ -32,7 +32,7 @@ class GitStorageBackend(StorageBackend):
         
         # 本地缓存目录
         if local_cache_dir is None:
-            local_cache_dir = Path(tempfile.gettempdir()) / "chatgpt2api_git_cache"
+            local_cache_dir = Path(tempfile.gettempdir()) / "gmkraw_git_cache"
         self.local_cache_dir = local_cache_dir
         self.local_cache_dir.mkdir(parents=True, exist_ok=True)
         

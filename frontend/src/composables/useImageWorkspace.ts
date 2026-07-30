@@ -1,4 +1,4 @@
-﻿import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { toast } from "vue-sonner";
 
 import {
@@ -35,14 +35,14 @@ import {
   type StoredReferenceImage,
 } from "@/stores/image-conversations";
 
-const ACTIVE_CONVERSATION_STORAGE_KEY = "chatgpt2api:image_single_active_conversation_id";
-const IMAGE_RATIO_STORAGE_KEY = "chatgpt2api:image_last_ratio";
-const IMAGE_TIER_STORAGE_KEY = "chatgpt2api:image_last_tier";
-const IMAGE_QUALITY_STORAGE_KEY = "chatgpt2api:image_last_quality";
-const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
-const PRESERVE_SUBJECT_STORAGE_KEY = "chatgpt2api:image_preserve_subject";
-const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
-const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "chatgpt2api:image_count_default_one_applied";
+const ACTIVE_CONVERSATION_STORAGE_KEY = "gmkraw:image_single_active_conversation_id";
+const IMAGE_RATIO_STORAGE_KEY = "gmkraw:image_last_ratio";
+const IMAGE_TIER_STORAGE_KEY = "gmkraw:image_last_tier";
+const IMAGE_QUALITY_STORAGE_KEY = "gmkraw:image_last_quality";
+const IMAGE_MODEL_STORAGE_KEY = "gmkraw:image_last_model";
+const PRESERVE_SUBJECT_STORAGE_KEY = "gmkraw:image_preserve_subject";
+const IMAGE_COUNT_STORAGE_KEY = "gmkraw:image_last_count";
+const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "gmkraw:image_count_default_one_applied";
 const DEFAULT_IMAGE_COUNT = "1";
 const REFERENCE_UPLOAD_CONCURRENCY = 2;
 const SCENE_IMAGE_OPTIMIZE_MIN_BYTES = 768 * 1024;

@@ -96,7 +96,7 @@ def migrate_data(from_backend: str, to_backend: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ChatGPT2API 存储后端数据迁移工具",
+        description="GMKRAW 存储后端数据迁移工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

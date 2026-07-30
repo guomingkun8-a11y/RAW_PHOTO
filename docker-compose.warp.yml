@@ -1,33 +1,33 @@
 services:
   init-config:
     image: python:3.13-alpine
-    container_name: chatgpt2api-warp-init
+    container_name: gmkraw-warp-init
     working_dir: /app
     volumes:
       - ./config.json:/app/config.json
       - ./scripts:/app/scripts:ro
     environment:
-      CHATGPT2API_CONFIG_FILE: /app/config.json
-      CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}
-      CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE: ${CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE:-single_proxy}
-      CHATGPT2API_PROXY_RUNTIME_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_URL:-http://privoxy:8118}
-      CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL:-}
-      CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY: ${CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY:-false}
-      CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES: ${CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES:-403}
-      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED:-true}
-      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE:-flaresolverr}
-      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC:-60}
-      CHATGPT2API_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL: ${CHATGPT2API_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL:-3600}
-      CHATGPT2API_PROXY_RUNTIME_WARM_UP_ON_START: ${CHATGPT2API_PROXY_RUNTIME_WARM_UP_ON_START:-false}
-      CHATGPT2API_PROXY_RUNTIME_BROWSER: ${CHATGPT2API_PROXY_RUNTIME_BROWSER:-chrome}
-      CHATGPT2API_PROXY_RUNTIME_USER_AGENT: ${CHATGPT2API_PROXY_RUNTIME_USER_AGENT:-}
-      CHATGPT2API_FLARESOLVERR_URL: ${CHATGPT2API_FLARESOLVERR_URL:-http://flaresolverr:8191}
+      GMKRAW_CONFIG_FILE: /app/config.json
+      GMKRAW_PROXY_RUNTIME_ENABLED: ${GMKRAW_PROXY_RUNTIME_ENABLED:-true}
+      GMKRAW_PROXY_RUNTIME_EGRESS_MODE: ${GMKRAW_PROXY_RUNTIME_EGRESS_MODE:-single_proxy}
+      GMKRAW_PROXY_RUNTIME_PROXY_URL: ${GMKRAW_PROXY_RUNTIME_PROXY_URL:-http://privoxy:8118}
+      GMKRAW_PROXY_RUNTIME_RESOURCE_PROXY_URL: ${GMKRAW_PROXY_RUNTIME_RESOURCE_PROXY_URL:-}
+      GMKRAW_PROXY_RUNTIME_SKIP_SSL_VERIFY: ${GMKRAW_PROXY_RUNTIME_SKIP_SSL_VERIFY:-false}
+      GMKRAW_PROXY_RUNTIME_RESET_STATUS_CODES: ${GMKRAW_PROXY_RUNTIME_RESET_STATUS_CODES:-403}
+      GMKRAW_PROXY_RUNTIME_CLEARANCE_ENABLED: ${GMKRAW_PROXY_RUNTIME_CLEARANCE_ENABLED:-true}
+      GMKRAW_PROXY_RUNTIME_CLEARANCE_MODE: ${GMKRAW_PROXY_RUNTIME_CLEARANCE_MODE:-flaresolverr}
+      GMKRAW_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC: ${GMKRAW_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC:-60}
+      GMKRAW_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL: ${GMKRAW_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL:-3600}
+      GMKRAW_PROXY_RUNTIME_WARM_UP_ON_START: ${GMKRAW_PROXY_RUNTIME_WARM_UP_ON_START:-false}
+      GMKRAW_PROXY_RUNTIME_BROWSER: ${GMKRAW_PROXY_RUNTIME_BROWSER:-chrome}
+      GMKRAW_PROXY_RUNTIME_USER_AGENT: ${GMKRAW_PROXY_RUNTIME_USER_AGENT:-}
+      GMKRAW_FLARESOLVERR_URL: ${GMKRAW_FLARESOLVERR_URL:-http://flaresolverr:8191}
     command: ["python3", "/app/scripts/init_proxy_config.py"]
     restart: "no"
 
   warp-proxy:
     image: caomingjun/warp:latest
-    container_name: chatgpt2api-warp-proxy
+    container_name: gmkraw-warp-proxy
     restart: unless-stopped
     environment:
       WARP_SLEEP: "2"
@@ -50,7 +50,7 @@ services:
 
   privoxy:
     image: vimagick/privoxy:latest
-    container_name: chatgpt2api-privoxy
+    container_name: gmkraw-privoxy
     restart: unless-stopped
     depends_on:
       warp-proxy:
@@ -68,7 +68,7 @@ services:
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: chatgpt2api-flaresolverr
+    container_name: gmkraw-flaresolverr
     restart: unless-stopped
     environment:
       LOG_LEVEL: ${FLARESOLVERR_LOG_LEVEL:-info}
@@ -86,8 +86,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: chatgpt2api:warp
-    container_name: chatgpt2api-warp
+    image: gmkraw:warp
+    container_name: gmkraw-warp
     restart: unless-stopped
     depends_on:
       init-config:
@@ -97,12 +97,12 @@ services:
       flaresolverr:
         condition: service_started
     ports:
-      - "${CHATGPT2API_PORT:-3000}:80"
+      - "${GMKRAW_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
-      CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
-      CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      GMKRAW_AUTH_KEY: ${GMKRAW_AUTH_KEY:-}
+      GMKRAW_BASE_URL: ${GMKRAW_BASE_URL:-}

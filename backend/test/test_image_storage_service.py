@@ -11,7 +11,7 @@ from services.image_storage_service import ImageStorageService
 
 
 def png_bytes() -> bytes:
-    path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.png"
+    path = Path(tempfile.gettempdir()) / "gmkraw-test-image.png"
     Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
     return path.read_bytes()
 
@@ -36,8 +36,8 @@ class FakeWebDAVClient:
         return True
 
     def test(self) -> dict[str, object]:
-        self.put(".chatgpt2api_webdav_test.txt", b"chatgpt2api webdav test\n")
-        self.delete(".chatgpt2api_webdav_test.txt")
+        self.put(".gmkraw_webdav_test.txt", b"gmkraw webdav test\n")
+        self.delete(".gmkraw_webdav_test.txt")
         return {"ok": True, "status": 200, "error": None}
 
 
@@ -61,8 +61,8 @@ class FakeMinIOClient:
         return True
 
     def test(self) -> dict[str, object]:
-        self.put(".chatgpt2api_minio_test.txt", b"chatgpt2api minio test\n")
-        self.delete(".chatgpt2api_minio_test.txt")
+        self.put(".gmkraw_minio_test.txt", b"gmkraw minio test\n")
+        self.delete(".gmkraw_minio_test.txt")
         return {"ok": True, "status": 200, "error": None}
 
 
@@ -99,14 +99,14 @@ class ImageStorageServiceTests(unittest.TestCase):
             "webdav_url": "",
             "webdav_username": "",
             "webdav_password": "",
-            "webdav_root_path": "chatgpt2api/images",
+            "webdav_root_path": "gmkraw/images",
             "minio_endpoint": "",
             "minio_access_key": "",
             "minio_secret_key": "",
             "minio_bucket": "",
             "minio_region": "us-east-1",
             "minio_secure": True,
-            "minio_root_path": "chatgpt2api/images",
+            "minio_root_path": "gmkraw/images",
             "public_base_url": "",
         }
         self.config_patcher = mock.patch("services.image_storage_service.config")
@@ -178,7 +178,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "qiniu_bucket": "raw-photo",
             "qiniu_domain": "https://cdn.example.test",
             "qiniu_upload_url": "https://upload-z0.qiniup.com",
-            "qiniu_prefix": "chatgpt2api/task-assets",
+            "qiniu_prefix": "gmkraw/task-assets",
             "qiniu_region": "z0",
             "qiniu_private": False,
         })
@@ -245,7 +245,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "qiniu_bucket": "raw-photo",
             "qiniu_domain": "https://cdn.example.test",
             "qiniu_upload_url": "https://upload-z0.qiniup.com",
-            "qiniu_prefix": "chatgpt2api/task-assets",
+            "qiniu_prefix": "gmkraw/task-assets",
             "qiniu_region": "z0",
             "qiniu_private": False,
         })
@@ -274,7 +274,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             result = self.service().test_webdav()
 
         self.assertTrue(result["ok"])
-        self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
+        self.assertIn(".gmkraw_webdav_test.txt", FakeWebDAVClient.deleted)
 
 
 if __name__ == "__main__":

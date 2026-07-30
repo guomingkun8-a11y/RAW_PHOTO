@@ -1,7 +1,7 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
-    container_name: chatgpt2api
+    image: ghcr.io/basketikun/gmkraw:latest
+    container_name: gmkraw
     restart: unless-stopped
     ports:
       - "3000:80"
@@ -23,7 +23,7 @@ services:
       # - GIT_FILE_PATH=accounts.json
       
       # 认证密钥 (可选，覆盖 config.json)
-      # - CHATGPT2API_AUTH_KEY=your_secret_key
+      # - GMKRAW_AUTH_KEY=your_secret_key
       
       # 基础 URL (可选)
-      # - CHATGPT2API_BASE_URL=https://your-domain.com
+      # - GMKRAW_BASE_URL=https://your-domain.com

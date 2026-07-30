@@ -16,7 +16,7 @@ Critical query fields are normalized columns. Flexible request and result detail
 ## Initialization
 
 ```bash
-CHATGPT2API_DATABASE_URL='mysql+pymysql://user:password@mysql:3306/raw_photo?charset=utf8mb4' \
+GMKRAW_DATABASE_URL='mysql+pymysql://user:password@mysql:3306/raw_photo?charset=utf8mb4' \
 uv run python backend/scripts/init_enterprise_schema.py
 ```
 

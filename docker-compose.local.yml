@@ -1,7 +1,7 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: chatgpt2api-redis
+    container_name: gmkraw-redis
     restart: unless-stopped
     command: redis-server --appendonly yes
     volumes:
@@ -11,8 +11,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: chatgpt2api:local
-    container_name: chatgpt2api-local
+    image: gmkraw:local
+    container_name: gmkraw-local
     restart: unless-stopped
     depends_on:
       - redis
@@ -33,8 +33,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: chatgpt2api:local
-    container_name: chatgpt2api-worker
+    image: gmkraw:local
+    container_name: gmkraw-worker
     restart: unless-stopped
     command: ["uv", "run", "python", "worker.py"]
     depends_on:
@@ -64,7 +64,7 @@ services:
     #   GIT_FILE_PATH: accounts.json
 
     # 认证密钥 (可选，覆盖 config.json)
-    #   CHATGPT2API_AUTH_KEY: your_secret_key
+    #   GMKRAW_AUTH_KEY: your_secret_key
 
     # 基础 URL (可选)
-    #   CHATGPT2API_BASE_URL: https://your-domain.com
+    #   GMKRAW_BASE_URL: https://your-domain.com

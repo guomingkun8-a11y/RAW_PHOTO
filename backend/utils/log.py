@@ -10,7 +10,7 @@ class Logger:
     _DATA_URL_RE = re.compile(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+")
     _JSON_B64_RE = re.compile(r'("b64_json"\s*:\s*")([A-Za-z0-9+/=]+)(")')
 
-    def __init__(self, name: str = "chatgpt2api") -> None:
+    def __init__(self, name: str = "gmkraw") -> None:
         self._logger = logging.getLogger(name)
         if not self._logger.handlers:
             handler = logging.StreamHandler()

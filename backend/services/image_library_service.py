@@ -136,7 +136,7 @@ def _dimensions_from_path(rel: str) -> tuple[int | None, int | None]:
 def _download_image(url: str) -> bytes:
     response = requests.get(
         url,
-        headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image library"},
+        headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "gmkraw image library"},
         timeout=60,
         allow_redirects=True,
         **proxy_settings.build_session_kwargs(),

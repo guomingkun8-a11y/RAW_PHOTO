@@ -181,7 +181,7 @@ export const AnimatedThemeToggler = ({
       setIsDark(newTheme)
       document.documentElement.classList.toggle("dark")
       document.documentElement.style.colorScheme = newTheme ? "dark" : "light"
-      localStorage.setItem("chatgpt2api-theme", newTheme ? "dark" : "light")
+      localStorage.setItem("gmkraw-theme", newTheme ? "dark" : "light")
     }
 
     if (typeof document.startViewTransition !== "function") {

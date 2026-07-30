@@ -22,7 +22,7 @@ def test_storage():
     """测试当前配置的存储后端"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print("=" * 60)
-    print("ChatGPT2API 存储后端测试")
+    print("GMKRAW 存储后端测试")
     print("=" * 60)
     
     # 显示当前配置

@@ -88,10 +88,10 @@ Copy-Item .env.example .env.local
 然后编辑 `.env.local`，至少配置：
 
 ```text
-CHATGPT2API_AUTH_KEY=replace-with-a-long-random-value
-CHATGPT2API_OPENAI_RELAY_ENABLED=true
-CHATGPT2API_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
-CHATGPT2API_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
+GMKRAW_AUTH_KEY=replace-with-a-long-random-value
+GMKRAW_OPENAI_RELAY_ENABLED=true
+GMKRAW_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
+GMKRAW_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
 IMAGE_TASK_QUEUE_ENABLED=true
 IMAGE_TASK_REDIS_URL=redis://127.0.0.1:6379/0
 ```
@@ -184,12 +184,12 @@ Copy-Item .env.example .env.intranet
 编辑 `.env.intranet`，至少填写：
 
 ```text
-CHATGPT2API_AUTH_KEY
+GMKRAW_AUTH_KEY
 MYSQL_PASSWORD
 MYSQL_ROOT_PASSWORD
 REDIS_PASSWORD
-CHATGPT2API_OPENAI_RELAY_BASE_URL
-CHATGPT2API_OPENAI_RELAY_API_KEY
+GMKRAW_OPENAI_RELAY_BASE_URL
+GMKRAW_OPENAI_RELAY_API_KEY
 ```
 
 如果使用七牛云或阿里云 OSS，还需要配置对应对象存储参数。
@@ -225,9 +225,9 @@ http://服务器局域网IP:8000/monitoring
 ### 生图中转站
 
 ```text
-CHATGPT2API_OPENAI_RELAY_ENABLED=true
-CHATGPT2API_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
-CHATGPT2API_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
+GMKRAW_OPENAI_RELAY_ENABLED=true
+GMKRAW_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
+GMKRAW_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
 ```
 
 如果使用多个 Key，建议把 Key 池放到环境变量或未提交的 `config.json` 中。配置多个 Key 后，系统可以在并发任务中分配空闲 Key，减少多人使用时的排队时间。
@@ -271,17 +271,17 @@ IMAGE_TASK_OWNER_PENDING_LIMIT=30
 常见模式：
 
 ```text
-CHATGPT2API_IMAGE_STORAGE_ENABLED=true
-CHATGPT2API_IMAGE_STORAGE_MODE=both
-CHATGPT2API_IMAGE_STORAGE_PROVIDER=minio
-CHATGPT2API_IMAGE_STORAGE_PUBLIC_BASE_URL=https://your-bucket-public-domain/path
-CHATGPT2API_MINIO_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
-CHATGPT2API_MINIO_ACCESS_KEY=replace-with-access-key
-CHATGPT2API_MINIO_SECRET_KEY=replace-with-secret-key
-CHATGPT2API_MINIO_BUCKET=replace-with-bucket
-CHATGPT2API_MINIO_REGION=cn-beijing
-CHATGPT2API_MINIO_ROOT_PATH=raw-photo/images
-CHATGPT2API_MINIO_SECURE=true
+GMKRAW_IMAGE_STORAGE_ENABLED=true
+GMKRAW_IMAGE_STORAGE_MODE=both
+GMKRAW_IMAGE_STORAGE_PROVIDER=minio
+GMKRAW_IMAGE_STORAGE_PUBLIC_BASE_URL=https://your-bucket-public-domain/path
+GMKRAW_MINIO_ENDPOINT=https://oss-cn-beijing.aliyuncs.com
+GMKRAW_MINIO_ACCESS_KEY=replace-with-access-key
+GMKRAW_MINIO_SECRET_KEY=replace-with-secret-key
+GMKRAW_MINIO_BUCKET=replace-with-bucket
+GMKRAW_MINIO_REGION=cn-beijing
+GMKRAW_MINIO_ROOT_PATH=raw-photo/images
+GMKRAW_MINIO_SECURE=true
 ```
 
 阿里云 OSS 可通过 S3 兼容方式接入，项目里使用 `minio` provider 对接即可。

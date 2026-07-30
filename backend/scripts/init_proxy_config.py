@@ -59,28 +59,28 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 
 
 def _warp_runtime_defaults() -> dict[str, Any]:
-    clearance_enabled = _env_bool("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED", True)
-    clearance_mode = os.getenv("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE", "flaresolverr").strip().lower()
+    clearance_enabled = _env_bool("GMKRAW_PROXY_RUNTIME_CLEARANCE_ENABLED", True)
+    clearance_mode = os.getenv("GMKRAW_PROXY_RUNTIME_CLEARANCE_MODE", "flaresolverr").strip().lower()
     if clearance_mode not in {"none", "manual", "flaresolverr"}:
         clearance_mode = "flaresolverr" if clearance_enabled else "none"
     if not clearance_enabled:
         clearance_mode = "none"
 
-    egress_mode = os.getenv("CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE", "single_proxy").strip().lower()
+    egress_mode = os.getenv("GMKRAW_PROXY_RUNTIME_EGRESS_MODE", "single_proxy").strip().lower()
     if egress_mode not in {"direct", "single_proxy"}:
         egress_mode = "single_proxy"
 
     runtime = copy.deepcopy(DEFAULT_PROXY_RUNTIME)
     runtime.update(
         {
-            "enabled": _env_bool("CHATGPT2API_PROXY_RUNTIME_ENABLED", True),
+            "enabled": _env_bool("GMKRAW_PROXY_RUNTIME_ENABLED", True),
             "egress_mode": egress_mode,
-            "proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_PROXY_URL", "http://privoxy:8118").strip(),
-            "resource_proxy_url": os.getenv("CHATGPT2API_PROXY_RUNTIME_RESOURCE_PROXY_URL", "").strip(),
-            "skip_ssl_verify": _env_bool("CHATGPT2API_PROXY_RUNTIME_SKIP_SSL_VERIFY", False),
+            "proxy_url": os.getenv("GMKRAW_PROXY_RUNTIME_PROXY_URL", "http://privoxy:8118").strip(),
+            "resource_proxy_url": os.getenv("GMKRAW_PROXY_RUNTIME_RESOURCE_PROXY_URL", "").strip(),
+            "skip_ssl_verify": _env_bool("GMKRAW_PROXY_RUNTIME_SKIP_SSL_VERIFY", False),
             "reset_session_status_codes": [
                 int(part.strip())
-                for part in os.getenv("CHATGPT2API_PROXY_RUNTIME_RESET_STATUS_CODES", "403").split(",")
+                for part in os.getenv("GMKRAW_PROXY_RUNTIME_RESET_STATUS_CODES", "403").split(",")
                 if part.strip().isdigit() and 100 <= int(part.strip()) <= 599
             ] or [403],
         }
@@ -89,12 +89,12 @@ def _warp_runtime_defaults() -> dict[str, Any]:
         {
             "enabled": clearance_enabled,
             "mode": clearance_mode,
-            "user_agent": os.getenv("CHATGPT2API_PROXY_RUNTIME_USER_AGENT", DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT,
-            "browser": os.getenv("CHATGPT2API_PROXY_RUNTIME_BROWSER", "chrome").strip() or "chrome",
-            "flaresolverr_url": os.getenv("CHATGPT2API_FLARESOLVERR_URL", "http://flaresolverr:8191").strip(),
-            "timeout_sec": _env_int("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC", 60, 1),
-            "refresh_interval": _env_int("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL", 3600, 60),
-            "warm_up_on_start": _env_bool("CHATGPT2API_PROXY_RUNTIME_WARM_UP_ON_START", False),
+            "user_agent": os.getenv("GMKRAW_PROXY_RUNTIME_USER_AGENT", DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT,
+            "browser": os.getenv("GMKRAW_PROXY_RUNTIME_BROWSER", "chrome").strip() or "chrome",
+            "flaresolverr_url": os.getenv("GMKRAW_FLARESOLVERR_URL", "http://flaresolverr:8191").strip(),
+            "timeout_sec": _env_int("GMKRAW_PROXY_RUNTIME_CLEARANCE_TIMEOUT_SEC", 60, 1),
+            "refresh_interval": _env_int("GMKRAW_PROXY_RUNTIME_CLEARANCE_REFRESH_INTERVAL", 3600, 60),
+            "warm_up_on_start": _env_bool("GMKRAW_PROXY_RUNTIME_WARM_UP_ON_START", False),
         }
     )
     return runtime
@@ -125,7 +125,7 @@ def _mask_url(value: str) -> str:
 
 
 def main() -> int:
-    config_path = Path(os.getenv("CHATGPT2API_CONFIG_FILE", "/app/config.json"))
+    config_path = Path(os.getenv("GMKRAW_CONFIG_FILE", "/app/config.json"))
     if not config_path.exists():
         print(f"Config file not found, creating {config_path}")
         data: dict[str, Any] = {}
@@ -143,7 +143,7 @@ def main() -> int:
     existing = data.get("proxy_runtime")
     changed = False
 
-    if _looks_like_repository_default(existing) or _env_bool("CHATGPT2API_PROXY_RUNTIME_FORCE", False):
+    if _looks_like_repository_default(existing) or _env_bool("GMKRAW_PROXY_RUNTIME_FORCE", False):
         data["proxy_runtime"] = desired
         changed = True
         print("Created proxy_runtime defaults")

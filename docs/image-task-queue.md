@@ -66,7 +66,7 @@ uv run python backend/scripts/migrate_image_task_assets.py --dry-run
 uv run python backend/scripts/migrate_image_task_assets.py
 ```
 
-The dry run only counts legacy assets. The write command stores task inputs and inline Base64 results as object references, then updates task JSON. It does not delete the original local image files. For Qiniu, set `CHATGPT2API_QINIU_TASK_PREFIX` for task assets and reserve `CHATGPT2API_QINIU_PREFIX` for public reference-image uploads.
+The dry run only counts legacy assets. The write command stores task inputs and inline Base64 results as object references, then updates task JSON. It does not delete the original local image files. For Qiniu, set `GMKRAW_QINIU_TASK_PREFIX` for task assets and reserve `GMKRAW_QINIU_PREFIX` for public reference-image uploads.
 
 Capture the current throughput and reliability baseline before changing worker concurrency:
 

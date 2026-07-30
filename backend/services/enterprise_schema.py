@@ -216,7 +216,7 @@ ENTERPRISE_TABLES = tuple(sorted(EnterpriseBase.metadata.tables))
 def resolve_enterprise_database_url(override: str | None = None) -> str:
     database_url = str(
         override
-        or os.getenv("CHATGPT2API_DATABASE_URL")
+        or os.getenv("GMKRAW_DATABASE_URL")
         or os.getenv("IMAGE_TASK_DATABASE_URL")
         or os.getenv("IMAGE_LIBRARY_DATABASE_URL")
         or os.getenv("MYSQL_DATABASE_URL")
@@ -224,7 +224,7 @@ def resolve_enterprise_database_url(override: str | None = None) -> str:
     ).strip()
     if not database_url:
         raise RuntimeError(
-            "enterprise database URL is required; set CHATGPT2API_DATABASE_URL or MYSQL_DATABASE_URL"
+            "enterprise database URL is required; set GMKRAW_DATABASE_URL or MYSQL_DATABASE_URL"
         )
     return database_url
 

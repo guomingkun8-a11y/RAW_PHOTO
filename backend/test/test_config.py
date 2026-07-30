@@ -39,12 +39,12 @@ class ConfigLoadingTests(unittest.TestCase):
             old_base_dir = module.BASE_DIR
             old_data_dir = module.DATA_DIR
             old_config_file = module.CONFIG_FILE
-            old_env_auth_key = module.os.environ.get("CHATGPT2API_AUTH_KEY")
+            old_env_auth_key = module.os.environ.get("GMKRAW_AUTH_KEY")
             try:
                 module.BASE_DIR = base_dir
                 module.DATA_DIR = data_dir
                 module.CONFIG_FILE = config_dir
-                module.os.environ["CHATGPT2API_AUTH_KEY"] = os_auth_key
+                module.os.environ["GMKRAW_AUTH_KEY"] = os_auth_key
 
                 settings = module._load_settings()
 
@@ -55,25 +55,25 @@ class ConfigLoadingTests(unittest.TestCase):
                 module.DATA_DIR = old_data_dir
                 module.CONFIG_FILE = old_config_file
                 if old_env_auth_key is None:
-                    module.os.environ.pop("CHATGPT2API_AUTH_KEY", None)
+                    module.os.environ.pop("GMKRAW_AUTH_KEY", None)
                 else:
-                    module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
+                    module.os.environ["GMKRAW_AUTH_KEY"] = old_env_auth_key
 
     def test_qiniu_prefixes_are_separate_for_tasks_and_references(self) -> None:
         module = self.config_module
         with mock.patch.dict(
             module.os.environ,
             {
-                "CHATGPT2API_QINIU_PREFIX": "chatgpt2api/reference",
-                "CHATGPT2API_QINIU_TASK_PREFIX": "chatgpt2api/task-assets",
+                "GMKRAW_QINIU_PREFIX": "gmkraw/reference",
+                "GMKRAW_QINIU_TASK_PREFIX": "gmkraw/task-assets",
             },
             clear=False,
         ):
             storage = module._normalize_image_storage_settings({})
             reference = module._normalize_image_reference_upload_settings({})
 
-        self.assertEqual(storage["qiniu_prefix"], "chatgpt2api/task-assets")
-        self.assertEqual(reference["qiniu_prefix"], "chatgpt2api/reference")
+        self.assertEqual(storage["qiniu_prefix"], "gmkraw/task-assets")
+        self.assertEqual(reference["qiniu_prefix"], "gmkraw/reference")
 
     def test_reference_upload_normalizes_legacy_provider_config_to_qiniu_only(self) -> None:
         module = self.config_module
@@ -108,9 +108,9 @@ class ConfigLoadingTests(unittest.TestCase):
         with mock.patch.dict(
             module.os.environ,
             {
-                "CHATGPT2API_OPENAI_RELAY_API_KEY": "legacy-key",
-                "CHATGPT2API_OPENAI_RELAY_API_KEYS": "pool-a\npool-b,pool-a",
-                "CHATGPT2API_OPENAI_RELAY_POOL_DISTRIBUTED": "true",
+                "GMKRAW_OPENAI_RELAY_API_KEY": "legacy-key",
+                "GMKRAW_OPENAI_RELAY_API_KEYS": "pool-a\npool-b,pool-a",
+                "GMKRAW_OPENAI_RELAY_POOL_DISTRIBUTED": "true",
             },
             clear=False,
         ):

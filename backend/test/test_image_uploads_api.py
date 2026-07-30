@@ -10,7 +10,7 @@ import api.image_uploads as image_uploads_module
 from services.reference_image_uploader import ReferenceUploadResult
 
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
+AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
 
 
 class ImageUploadsApiTests(unittest.TestCase):

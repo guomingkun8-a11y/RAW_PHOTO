@@ -9,7 +9,7 @@ For local development, `.env.local` is loaded automatically and is ignored by bo
 1. Copy `.env.example` to the deployment secret store, not into source control.
 2. Replace every placeholder with a newly generated value.
 3. Rotate any provider credential that was previously stored in `config.json`.
-4. Set `CHATGPT2API_STRICT_SECRET_SOURCES=true` in production.
+4. Set `GMKRAW_STRICT_SECRET_SOURCES=true` in production.
 5. Run the audit before deployment:
 
 ```bash

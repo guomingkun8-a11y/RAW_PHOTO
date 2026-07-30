@@ -1,6 +1,6 @@
 # 部署与升级指南
 
-本文介绍 ChatGPT2API 的常见部署方式，以及后续升级项目时需要保留的数据和执行步骤。
+本文介绍 GMKRAW 的常见部署方式，以及后续升级项目时需要保留的数据和执行步骤。
 
 ## 部署前准备
 
@@ -33,15 +33,15 @@ git --version
 适合不需要 WARP / FlareSolverr 清障的场景。
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
+git clone git@github.com:basketikun/gmkraw.git
+cd gmkraw
 ```
 
 设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
 
 ```yaml
 environment:
-  - CHATGPT2API_AUTH_KEY=your_secret_key
+  - GMKRAW_AUTH_KEY=your_secret_key
 ```
 
 启动：
@@ -65,7 +65,7 @@ http://localhost:3000/v1
 查看日志：
 
 ```bash
-docker logs -f chatgpt2api
+docker logs -f gmkraw
 ```
 
 停止：
@@ -93,7 +93,7 @@ cp .env.example .env
 至少修改 `.env` 中的：
 
 ```text
-CHATGPT2API_AUTH_KEY=your_secret_key_here
+GMKRAW_AUTH_KEY=your_secret_key_here
 ```
 
 启动：
@@ -119,8 +119,8 @@ docker compose -f docker-compose.warp.yml ps
 查看日志：
 
 ```bash
-docker logs -f chatgpt2api-warp
-docker logs -f chatgpt2api-flaresolverr
+docker logs -f gmkraw-warp
+docker logs -f gmkraw-flaresolverr
 ```
 
 停止：
@@ -136,8 +136,8 @@ docker compose -f docker-compose.warp.yml down
 后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
+git clone git@github.com:basketikun/gmkraw.git
+cd gmkraw
 uv sync
 uv run main.py
 ```
@@ -191,13 +191,13 @@ environment:
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+tar -czf backups/gmkraw-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 ```
 
 如果没有 `.env`，可以去掉：
 
 ```bash
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json data
+tar -czf backups/gmkraw-$(date +%Y%m%d-%H%M%S).tgz config.json data
 ```
 
 也可以在后台设置页配置 Cloudflare R2 备份，用于定时备份关键数据。
@@ -207,14 +207,14 @@ tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json data
 进入项目目录：
 
 ```bash
-cd chatgpt2api
+cd gmkraw
 ```
 
 备份：
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+tar -czf backups/gmkraw-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 ```
 
 拉取最新代码和镜像：
@@ -229,7 +229,7 @@ docker compose up -d
 
 ```bash
 docker compose ps
-docker logs -f chatgpt2api
+docker logs -f gmkraw
 ```
 
 ## 升级：WARP / FlareSolverr 部署
@@ -237,14 +237,14 @@ docker logs -f chatgpt2api
 进入项目目录：
 
 ```bash
-cd chatgpt2api
+cd gmkraw
 ```
 
 备份：
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
+tar -czf backups/gmkraw-$(date +%Y%m%d-%H%M%S).tgz config.json .env data
 ```
 
 拉取最新代码并重新构建：
@@ -258,13 +258,13 @@ docker compose -f docker-compose.warp.yml up -d --build
 
 ```bash
 docker compose -f docker-compose.warp.yml ps
-docker logs -f chatgpt2api-warp
+docker logs -f gmkraw-warp
 ```
 
 ## 升级：源码运行
 
 ```bash
-cd chatgpt2api
+cd gmkraw
 git pull
 uv sync
 ```
@@ -329,13 +329,13 @@ docker compose ps
 查看主服务日志：
 
 ```bash
-docker logs -f chatgpt2api
+docker logs -f gmkraw
 ```
 
 查看 WARP 部署主服务日志：
 
 ```bash
-docker logs -f chatgpt2api-warp
+docker logs -f gmkraw-warp
 ```
 
 重启普通部署：

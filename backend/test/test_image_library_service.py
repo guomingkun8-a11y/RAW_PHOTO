@@ -41,7 +41,7 @@ class ImageLibraryServiceTests(unittest.TestCase):
         )
 
     def png_bytes(self) -> bytes:
-        path = Path(tempfile.gettempdir()) / "chatgpt2api-library-test-image.png"
+        path = Path(tempfile.gettempdir()) / "gmkraw-library-test-image.png"
         Image.new("RGB", (2, 2), color=(255, 0, 0)).save(path, format="PNG")
         return path.read_bytes()
 

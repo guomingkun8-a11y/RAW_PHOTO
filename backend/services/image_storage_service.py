@@ -243,9 +243,9 @@ class WebDAVClient:
             return {"ok": False, "status": 0, "error": "WebDAV URL is required"}
         if urlparse(self.url).scheme not in {"http", "https"}:
             return {"ok": False, "status": 0, "error": "invalid WebDAV URL"}
-        test_rel = ".chatgpt2api_webdav_test.txt"
+        test_rel = ".gmkraw_webdav_test.txt"
         try:
-            self.put(test_rel, b"chatgpt2api webdav test\n", content_type="text/plain")
+            self.put(test_rel, b"gmkraw webdav test\n", content_type="text/plain")
             self.delete(test_rel)
             return {"ok": True, "status": 200, "error": None}
         except ImageStorageError as exc:
@@ -329,9 +329,9 @@ class MinIOClient:
             raise ImageStorageError(f"MinIO DELETE failed: {exc.code}") from exc
 
     def test(self) -> dict[str, object]:
-        test_rel = ".chatgpt2api_minio_test.txt"
+        test_rel = ".gmkraw_minio_test.txt"
         try:
-            self.put(test_rel, b"chatgpt2api minio test\n", content_type="text/plain")
+            self.put(test_rel, b"gmkraw minio test\n", content_type="text/plain")
             self.delete(test_rel)
             return {"ok": True, "status": 200, "error": None}
         except ImageStorageError as exc:
@@ -464,9 +464,9 @@ class QiniuClient:
         raise ImageStorageError(f"Qiniu delete failed: HTTP {response.status_code}")
 
     def test(self) -> dict[str, object]:
-        rel = ".chatgpt2api_qiniu_test.txt"
+        rel = ".gmkraw_qiniu_test.txt"
         try:
-            self.put(rel, b"chatgpt2api qiniu test\n", "text/plain")
+            self.put(rel, b"gmkraw qiniu test\n", "text/plain")
             self.delete(rel)
             return {"ok": True, "status": 200, "error": None}
         except ImageStorageError as exc:
