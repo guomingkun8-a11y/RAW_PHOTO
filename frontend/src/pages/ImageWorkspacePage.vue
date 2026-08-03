@@ -8,6 +8,7 @@ import ImageComposer from "@/components/image/ImageComposer.vue";
 import ImageLightbox from "@/components/image/ImageLightbox.vue";
 import ImageResults from "@/components/image/ImageResults.vue";
 import { useImageWorkspace } from "@/composables/useImageWorkspace";
+import { resolveApiAssetUrl } from "@/lib/api";
 import { getImageConversationStats } from "@/stores/image-conversations";
 import { sessionState } from "@/stores/session";
 
@@ -49,6 +50,14 @@ const {
 const resultsViewport = ref<HTMLDivElement | null>(null);
 const showScrollLatest = ref(false);
 const recent = computed(() => conversations.value.slice(0, 4));
+const recentStats = computed(() => new Map(recent.value.map((conversation) => {
+  const stats = getImageConversationStats(conversation);
+  const success = conversation.turns.reduce((n, turn) => n + turn.images.filter((image) => image.status === "success").length, 0);
+  return [conversation.id, { ...stats, success }];
+})));
+const currentUserName = computed(() => sessionState.session?.name || sessionState.session?.username || "用户");
+const currentUserInitial = computed(() => currentUserName.value.trim().slice(0, 1).toUpperCase() || "U");
+const currentUserAvatarUrl = computed(() => resolveApiAssetUrl(sessionState.session?.avatarUrl));
 
 function onResultsScroll() {
   const element = resultsViewport.value;
@@ -98,7 +107,7 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
                   {{ conversation.turns.length }} 轮 / {{ workspace.formatConversationTime(conversation.updatedAt) }}
                 </span>
                 <span class="mt-1 inline-flex rounded-full bg-white px-2 py-0.5 text-[11px] text-slate-500 dark:bg-white/[0.08]">
-                  {{ getImageConversationStats(conversation).running ? `${getImageConversationStats(conversation).running} 个生成中` : `${conversation.turns.reduce((n, turn) => n + turn.images.filter((image) => image.status === 'success').length, 0)} 张成功` }}
+                  {{ recentStats.get(conversation.id)?.running ? `${recentStats.get(conversation.id)?.running} 个生成中` : `${recentStats.get(conversation.id)?.success || 0} 张成功` }}
                 </span>
               </button>
               <button type="button" class="studio-button absolute right-1.5 top-1.5 inline-flex size-7 items-center justify-center rounded-lg text-slate-400 opacity-100 hover:bg-rose-50 hover:text-rose-600 sm:opacity-0 sm:group-hover:opacity-100" aria-label="删除图片任务" @click.stop="workspace.requestDeleteConversation(conversation.id)">
@@ -114,6 +123,9 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
               :conversation="selectedConversation"
               :timeout-retry="timeoutRetry"
               :allow-timeout-retry-continue="!isOpenAIRelayEnabled"
+              :user-name="currentUserName"
+              :user-initial="currentUserInitial"
+              :user-avatar-url="currentUserAvatarUrl"
               :format-conversation-time="workspace.formatConversationTime"
               @open-lightbox="workspace.openLightbox"
               @continue-edit="workspace.continueEdit"

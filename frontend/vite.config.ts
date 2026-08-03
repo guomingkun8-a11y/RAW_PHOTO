@@ -35,6 +35,7 @@ export default defineConfig({
       "/v1": { target: "http://127.0.0.1:8002", changeOrigin: false },
       "/images": { target: "http://127.0.0.1:8002", changeOrigin: false },
       "/image-thumbnails": { target: "http://127.0.0.1:8002", changeOrigin: false },
+      "/avatars": { target: "http://127.0.0.1:8002", changeOrigin: false },
     },
   },
   build: {

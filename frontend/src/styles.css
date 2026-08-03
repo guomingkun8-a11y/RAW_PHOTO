@@ -171,6 +171,10 @@
     box-shadow: var(--studio-shadow);
   }
 
+  .monitoring-page .studio-card:hover {
+    transform: none;
+  }
+
   .image-single-page .studio-button:hover,
   .image-single-page [class*="hover:scale"]:hover,
   .image-single-page [class*="hover:-translate-y"]:hover {

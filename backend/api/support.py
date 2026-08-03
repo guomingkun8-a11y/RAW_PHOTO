@@ -23,6 +23,8 @@ def extract_bearer_token(authorization: str | None) -> str:
 
 
 def _legacy_admin_identity(token: str) -> dict[str, object] | None:
+    if not config.legacy_auth_key_admin_enabled:
+        return None
     auth_key = str(config.auth_key or "").strip()
     if auth_key and token == auth_key:
         return {"id": "local-admin", "username": "legacy-admin", "name": "管理员", "role": "admin"}

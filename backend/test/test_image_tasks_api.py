@@ -13,6 +13,7 @@ import api.image_tasks as image_tasks_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
+TEST_IDENTITY = {"id": "test-user", "username": "tester", "name": "Tester", "role": "user"}
 PNG_BYTES = b"\x89PNG\r\n\x1a\n"
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
@@ -76,9 +77,19 @@ class FakeImageTaskService:
 class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
         self.fake_service = FakeImageTaskService()
+        self.identity_patcher = mock.patch.object(image_tasks_module, "require_identity", return_value=TEST_IDENTITY)
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)
         self.service_patcher.start()
         self.addCleanup(self.service_patcher.stop)
+        self.storage_patcher = mock.patch.object(
+            image_tasks_module.image_storage_service,
+            "get_bytes",
+            return_value=PNG_BYTES,
+        )
+        self.storage_patcher.start()
+        self.addCleanup(self.storage_patcher.stop)
         self.public_url_patcher = mock.patch.object(
             image_tasks_module.openai_relay_service,
             "requires_public_image_urls",
@@ -207,7 +218,11 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertIs(self.fake_service.edit_calls[0][1]["preserve_subject"], True)
 
     def test_list_tasks_reports_missing_ids(self):
-        response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)
+        response = self.client.post(
+            "/api/image-tasks/query",
+            headers=AUTH_HEADERS,
+            json={"ids": ["task-1", "missing"]},
+        )
 
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
@@ -222,7 +237,7 @@ class ImageTasksApiTests(unittest.TestCase):
                 "folder_name": "商品图片-任务1",
                 "items": [
                     {
-                        "b64_json": base64.b64encode(PNG_BYTES).decode("ascii"),
+                        "task_id": "task-1",
                         "filename": "结果图.png",
                     }
                 ],
@@ -235,6 +250,41 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertIn("filename*=UTF-8''", response.headers["content-disposition"])
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             self.assertEqual(archive.namelist(), ["商品图片-任务1/结果图.png"])
+
+    def test_download_zip_fetches_external_result_url(self):
+        def list_tasks(_identity, ids):
+            return {
+                "items": [
+                    {
+                        "id": task_id,
+                        "status": "success",
+                        "mode": "generate",
+                        "created_at": "2026-01-01 00:00:00",
+                        "updated_at": "2026-01-01 00:00:00",
+                        "data": [{"url": "https://cdn.example.test/result.png"}],
+                    }
+                    for task_id in ids
+                ],
+                "missing_ids": [],
+            }
+
+        with (
+            mock.patch.object(self.fake_service, "list_tasks", side_effect=list_tasks),
+            mock.patch.object(image_tasks_module, "_download_image_url", return_value=(PNG_BYTES, "result.png", "image/png")) as download,
+        ):
+            response = self.client.post(
+                "/api/image-tasks/download-zip",
+                headers=AUTH_HEADERS,
+                json={
+                    "folder_name": "results",
+                    "items": [{"task_id": "external-1", "filename": "one.png"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        download.assert_called_once_with("https://cdn.example.test/result.png")
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ["results/one.png"])
 
     def test_cancel_image_task(self):
         response = self.client.post("/api/image-tasks/task-1/cancel", headers=AUTH_HEADERS)

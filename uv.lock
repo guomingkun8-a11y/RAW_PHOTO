@@ -244,59 +244,6 @@ wheels = [
 ]
 
 [[package]]
-name = "gmkraw"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "captcha" },
-    { name = "celery" },
-    { name = "curl-cffi" },
-    { name = "fastapi" },
-    { name = "gitpython" },
-    { name = "minio" },
-    { name = "pillow" },
-    { name = "psycopg2-binary" },
-    { name = "pybase64" },
-    { name = "pymysql" },
-    { name = "python-dotenv" },
-    { name = "python-multipart" },
-    { name = "qiniu" },
-    { name = "redis" },
-    { name = "sqlalchemy" },
-    { name = "tiktoken" },
-    { name = "uvicorn" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "httpx" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "captcha", specifier = ">=0.7.1" },
-    { name = "celery", specifier = ">=5.5.0" },
-    { name = "curl-cffi", specifier = ">=0.15.0" },
-    { name = "fastapi", specifier = ">=0.136.0" },
-    { name = "gitpython", specifier = ">=3.1.0" },
-    { name = "minio", specifier = ">=7.2.15" },
-    { name = "pillow", specifier = ">=12.2.0" },
-    { name = "psycopg2-binary", specifier = ">=2.9.0" },
-    { name = "pybase64", specifier = ">=1.4.3" },
-    { name = "pymysql", specifier = ">=1.2.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "python-multipart", specifier = ">=0.0.26" },
-    { name = "qiniu", specifier = ">=7.18.0" },
-    { name = "redis", specifier = ">=5.0.0" },
-    { name = "sqlalchemy", specifier = ">=2.0.0" },
-    { name = "tiktoken", specifier = ">=0.12.0" },
-    { name = "uvicorn", specifier = ">=0.44.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "httpx", specifier = ">=0.28.1" }]
-
-[[package]]
 name = "click"
 version = "8.3.2"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
@@ -426,6 +373,57 @@ sdist = { url = "https://mirrors.aliyun.com/pypi/packages/c1/bd/50db468e9b131052
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/f2/c5/a1bc0996af85757903cf2bf444a7824e68e0035ce63fb41d6f76f9def68b/gitpython-3.1.47-py3-none-any.whl", hash = "sha256:489f590edfd6d20571b2c0e72c6a6ac6915ee8b8cd04572330e3842207a78905" },
 ]
+
+[[package]]
+name = "gmkraw"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "captcha" },
+    { name = "celery" },
+    { name = "curl-cffi" },
+    { name = "fastapi" },
+    { name = "gitpython" },
+    { name = "minio" },
+    { name = "pillow" },
+    { name = "psycopg2-binary" },
+    { name = "pybase64" },
+    { name = "pymysql" },
+    { name = "python-dotenv" },
+    { name = "python-multipart" },
+    { name = "redis" },
+    { name = "sqlalchemy" },
+    { name = "tiktoken" },
+    { name = "uvicorn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "captcha", specifier = ">=0.7.1" },
+    { name = "celery", specifier = ">=5.5.0" },
+    { name = "curl-cffi", specifier = ">=0.15.0" },
+    { name = "fastapi", specifier = ">=0.136.0" },
+    { name = "gitpython", specifier = ">=3.1.0" },
+    { name = "minio", specifier = ">=7.2.15" },
+    { name = "pillow", specifier = ">=12.2.0" },
+    { name = "psycopg2-binary", specifier = ">=2.9.0" },
+    { name = "pybase64", specifier = ">=1.4.3" },
+    { name = "pymysql", specifier = ">=1.2.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "python-multipart", specifier = ">=0.0.26" },
+    { name = "redis", specifier = ">=5.0.0" },
+    { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
+    { name = "uvicorn", specifier = ">=0.44.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "httpx", specifier = ">=0.28.1" }]
 
 [[package]]
 name = "greenlet"
@@ -915,18 +913,6 @@ source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/88/71/b145a380824a960ebd60e1014256dbb7d2253f2316ff2d73dfd8928ec2c3/python_multipart-0.0.26.tar.gz", hash = "sha256:08fadc45918cd615e26846437f50c5d6d23304da32c341f289a617127b081f17" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/9a/22/f1925cdda983ab66fc8ec6ec8014b959262747e58bdca26a4e3d1da29d56/python_multipart-0.0.26-py3-none-any.whl", hash = "sha256:c0b169f8c4484c13b0dcf2ef0ec3a4adb255c4b7d18d8e420477d2b1dd03f185" },
-]
-
-[[package]]
-name = "qiniu"
-version = "7.18.0"
-source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
-dependencies = [
-    { name = "requests" },
-]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/32/e5/82e5078de1204b641d6b24fdd15b3c5a87a7dd71f514e4a3cfb845a2d988/qiniu-7.18.0.tar.gz", hash = "sha256:d9edca3a1c5217c13638a08d9095cd1661f5ba6cf92ea3827949ff3d332ea4fa" }
-wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/1d/56/9368cd96d2132017f5748a812cb20a87263498de314e1823472cb4bdbad9/qiniu-7.18.0-py3-none-any.whl", hash = "sha256:0f1be608ac6800ad5f32690d1aa02353b6b2ff5edc78f32a2318859d375a27df" },
 ]
 
 [[package]]

@@ -7,7 +7,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/", redirect: "/image" },
   { path: "/login", name: "login", component: () => import("@/pages/AuthPage.vue"), meta: { public: true, auth: true } },
   { path: "/register", name: "register", component: () => import("@/pages/AuthPage.vue"), meta: { public: true, auth: true } },
-  { path: "/image", name: "image", component: () => import("@/pages/ImageWorkspacePage.vue") },
+  { path: "/image", name: "image", component: () => import("@/pages/ImageWorkspacePage.vue"), meta: { keepAlive: true } },
   { path: "/image-library", name: "image-library", component: () => import("@/pages/ImageLibraryPage.vue") },
   { path: "/products", redirect: "/image" },
   { path: "/prompt-templates", name: "prompt-templates", component: () => import("@/pages/PromptTemplatesPage.vue") },

@@ -13,6 +13,7 @@ Base = declarative_base()
 
 DEFAULT_DATABASE_URL = "mysql+pymysql://root:root@127.0.0.1:3306/raw_photo?charset=utf8mb4"
 LONG_TEXT = Text().with_variant(LONGTEXT, "mysql")
+INLINE_IMAGE_REMOTE_LIMIT = 2048
 
 
 class ImageConversationModel(Base):
@@ -58,7 +59,34 @@ def _normalize_payload(conversation_id: str, payload: dict[str, Any], *, title: 
     normalized["updatedAt"] = _clean(normalized.get("updatedAt")) or now
     if not isinstance(normalized.get("turns"), list):
         normalized["turns"] = []
-    return normalized
+    return _slim_payload_for_storage(normalized)
+
+
+def _is_image_data_url(value: str) -> bool:
+    return value.lower().startswith("data:image/") and ";base64," in value[:128].lower()
+
+
+def _slim_payload_for_storage(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_slim_payload_for_storage(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    has_url = bool(_clean(value.get("url")))
+    result: dict[str, Any] = {}
+    for key, child in value.items():
+        clean_key = str(key)
+        if clean_key == "b64_json":
+            continue
+        if (
+            clean_key == "dataUrl"
+            and isinstance(child, str)
+            and _is_image_data_url(child)
+            and (has_url or len(child) > INLINE_IMAGE_REMOTE_LIMIT)
+        ):
+            continue
+        result[clean_key] = _slim_payload_for_storage(child)
+    return result
 
 
 def _payload_from_row(row: ImageConversationModel) -> dict[str, Any]:
@@ -203,7 +231,7 @@ class ImageConversationService:
             payload["title"] = clean_title
             payload["updatedAt"] = datetime.now().isoformat(timespec="seconds")
             row.title = clean_title
-            row.payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            row.payload_json = json.dumps(_slim_payload_for_storage(payload), ensure_ascii=False, separators=(",", ":"))
             row.updated_at = datetime.now()
             session.commit()
             return _payload_from_row(row)

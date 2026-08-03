@@ -1,75 +1,76 @@
-import base64
 from concurrent.futures import ThreadPoolExecutor
-import json
 import threading
 import time
-from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from minio.error import S3Error
+
 from services import reference_image_uploader
-from services.reference_image_uploader import _qiniu_token, _urlsafe_base64
 
 
-class QiniuUploadTokenTests(unittest.TestCase):
+def _s3_error(code: str) -> S3Error:
+    return S3Error(
+        response=Mock(),
+        code=code,
+        message=code,
+        resource="/bucket/key",
+        request_id="request-id",
+        host_id="host-id",
+        bucket_name="bucket",
+        object_name="key",
+    )
+
+
+class FakeOSSClient:
+    def __init__(self, *, exists: bool = False):
+        self.exists = exists
+        self.stat_calls: list[tuple[str, str]] = []
+        self.put_calls: list[dict[str, object]] = []
+
+    def stat_object(self, bucket: str, key: str) -> None:
+        self.stat_calls.append((bucket, key))
+        if not self.exists:
+            raise _s3_error("NoSuchKey")
+
+    def put_object(self, bucket: str, key: str, data, **kwargs) -> None:
+        self.put_calls.append(
+            {
+                "bucket": bucket,
+                "key": key,
+                "payload": data.read(),
+                **kwargs,
+            }
+        )
+
+
+class OSSReferenceUploadTests(unittest.TestCase):
     def setUp(self):
         reference_image_uploader._upload_url_cache.clear()
         reference_image_uploader._upload_inflight.clear()
-        reference_image_uploader._qiniu_endpoint_open_until.clear()
         reference_image_uploader._upload_serial_until = 0.0
-        self.zone_patcher = patch("qiniu.Zone")
-        zone_class = self.zone_patcher.start()
-        zone_class.return_value.get_up_host.return_value = [
-            "https://upload-z0.qiniup.com",
-            "https://up-z0.qiniup.com",
-        ]
-        self.addCleanup(self.zone_patcher.stop)
 
     @staticmethod
-    def qiniu_settings():
+    def oss_settings():
         return {
             "enabled": True,
-            "provider": "qiniu",
-            "qiniu_access_key": "ak",
-            "qiniu_secret_key": "sk",
-            "qiniu_bucket": "bucket",
-            "qiniu_domain": "https://cdn.example.test",
-            "qiniu_upload_url": "https://upload-z0.qiniup.com",
-            "qiniu_prefix": "reference",
+            "provider": "oss",
+            "oss_endpoint": "https://oss-cn-beijing.aliyuncs.com",
+            "oss_access_key": "ak",
+            "oss_secret_key": "sk",
+            "oss_bucket": "bucket",
+            "oss_region": "oss-cn-beijing",
+            "oss_secure": True,
+            "oss_prefix": "reference",
+            "public_base_url": "https://cdn.example.test",
             "timeout_sec": 45,
+            "persistent_cache_enabled": False,
         }
-
-    @staticmethod
-    def qiniu_sdk_patches():
-        auth = Mock()
-        auth.upload_token.return_value = "upload-token"
-        bucket_manager = Mock()
-        bucket_manager.stat.return_value = (None, SimpleNamespace(status_code=612))
-        return auth, bucket_manager
-
-    def test_urlsafe_base64_keeps_qiniu_padding(self):
-        self.assertEqual(_urlsafe_base64(b"{}"), "e30=")
-
-    def test_qiniu_token_policy_segment_remains_decodable_with_padding(self):
-        with patch("services.reference_image_uploader.time.time", return_value=1000):
-            token = _qiniu_token("bucket", "folder/image.png", "ak", "sk")
-
-        access_key, _signature, encoded_policy = token.split(":")
-        expected_policy = json.dumps(
-            {"scope": "bucket:folder/image.png", "deadline": 4600},
-            separators=(",", ":"),
-        ).encode("utf-8")
-        policy = json.loads(base64.urlsafe_b64decode(encoded_policy).decode("utf-8"))
-
-        self.assertEqual(access_key, "ak")
-        self.assertEqual(encoded_policy, base64.urlsafe_b64encode(expected_policy).decode("ascii"))
-        self.assertEqual(policy["scope"], "bucket:folder/image.png")
-        self.assertEqual(policy["deadline"], 4600)
 
     def test_upload_images_reuses_cached_identical_image(self):
         with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(reference_image_uploader, "upload_to_qiniu", return_value="https://cdn.example.test/reference/a.png") as upload,
+            patch.object(reference_image_uploader, "settings", side_effect=self.oss_settings),
+            patch.object(reference_image_uploader, "upload_to_oss", return_value="https://cdn.example.test/reference/a.png") as upload,
         ):
             urls = reference_image_uploader.upload_images([
                 (b"same-image", "one.png", "image/png"),
@@ -89,8 +90,8 @@ class QiniuUploadTokenTests(unittest.TestCase):
             return "https://cdn.example.test/reference/slow.png"
 
         with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(reference_image_uploader, "upload_to_qiniu", side_effect=slow_upload) as upload,
+            patch.object(reference_image_uploader, "settings", side_effect=self.oss_settings),
+            patch.object(reference_image_uploader, "upload_to_oss", side_effect=slow_upload) as upload,
             patch.object(reference_image_uploader, "_UPLOAD_INFLIGHT_WAIT_SLICE_SECONDS", 0.01),
             patch.object(reference_image_uploader, "_UPLOAD_INFLIGHT_MAX_WAIT_SECONDS", 1),
         ):
@@ -108,167 +109,53 @@ class QiniuUploadTokenTests(unittest.TestCase):
         self.assertTrue(waiter_result.cached)
         upload.assert_called_once()
 
-    def test_qiniu_key_is_stable_for_identical_content(self):
+    def test_object_key_is_stable_for_identical_content(self):
         digest = "a" * 64
-        with patch.object(reference_image_uploader, "settings", return_value={"qiniu_prefix": "reference"}):
-            first = reference_image_uploader._qiniu_key("one.png", digest, "image/png")
-            second = reference_image_uploader._qiniu_key("two.png", digest, "image/png")
+        with patch.object(reference_image_uploader, "settings", return_value={"oss_prefix": "reference"}):
+            first = reference_image_uploader._object_key("one.png", digest, "image/png")
+            second = reference_image_uploader._object_key("two.png", digest, "image/png")
 
         self.assertEqual(first, second)
         self.assertEqual(first, f"reference/sha256/aa/{digest}.png")
 
-    def test_qiniu_sdk_session_ignores_windows_system_proxy(self):
-        from qiniu.http.default_client import qn_http_client
+    def test_public_base_url_uses_bucket_host_when_no_explicit_url(self):
+        item = {
+            "oss_endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+            "oss_bucket": "raw-photo",
+            "public_base_url": "",
+        }
 
-        qn_http_client.session.trust_env = True
-        reference_image_uploader._configure_qiniu_direct_session()
-
-        self.assertFalse(qn_http_client.session.trust_env)
-
-    def test_qiniu_upload_zone_uses_configured_https_primary_and_backup(self):
-        zone = reference_image_uploader._qiniu_upload_zone("https://upload-z0.qiniup.com")
-
-        self.assertEqual(zone.scheme, "https")
-        self.assertEqual(zone.up_host, "https://upload-z0.qiniup.com")
-        self.assertEqual(zone.up_host_backup, "https://up-z0.qiniup.com")
-
-    def test_qiniu_upload_endpoints_prefer_sdk_region_discovery(self):
-        import qiniu
-
-        qiniu.Zone.return_value.get_up_host.return_value = ["https://upload.qiniup.com", "https://up.qiniup.com"]
-        endpoints = reference_image_uploader._resolve_qiniu_upload_endpoints(
-            "ak", "bucket", "https://upload-z0.qiniup.com",
+        self.assertEqual(
+            reference_image_uploader._public_base_url(item),
+            "https://raw-photo.oss-cn-hangzhou.aliyuncs.com",
         )
 
-        self.assertEqual(endpoints, ["https://upload.qiniup.com", "https://up.qiniup.com"])
-
-    def test_small_qiniu_payload_uses_form_upload(self):
-        import qiniu
-
-        auth, bucket_manager = self.qiniu_sdk_patches()
-        put_data = Mock(return_value=({"key": "reference/a.png"}, SimpleNamespace(status_code=200)))
+    def test_upload_to_oss_reuses_existing_object(self):
+        client = FakeOSSClient(exists=True)
         with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(qiniu, "Auth", return_value=auth),
-            patch.object(qiniu, "BucketManager", return_value=bucket_manager),
-            patch.object(qiniu, "put_data", put_data),
+            patch.object(reference_image_uploader, "settings", side_effect=self.oss_settings),
+            patch.object(reference_image_uploader, "_oss_client", return_value=client),
         ):
-            url = reference_image_uploader._upload_to_qiniu_sdk(
-                b"small-image", "small.png", "image/png", key="reference/a.png", timeout=45,
-            )
+            url = reference_image_uploader.upload_to_oss(b"image", "image.png", "image/png")
 
-        self.assertEqual(url, "https://cdn.example.test/reference/a.png")
-        put_data.assert_called_once()
+        self.assertTrue(url.startswith("https://cdn.example.test/reference/sha256/"))
+        self.assertEqual(len(client.stat_calls), 1)
+        self.assertEqual(client.put_calls, [])
 
-    def test_large_qiniu_payload_uses_resumable_upload(self):
-        import qiniu
-
-        auth, bucket_manager = self.qiniu_sdk_patches()
-        put_data = Mock()
-        put_stream = Mock(return_value=({"key": "reference/large.png"}, SimpleNamespace(status_code=200)))
-        payload = b"x" * reference_image_uploader._QINIU_RESUMABLE_THRESHOLD
+    def test_upload_to_oss_puts_missing_object_sequentially(self):
+        client = FakeOSSClient(exists=False)
         with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(qiniu, "Auth", return_value=auth),
-            patch.object(qiniu, "BucketManager", return_value=bucket_manager),
-            patch.object(qiniu, "put_data", put_data),
-            patch.object(reference_image_uploader, "_put_qiniu_resumable_data", put_stream),
+            patch.object(reference_image_uploader, "settings", side_effect=self.oss_settings),
+            patch.object(reference_image_uploader, "_oss_client", return_value=client),
         ):
-            reference_image_uploader._upload_to_qiniu_sdk(
-                payload, "large.png", "image/png", key="reference/large.png", timeout=45,
-            )
+            url = reference_image_uploader.upload_to_oss(b"image", "image.png", "image/png")
 
-        put_data.assert_not_called()
-        put_stream.assert_called_once()
-        args, _kwargs = put_stream.call_args
-        self.assertEqual(args[2], payload)
-        self.assertEqual(args[5], "bucket")
-
-    def test_resumable_uploader_forces_sequential_parts(self):
-        uploader = Mock()
-        uploader.upload.return_value = ({"key": "reference/large.png"}, SimpleNamespace(status_code=200))
-        recorder = Mock()
-        zone = reference_image_uploader._qiniu_single_endpoint_zone("https://upload.qiniup.com")
-        with (
-            patch("qiniu.services.storage.upload_progress_recorder.UploadProgressRecorder", return_value=recorder),
-            patch("qiniu.services.storage.uploaders.ResumeUploaderV2", return_value=uploader) as uploader_class,
-        ):
-            reference_image_uploader._put_qiniu_resumable_data(
-                "token", "reference/large.png", b"large", "large.png", "image/png", "bucket", zone,
-            )
-
-        self.assertIsNone(uploader_class.call_args.kwargs["concurrent_executor"])
-        self.assertEqual(uploader_class.call_args.kwargs["part_size"], 1 * 1024 * 1024)
-        self.assertEqual(uploader.upload.call_args.kwargs["data_size"], 5)
-
-    def test_resumable_upload_retries_primary_before_backup(self):
-        import qiniu
-
-        auth, bucket_manager = self.qiniu_sdk_patches()
-        payload = b"x" * reference_image_uploader._QINIU_RESUMABLE_THRESHOLD
-        put_stream = Mock(side_effect=[
-            (None, SimpleNamespace(status_code=-1, exception=TimeoutError("write timed out"))),
-            ({"key": "reference/large.png"}, SimpleNamespace(status_code=200)),
-        ])
-        with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(qiniu, "Auth", return_value=auth),
-            patch.object(qiniu, "BucketManager", return_value=bucket_manager),
-            patch.object(reference_image_uploader, "_put_qiniu_resumable_data", put_stream),
-            patch.object(reference_image_uploader.time, "sleep"),
-        ):
-            reference_image_uploader._upload_to_qiniu_sdk(
-                payload, "large.png", "image/png", key="reference/large.png", timeout=45,
-            )
-
-        self.assertEqual(put_stream.call_count, 2)
-        self.assertEqual(put_stream.call_args_list[0].args[6].up_host, "https://upload-z0.qiniup.com")
-        self.assertEqual(put_stream.call_args_list[1].args[6].up_host, "https://upload-z0.qiniup.com")
-
-    def test_qiniu_primary_failure_falls_back_to_backup_endpoint(self):
-        import qiniu
-
-        auth, bucket_manager = self.qiniu_sdk_patches()
-        put_data = Mock(side_effect=[
-            (None, SimpleNamespace(status_code=-1, exception=TimeoutError("write timed out"))),
-            ({"key": "reference/a.png"}, SimpleNamespace(status_code=200)),
-        ])
-        with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(qiniu, "Auth", return_value=auth),
-            patch.object(qiniu, "BucketManager", return_value=bucket_manager),
-            patch.object(qiniu, "put_data", put_data),
-        ):
-            reference_image_uploader._upload_to_qiniu_sdk(
-                b"small-image", "small.png", "image/png", key="reference/a.png", timeout=45,
-            )
-
-        self.assertEqual(put_data.call_count, 2)
-        primary_zone = put_data.call_args_list[0].kwargs["regions"][0]
-        backup_zone = put_data.call_args_list[1].kwargs["regions"][0]
-        self.assertEqual(primary_zone.up_host, "https://upload-z0.qiniup.com")
-        self.assertEqual(backup_zone.up_host, "https://up-z0.qiniup.com")
-
-    def test_qiniu_open_circuit_skips_failed_primary_endpoint(self):
-        import qiniu
-
-        auth, bucket_manager = self.qiniu_sdk_patches()
-        primary = "https://upload-z0.qiniup.com"
-        reference_image_uploader._qiniu_endpoint_open_until[primary] = time.monotonic() + 60
-        put_data = Mock(return_value=({"key": "reference/a.png"}, SimpleNamespace(status_code=200)))
-        with (
-            patch.object(reference_image_uploader, "settings", side_effect=self.qiniu_settings),
-            patch.object(qiniu, "Auth", return_value=auth),
-            patch.object(qiniu, "BucketManager", return_value=bucket_manager),
-            patch.object(qiniu, "put_data", put_data),
-        ):
-            reference_image_uploader._upload_to_qiniu_sdk(
-                b"small-image", "small.png", "image/png", key="reference/a.png", timeout=45,
-            )
-
-        zone = put_data.call_args.kwargs["regions"][0]
-        self.assertEqual(zone.up_host, "https://up-z0.qiniup.com")
-        self.assertEqual(reference_image_uploader._UPLOAD_MAX_CONCURRENCY, 2)
+        self.assertTrue(url.startswith("https://cdn.example.test/reference/sha256/"))
+        self.assertEqual(len(client.stat_calls), 1)
+        self.assertEqual(len(client.put_calls), 1)
+        self.assertEqual(client.put_calls[0]["payload"], b"image")
+        self.assertEqual(client.put_calls[0]["content_type"], "image/png")
+        self.assertEqual(client.put_calls[0]["num_parallel_uploads"], 1)
 
     def test_two_small_uploads_can_use_both_upload_slots(self):
         first_entered = threading.Event()

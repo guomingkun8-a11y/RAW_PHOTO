@@ -1,19 +1,14 @@
 <script setup lang="ts">
 import {
   Activity,
-  AlertTriangle,
-  BarChart3,
-  CheckCircle2,
+  ArrowDown,
+  ArrowDownUp,
+  ArrowUp,
   CloudUpload,
-  Clock3,
   Gauge,
   RefreshCw,
   Save,
   Search,
-  Server,
-  TimerReset,
-  Users,
-  Users2,
   Wifi,
   WifiOff,
   Workflow,
@@ -37,6 +32,20 @@ const refreshing = ref(false);
 const lastUpdated = ref("");
 let timer = 0;
 
+type SortDirection = "asc" | "desc";
+type UserSortKey = "success" | "failed" | "running" | "queued" | "total" | "load";
+
+const userSortKey = ref<UserSortKey>("load");
+const userSortDirection = ref<SortDirection>("desc");
+
+const userSortColumns: { key: UserSortKey; label: string }[] = [
+  { key: "success", label: "成功" },
+  { key: "failed", label: "失败" },
+  { key: "running", label: "进行中" },
+  { key: "queued", label: "排队中" },
+  { key: "total", label: "总生成" },
+];
+
 const numberFormat = new Intl.NumberFormat("zh-CN");
 
 function formatNumber(value: number) {
@@ -57,6 +66,53 @@ function userVolume(item: MonitoringUserStat) {
 
 function userLoad(item: MonitoringUserStat) {
   return item.active_tasks || item.running_tasks + item.queued_tasks;
+}
+
+function userSortValue(item: MonitoringUserStat, key: UserSortKey) {
+  if (key === "success") return item.success_count;
+  if (key === "failed") return item.failed_count;
+  if (key === "running") return item.running_tasks;
+  if (key === "queued") return item.queued_tasks;
+  if (key === "total") return userVolume(item);
+  return userLoad(item);
+}
+
+function compareUserName(a: MonitoringUserStat, b: MonitoringUserStat) {
+  return String(a.username || a.user_id).localeCompare(String(b.username || b.user_id), "zh-CN");
+}
+
+function userRolePriority(role: MonitoringUserStat["role"]) {
+  return role === "admin" ? 0 : role === "user" ? 1 : 2;
+}
+
+function sortUsers(users: MonitoringUserStat[], key: UserSortKey, direction: SortDirection, adminFirst = false) {
+  return [...users].sort((a, b) => {
+    if (adminFirst) {
+      const roleDelta = userRolePriority(a.role) - userRolePriority(b.role);
+      if (roleDelta !== 0) return roleDelta;
+    }
+    const valueDelta = userSortValue(a, key) - userSortValue(b, key);
+    if (valueDelta !== 0) return direction === "asc" ? valueDelta : -valueDelta;
+    const loadDelta = userLoad(b) - userLoad(a);
+    if (loadDelta !== 0) return loadDelta;
+    const volumeDelta = userVolume(b) - userVolume(a);
+    if (volumeDelta !== 0) return volumeDelta;
+    return compareUserName(a, b);
+  });
+}
+
+function toggleUserSort(key: UserSortKey) {
+  if (userSortKey.value === key) {
+    userSortDirection.value = userSortDirection.value === "desc" ? "asc" : "desc";
+    return;
+  }
+  userSortKey.value = key;
+  userSortDirection.value = "desc";
+}
+
+function sortIcon(key: UserSortKey) {
+  if (userSortKey.value !== key) return ArrowDownUp;
+  return userSortDirection.value === "desc" ? ArrowDown : ArrowUp;
 }
 
 function matchesQuery(item: MonitoringUserStat, keyword: string) {
@@ -117,124 +173,51 @@ const queueState = computed(() => {
   };
 });
 
-const usersByVolume = computed(() => {
+const filteredUsers = computed(() => {
   const keyword = query.value.trim().toLowerCase();
-  const sorted = [...(summary.value?.users || [])].sort((a, b) => {
-    const volumeDelta = userVolume(b) - userVolume(a);
-    if (volumeDelta !== 0) {
-      return volumeDelta;
-    }
-    const loadDelta = userLoad(b) - userLoad(a);
-    if (loadDelta !== 0) {
-      return loadDelta;
-    }
-    return String(a.username || a.user_id).localeCompare(String(b.username || b.user_id), "zh-CN");
-  });
-  return keyword ? sorted.filter((item) => matchesQuery(item, keyword)) : sorted;
+  const users = summary.value?.users || [];
+  return keyword ? users.filter((item) => matchesQuery(item, keyword)) : users;
 });
 
-const usersByLoad = computed(() => {
-  const keyword = query.value.trim().toLowerCase();
-  const sorted = [...(summary.value?.users || [])].sort((a, b) => {
-    const loadDelta = userLoad(b) - userLoad(a);
-    if (loadDelta !== 0) {
-      return loadDelta;
-    }
-    const volumeDelta = userVolume(b) - userVolume(a);
-    if (volumeDelta !== 0) {
-      return volumeDelta;
-    }
-    return String(a.username || a.user_id).localeCompare(String(b.username || b.user_id), "zh-CN");
-  });
-  return keyword ? sorted.filter((item) => matchesQuery(item, keyword)) : sorted;
-});
+const usersByLoad = computed(() => sortUsers(filteredUsers.value, "load", "desc"));
+const sortedUsers = computed(() => sortUsers(filteredUsers.value, userSortKey.value, userSortDirection.value, true));
 
 const totalSuccess = computed(() => summary.value?.total_success || 0);
 const totalFailed = computed(() => summary.value?.total_failed || 0);
 const successRate = computed(() => rate(totalSuccess.value, totalFailed.value));
-const busyUsers = computed(() => usersByLoad.value.filter((item) => userLoad(item) > 0).slice(0, 5));
-const maxUserVolume = computed(() => Math.max(1, ...usersByVolume.value.slice(0, 6).map((item) => userVolume(item))));
+const busyUsers = computed(() => usersByLoad.value.filter((item) => userLoad(item) > 0).slice(0, 3));
 const maxBusyLoad = computed(() => Math.max(1, ...busyUsers.value.map((item) => userLoad(item))));
+const ownerConcurrencyLimit = computed(() => queue.value?.effective_owner_concurrency || queue.value?.owner_concurrency || 0);
 
-const queueMetrics = computed(() =>
+function userLoadPercent(item: MonitoringUserStat) {
+  const load = userLoad(item);
+  if (!load) return 0;
+  const limit = ownerConcurrencyLimit.value || maxBusyLoad.value || load;
+  return Math.min(100, Math.max(8, (load / Math.max(1, limit)) * 100));
+}
+
+const compactQueueMetrics = computed(() =>
   queue.value
     ? [
         {
-          label: "队列深度",
+          label: "排队",
           value: formatNumber(queue.value.queue_depth),
-          detail: "Redis 待处理任务",
-          icon: Workflow,
+          tone: "bg-amber-50 text-amber-700 dark:bg-amber-400/10 dark:text-amber-300",
+        },
+        {
+          label: "运行",
+          value: formatNumber(queue.value.running_tasks),
           tone: "bg-[#4F7CFF]/10 text-[#315be8]",
         },
         {
-          label: "活跃 slot",
+          label: "slot",
           value: `${formatNumber(queue.value.active_slots)}/${formatNumber(queue.value.slot_limit)}`,
-          detail: "全局并发上限",
-          icon: Server,
           tone: "bg-[#6D5EF7]/10 text-[#6D5EF7]",
         },
         {
-          label: "worker",
-          value: formatNumber(queue.value.active_workers),
-          detail: `本地并发 ${formatNumber(queue.value.local_concurrency_limit)}`,
-          icon: Users2,
-          tone: "bg-emerald-50 text-emerald-700",
-        },
-        {
-          label: "单用户并发",
-          value: formatNumber(queue.value.owner_concurrency),
-          detail: `待处理上限 ${formatNumber(queue.value.owner_pending_limit)}`,
-          icon: Users,
+          label: "单用户",
+          value: formatNumber(queue.value.effective_owner_concurrency || queue.value.owner_concurrency),
           tone: "bg-sky-50 text-sky-700",
-        },
-        {
-          label: "超时重入",
-          value: formatNumber(queue.value.stale_running_tasks),
-          detail: `${formatNumber(queue.value.stale_running_timeout_secs)} 秒阈值`,
-          icon: AlertTriangle,
-          tone: "bg-rose-50 text-rose-700",
-        },
-        {
-          label: "心跳",
-          value: `${formatNumber(queue.value.worker_heartbeat_secs)}s`,
-          detail: queue.value.executor === "celery" ? "Celery worker" : "Redis worker",
-          icon: Clock3,
-          tone: "bg-slate-100 text-slate-700 dark:bg-white/[0.08] dark:text-slate-300",
-        },
-      ]
-    : [],
-);
-
-const latencyMetrics = computed(() =>
-  latency.value
-    ? [
-        {
-          label: "样本",
-          value: formatNumber(latency.value.sample_size),
-          detail: "已完成任务耗时",
-          icon: BarChart3,
-          tone: "bg-[#4F7CFF]/10 text-[#315be8]",
-        },
-        {
-          label: "平均",
-          value: `${formatNumber(latency.value.average_ms)}ms`,
-          detail: "全局平均耗时",
-          icon: Gauge,
-          tone: "bg-emerald-50 text-emerald-700",
-        },
-        {
-          label: "P95",
-          value: `${formatNumber(latency.value.p95_ms)}ms`,
-          detail: "95 分位耗时",
-          icon: TimerReset,
-          tone: "bg-amber-50 text-amber-700",
-        },
-        {
-          label: "最大",
-          value: `${formatNumber(latency.value.max_ms)}ms`,
-          detail: "单次最长耗时",
-          icon: AlertTriangle,
-          tone: "bg-rose-50 text-rose-700",
         },
       ]
     : [],
@@ -270,7 +253,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
 <template>
-  <section class="min-h-[calc(100dvh_-_var(--studio-nav-height))] bg-[#F8FAFC] p-4 dark:bg-[#0f1115] sm:p-5">
+  <section class="monitoring-page min-h-[calc(100dvh_-_var(--studio-nav-height))] bg-[#F8FAFC] p-4 dark:bg-[#0f1115] sm:p-5">
     <div class="mx-auto flex max-w-[1680px] flex-col gap-5">
       <div class="studio-card bg-white px-5 py-5 dark:bg-[#171a21]">
         <div class="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
@@ -303,73 +286,21 @@ onBeforeUnmount(() => window.clearInterval(timer));
         </div>
       </div>
 
-      <div class="grid gap-4 sm:grid-cols-2 2xl:grid-cols-4">
-        <article
-          v-for="item in [
-            {
-              label: '今日生成',
-              value: totalSuccess + totalFailed,
-              detail: `成功 ${formatNumber(totalSuccess)}，失败 ${formatNumber(totalFailed)}`,
-              icon: Zap,
-              tone: 'bg-[#4F7CFF]/10 text-[#315be8]',
-            },
-            {
-              label: '成功率',
-              value: `${successRate}%`,
-              detail: '按全部图片任务统计',
-              icon: CheckCircle2,
-              tone: 'bg-emerald-50 text-emerald-700',
-            },
-            {
-              label: '活跃会话',
-              value: summary?.active_sessions || 0,
-              detail: '在线会话可继续接收任务',
-              icon: Server,
-              tone: 'bg-[#6D5EF7]/10 text-[#6D5EF7]',
-            },
-            {
-              label: '在线用户',
-              value: summary?.total_users || 0,
-              detail: `近 ${summary?.online_window_minutes || 5} 分钟在线 ${summary?.online_users || 0} 人`,
-              icon: Users,
-              tone: 'bg-[#4F7CFF]/10 text-[#315be8]',
-            },
-          ]"
-          :key="item.label"
-          class="studio-card bg-white p-5 dark:bg-[#171a21]"
-        >
-          <div class="flex items-start justify-between gap-4">
-            <div>
-              <p class="text-[13px] font-medium text-slate-500">{{ item.label }}</p>
-              <p class="mt-3 text-[30px] font-semibold leading-none text-slate-950 dark:text-stone-50">
-                {{ item.value }}
-              </p>
-            </div>
-            <div class="flex size-11 items-center justify-center rounded-2xl" :class="item.tone">
-              <component :is="item.icon" class="size-5" />
-            </div>
-          </div>
-          <p class="mt-4 text-[13px] leading-5 text-slate-500">{{ item.detail }}</p>
-        </article>
-      </div>
-
       <div class="grid gap-4 xl:grid-cols-3">
-        <div class="studio-card bg-white p-5 dark:bg-[#171a21] xl:col-span-2">
-          <div class="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div class="studio-card bg-white p-4 dark:bg-[#171a21] xl:col-span-2">
+          <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <div class="flex items-center gap-2">
-                <h2 class="text-[22px] font-semibold">队列健康</h2>
+                <h2 class="text-[20px] font-semibold">队列健康</h2>
                 <span
-                  class="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold"
+                  class="inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold"
                   :class="queueState.tone"
                 >
                   {{ queueState.label }}
                 </span>
               </div>
-              <p class="mt-1 max-w-2xl text-[13px] text-slate-500">
-                {{ queueState.detail }}。{{ queue?.executor || "inline" }} 模式下
-                {{ queue?.worker_concurrency || 0 }} 个本地 worker 并发，slot 上限
-                {{ queue?.slot_limit || 0 }}。
+              <p class="mt-1 max-w-2xl text-[13px] leading-5 text-slate-500">
+                {{ queueState.detail }}。{{ queue?.executor || "inline" }} 模式，worker {{ formatNumber(queue?.active_workers || 0) }}，心跳 {{ formatNumber(queue?.worker_heartbeat_secs || 0) }}s。
               </p>
             </div>
             <div class="text-right text-xs text-slate-500">
@@ -378,48 +309,34 @@ onBeforeUnmount(() => window.clearInterval(timer));
             </div>
           </div>
 
-          <div v-if="queueMetrics.length" class="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          <div v-if="compactQueueMetrics.length" class="mt-4 grid gap-2 sm:grid-cols-4">
             <div
-              v-for="item in queueMetrics"
+              v-for="item in compactQueueMetrics"
               :key="item.label"
-              class="rounded-[18px] border border-black/[0.06] bg-[#F8FAFC] p-4 dark:border-white/10 dark:bg-white/[0.04]"
+              class="rounded-xl px-3 py-3"
+              :class="item.tone"
             >
-              <div class="flex items-start justify-between gap-3">
-                <div>
-                  <p class="text-[13px] font-medium text-slate-500">{{ item.label }}</p>
-                  <p class="mt-2 text-[28px] font-semibold leading-none text-slate-950 dark:text-stone-50">
-                    {{ item.value }}
-                  </p>
-                </div>
-                <div class="flex size-10 items-center justify-center rounded-2xl" :class="item.tone">
-                  <component :is="item.icon" class="size-4" />
-                </div>
-              </div>
-              <p class="mt-3 text-[12px] leading-5 text-slate-500">{{ item.detail }}</p>
+              <p class="text-[11px] font-medium opacity-80">{{ item.label }}</p>
+              <p class="mt-1 text-xl font-semibold leading-none">{{ item.value }}</p>
             </div>
           </div>
 
-          <div class="mt-5 border-t border-black/[0.06] pt-4 dark:border-white/10">
+          <div class="mt-4 border-t border-black/[0.06] pt-3 dark:border-white/10">
             <div class="flex items-center justify-between gap-3">
               <h3 class="text-[15px] font-semibold">当前占用</h3>
-              <span class="text-[12px] text-slate-500">按进行中任务排序</span>
+              <span class="text-[12px] text-slate-500">Top 3</span>
             </div>
 
-            <div v-if="busyUsers.length" class="mt-3 space-y-3">
-              <div v-for="user in busyUsers" :key="user.user_id" class="flex items-center gap-3">
+            <div v-if="busyUsers.length" class="mt-2 space-y-2">
+              <div v-for="user in busyUsers" :key="user.user_id" class="flex items-center gap-3 rounded-xl bg-[#F8FAFC] px-3 py-2 dark:bg-white/[0.04]">
                 <div class="min-w-0 flex-1">
                   <div class="flex items-center justify-between gap-3">
                     <div class="truncate text-[14px] font-medium text-slate-950 dark:text-stone-50">
                       {{ user.name || user.username }}
                     </div>
                     <div class="shrink-0 text-[12px] text-slate-500">
-                      {{ formatNumber(user.running_tasks) }}/{{ formatNumber(queue?.owner_concurrency || 0) }} running
+                      运行 {{ formatNumber(user.running_tasks) }} · 排队 {{ formatNumber(user.queued_tasks) }}
                     </div>
-                  </div>
-                  <div class="mt-1 flex flex-wrap gap-2 text-[12px] text-slate-500">
-                    <span>进行中 {{ formatNumber(user.running_tasks) }}</span>
-                    <span>排队中 {{ formatNumber(user.queued_tasks) }}</span>
-                    <span>总量 {{ formatNumber(user.active_tasks) }}</span>
                   </div>
                 </div>
                 <div class="w-28 shrink-0">
@@ -435,7 +352,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 
             <div
               v-else
-              class="mt-3 rounded-[18px] border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-500 dark:border-white/10"
+              class="mt-2 rounded-xl bg-[#F8FAFC] px-3 py-3 text-sm text-slate-500 dark:bg-white/[0.04]"
             >
               当前没有用户占用队列。
             </div>
@@ -446,33 +363,27 @@ onBeforeUnmount(() => window.clearInterval(timer));
           <div class="flex items-center justify-between gap-3">
             <div>
               <h2 class="text-[22px] font-semibold">失败与时延</h2>
-              <p class="mt-1 text-[13px] text-slate-500">看失败量、超时和当前耗时样本。</p>
+              <p class="mt-1 text-[13px] text-slate-500">只保留排障需要的关键指标。</p>
             </div>
             <Gauge class="size-5 text-emerald-600" />
           </div>
 
-          <div v-if="latencyMetrics.length" class="mt-5 grid gap-3 sm:grid-cols-2">
-            <div
-              v-for="item in latencyMetrics"
-              :key="item.label"
-              class="rounded-[18px] border border-black/[0.06] bg-[#F8FAFC] p-4 dark:border-white/10 dark:bg-white/[0.04]"
-            >
-              <div class="flex items-start justify-between gap-3">
-                <div>
-                  <p class="text-[13px] font-medium text-slate-500">{{ item.label }}</p>
-                  <p class="mt-2 text-[26px] font-semibold leading-none text-slate-950 dark:text-stone-50">
-                    {{ item.value }}
-                  </p>
-                </div>
-                <div class="flex size-10 items-center justify-center rounded-2xl" :class="item.tone">
-                  <component :is="item.icon" class="size-4" />
-                </div>
-              </div>
-              <p class="mt-3 text-[12px] leading-5 text-slate-500">{{ item.detail }}</p>
+          <div class="mt-5 grid gap-2 sm:grid-cols-3">
+            <div class="rounded-xl bg-rose-50 px-3 py-3 dark:bg-rose-400/10">
+              <div class="text-[11px] font-medium text-rose-700 dark:text-rose-300">失败</div>
+              <div class="mt-1 text-lg font-semibold text-rose-700 dark:text-rose-300">{{ formatNumber(totalFailed) }}</div>
+            </div>
+            <div class="rounded-xl bg-amber-50 px-3 py-3 dark:bg-amber-400/10">
+              <div class="text-[11px] font-medium text-amber-700 dark:text-amber-300">P95</div>
+              <div class="mt-1 text-lg font-semibold text-amber-700 dark:text-amber-300">{{ formatDuration(latency?.p95_ms || 0) }}</div>
+            </div>
+            <div class="rounded-xl bg-slate-100 px-3 py-3 dark:bg-white/[0.06]">
+              <div class="text-[11px] font-medium text-slate-500 dark:text-stone-400">最大耗时</div>
+              <div class="mt-1 text-lg font-semibold text-slate-950 dark:text-stone-50">{{ formatDuration(latency?.max_ms || 0) }}</div>
             </div>
           </div>
 
-          <div v-if="stageMetrics.length" class="mt-5 border-t border-black/[0.06] pt-4 dark:border-white/10">
+          <div v-if="stageMetrics.length" class="mt-5">
             <div class="flex items-center justify-between gap-3">
               <h3 class="text-[15px] font-semibold">分阶段耗时</h3>
               <span class="text-[12px] text-slate-500">平均 / P95</span>
@@ -486,39 +397,19 @@ onBeforeUnmount(() => window.clearInterval(timer));
               </div>
             </div>
           </div>
-
-          <div class="mt-5 rounded-[18px] border border-black/[0.06] bg-[#F8FAFC] p-4 dark:border-white/10 dark:bg-white/[0.04]">
-            <div class="flex items-center justify-between gap-3">
-              <div class="flex items-center gap-2">
-                <Clock3 class="size-4 text-[#4F7CFF]" />
-                <span class="text-[14px] font-semibold">队列提示</span>
-              </div>
-              <span class="rounded-full bg-white px-3 py-1 text-[12px] font-semibold text-slate-600 dark:bg-white/[0.06] dark:text-slate-300">
-                {{ queue?.executor || "inline" }}
-              </span>
-            </div>
-            <div class="mt-3 space-y-2 text-[13px] leading-6 text-slate-600 dark:text-slate-300">
-              <p>当前排队 {{ formatNumber(queue?.queue_depth || 0) }}，运行中 {{ formatNumber(queue?.running_tasks || 0) }}。</p>
-              <p>
-                全局 slot {{ formatNumber(queue?.active_slots || 0) }}/{{ formatNumber(queue?.slot_limit || 0) }}，
-                单用户上限 {{ formatNumber(queue?.owner_concurrency || 0) }}。
-              </p>
-              <p>超时阈值 {{ formatNumber(queue?.stale_running_timeout_secs || 0) }} 秒，失败样本 {{ formatNumber(totalFailed) }} 条。</p>
-            </div>
-          </div>
         </div>
       </div>
 
-      <div class="grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">
-        <div class="studio-card min-h-[320px] bg-white p-5 dark:bg-[#171a21] xl:col-span-2">
+      <div class="grid gap-4 xl:grid-cols-3">
+        <div class="studio-card bg-white p-4 dark:bg-[#171a21] xl:col-span-2">
           <div class="flex items-center justify-between gap-4">
             <div>
-              <h2 class="text-[22px] font-semibold">生成趋势</h2>
-              <p class="mt-1 text-[13px] text-slate-500">实时刷新任务数量曲线。</p>
+              <h2 class="text-[20px] font-semibold">生成趋势</h2>
+              <p class="mt-1 text-[13px] text-slate-500">任务量曲线，最后刷新 {{ lastUpdated || "暂无" }}。</p>
             </div>
             <span class="rounded-full bg-[#4F7CFF]/10 px-3 py-1 text-xs font-semibold text-[#315be8]">Live</span>
           </div>
-          <div class="mt-6 h-[210px] rounded-[20px] border border-black/[0.06] bg-[#F8FAFC] p-4 dark:border-white/10 dark:bg-white/[0.04]">
+          <div class="mt-4 h-[138px] rounded-2xl border border-black/[0.06] bg-[#F8FAFC] p-3 dark:border-white/10 dark:bg-white/[0.04]">
             <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="h-full w-full overflow-visible">
               <defs>
                 <linearGradient id="trendLineVue" x1="0" x2="1">
@@ -567,29 +458,6 @@ onBeforeUnmount(() => window.clearInterval(timer));
           </div>
         </div>
 
-        <div class="studio-card bg-white p-5 dark:bg-[#171a21]">
-          <div class="flex items-center justify-between gap-4">
-            <div>
-              <h2 class="text-[22px] font-semibold">用户生成量</h2>
-              <p class="mt-1 text-[13px] text-slate-500">按总生成量排序。</p>
-            </div>
-            <BarChart3 class="size-5 text-[#4F7CFF]" />
-          </div>
-          <div class="mt-6 space-y-4">
-            <div v-for="user in usersByVolume.slice(0, 6)" :key="user.user_id">
-              <div class="mb-2 flex items-center justify-between gap-3 text-[13px]">
-                <span class="truncate font-semibold">{{ user.name || user.username }}</span>
-                <span class="text-slate-500">{{ formatNumber(userVolume(user)) }}</span>
-              </div>
-              <div class="h-2 overflow-hidden rounded-full bg-slate-100 dark:bg-white/[0.08]">
-                <div
-                  class="h-full rounded-full bg-gradient-to-r from-[#4F7CFF] to-[#6D5EF7]"
-                  :style="{ width: `${Math.max(8, (userVolume(user) / maxUserVolume) * 100)}%` }"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
       </div>
 
       <div class="studio-card bg-white p-5 dark:bg-[#171a21]">
@@ -608,12 +476,12 @@ onBeforeUnmount(() => window.clearInterval(timer));
           </div>
         </div>
 
-        <div v-if="loading && !summary" class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          <div v-for="index in 6" :key="index" class="studio-skeleton h-[150px] rounded-[20px]" />
+        <div v-if="loading && !summary" class="mt-5 space-y-2">
+          <div v-for="index in 6" :key="index" class="studio-skeleton h-[82px] rounded-2xl" />
         </div>
 
         <div
-          v-else-if="!usersByLoad.length"
+          v-else-if="!sortedUsers.length"
           class="mt-5 grid min-h-[240px] place-items-center rounded-[20px] border border-dashed border-slate-300 text-center dark:border-white/10"
         >
           <div>
@@ -622,63 +490,94 @@ onBeforeUnmount(() => window.clearInterval(timer));
           </div>
         </div>
 
-        <div v-else class="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-          <article
-            v-for="user in usersByLoad"
-            :key="user.user_id"
-            class="rounded-[20px] border border-black/[0.06] bg-[#F8FAFC] p-4 dark:border-white/10 dark:bg-white/[0.04]"
-          >
-            <div class="flex items-start justify-between gap-3">
-              <div class="min-w-0">
-                <div class="flex items-center gap-2">
-                  <span class="truncate text-[15px] font-semibold">{{ user.name || user.username }}</span>
-                  <span class="rounded-full bg-slate-100 px-2 py-1 text-[11px] dark:bg-white/[0.08]">
-                    {{ roleLabel(user.role) }}
-                  </span>
+        <div v-else class="mt-5 overflow-x-auto pb-1">
+          <div class="min-w-[1180px] space-y-2">
+            <div class="grid grid-cols-[minmax(260px,1.25fr)_96px_repeat(5,minmax(78px,.55fr))_minmax(150px,.7fr)_minmax(150px,.7fr)_180px] items-center gap-3 px-4 text-[11px] font-semibold text-slate-400">
+              <span>用户</span>
+              <span>状态</span>
+              <button
+                v-for="column in userSortColumns"
+                :key="column.key"
+                type="button"
+                class="inline-flex items-center justify-end gap-1 rounded-lg px-1.5 py-1 text-right transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35"
+                :class="userSortKey === column.key ? 'text-[#315be8]' : 'text-slate-400 dark:text-stone-500'"
+                :aria-label="`按${column.label}${userSortKey === column.key && userSortDirection === 'desc' ? '从小到大' : '从大到小'}排序`"
+                @click="toggleUserSort(column.key)"
+              >
+                <span>{{ column.label }}</span>
+                <component :is="sortIcon(column.key)" class="size-3" />
+              </button>
+              <span>最近登录</span>
+              <span>最近活跃</span>
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded-lg px-1.5 py-1 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35"
+                :class="userSortKey === 'load' ? 'text-[#315be8]' : 'text-slate-400 dark:text-stone-500'"
+                :aria-label="`按当前负载${userSortKey === 'load' && userSortDirection === 'desc' ? '从小到大' : '从大到小'}排序`"
+                @click="toggleUserSort('load')"
+              >
+                <span>当前负载</span>
+                <component :is="sortIcon('load')" class="size-3" />
+              </button>
+            </div>
+            <div
+              v-for="user in sortedUsers"
+              :key="user.user_id"
+              class="group grid min-h-[82px] grid-cols-[minmax(260px,1.25fr)_96px_repeat(5,minmax(78px,.55fr))_minmax(150px,.7fr)_minmax(150px,.7fr)_180px] items-center gap-3 rounded-2xl border border-black/[0.06] bg-[#F8FAFC] px-4 py-3 transition-colors duration-200 hover:border-[#4F7CFF]/30 hover:bg-white hover:ring-2 hover:ring-[#4F7CFF]/10 motion-safe:transition-transform motion-safe:hover:-translate-y-0.5 dark:border-white/10 dark:bg-white/[0.04] dark:hover:bg-white/[0.07]"
+            >
+              <div class="flex min-w-0 items-center gap-3">
+                <div
+                  class="flex size-10 shrink-0 items-center justify-center rounded-xl bg-slate-950 text-sm font-semibold text-white transition-colors duration-200 group-hover:bg-[#315be8] dark:bg-white dark:text-slate-950"
+                >
+                  {{ (user.name || user.username || user.user_id || 'U').slice(0, 1).toUpperCase() }}
                 </div>
-                <div class="mt-1 truncate text-xs text-slate-500">
-                  {{ user.username }} / {{ user.user_id }}
+                <div class="min-w-0">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <span class="truncate text-[15px] font-semibold text-slate-950 dark:text-stone-50">{{ user.name || user.username }}</span>
+                    <span class="shrink-0 rounded-full bg-white px-2 py-1 text-[11px] text-slate-500 dark:bg-white/[0.08] dark:text-stone-300">
+                      {{ roleLabel(user.role) }}
+                    </span>
+                  </div>
+                  <div class="mt-1 truncate text-xs text-slate-500">
+                    {{ user.username }} / {{ user.user_id }}
+                  </div>
                 </div>
               </div>
+
               <span
-                class="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold"
+                class="inline-flex w-fit items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold"
                 :class="
                   user.online
                     ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300'
-                    : 'bg-slate-100 text-slate-500 dark:bg-white/[0.08]'
+                    : 'bg-slate-100 text-slate-500 dark:bg-white/[0.08] dark:text-slate-300'
                 "
               >
                 <Wifi v-if="user.online" class="size-3" />
                 <WifiOff v-else class="size-3" />
                 {{ user.online ? '在线' : '离线' }}
               </span>
-            </div>
 
-            <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div class="rounded-2xl bg-white px-3 py-2 dark:bg-[#171a21]">
-                <div class="text-[11px] text-slate-500">成功</div>
-                <div class="mt-1 text-sm font-semibold text-emerald-600">{{ formatNumber(user.success_count) }}</div>
-              </div>
-              <div class="rounded-2xl bg-white px-3 py-2 dark:bg-[#171a21]">
-                <div class="text-[11px] text-slate-500">失败</div>
-                <div class="mt-1 text-sm font-semibold text-rose-600">{{ formatNumber(user.failed_count) }}</div>
-              </div>
-              <div class="rounded-2xl bg-white px-3 py-2 dark:bg-[#171a21]">
-                <div class="text-[11px] text-slate-500">进行中</div>
-                <div class="mt-1 text-sm font-semibold text-[#4F7CFF]">{{ formatNumber(user.running_tasks) }}</div>
-              </div>
-              <div class="rounded-2xl bg-white px-3 py-2 dark:bg-[#171a21]">
-                <div class="text-[11px] text-slate-500">排队中</div>
-                <div class="mt-1 text-sm font-semibold text-amber-600">{{ formatNumber(user.queued_tasks) }}</div>
+              <div class="text-right text-sm font-semibold text-emerald-600">{{ formatNumber(user.success_count) }}</div>
+              <div class="text-right text-sm font-semibold text-rose-600">{{ formatNumber(user.failed_count) }}</div>
+              <div class="text-right text-sm font-semibold text-[#4F7CFF]">{{ formatNumber(user.running_tasks) }}</div>
+              <div class="text-right text-sm font-semibold text-amber-600">{{ formatNumber(user.queued_tasks) }}</div>
+              <div class="text-right text-sm font-semibold text-slate-900 dark:text-stone-100">{{ formatNumber(userVolume(user)) }}</div>
+              <div class="truncate text-xs text-slate-500">{{ user.last_login_at || '暂无' }}</div>
+              <div class="truncate text-xs text-slate-500">{{ user.last_seen_at || '暂无' }}</div>
+              <div>
+                <div class="flex items-center justify-between gap-2 text-xs">
+                  <span class="font-semibold text-slate-900 dark:text-stone-100">{{ formatNumber(userLoad(user)) }}</span>
+                  <span class="text-slate-500">/ {{ formatNumber(ownerConcurrencyLimit) }}</span>
+                </div>
+                <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-200 dark:bg-white/[0.08]">
+                  <div
+                    class="h-full rounded-full bg-gradient-to-r from-[#4F7CFF] to-[#6D5EF7] transition-[width,background-color] duration-300"
+                    :style="{ width: `${userLoadPercent(user)}%` }"
+                  />
+                </div>
               </div>
             </div>
-
-            <div class="mt-4 border-t border-black/[0.06] pt-3 text-xs leading-5 text-slate-500 dark:border-white/10">
-              <div>最近登录 {{ user.last_login_at || '暂无' }}</div>
-              <div>最近活跃 {{ user.last_seen_at || '暂无' }}</div>
-              <div>当前负载 {{ formatNumber(user.active_tasks) }} / {{ formatNumber(queue?.owner_concurrency || 0) }}</div>
-            </div>
-          </article>
+          </div>
         </div>
       </div>
     </div>

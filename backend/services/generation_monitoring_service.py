@@ -67,6 +67,32 @@ def _format_datetime(value: object) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M:%S") if parsed else ""
 
 
+def _is_cancellation_text(value: object) -> bool:
+    text_value = _clean(value).lower()
+    if not text_value:
+        return False
+    return any(
+        marker in text_value
+        for marker in (
+            "任务已中止",
+            "任务已取消",
+            "已中止",
+            "已取消",
+            "用户中止",
+            "用户取消",
+            "主动中止",
+            "主动取消",
+            "canceled",
+            "cancelled",
+            "aborted",
+            "user cancelled",
+            "user canceled",
+            "user stopped",
+            "stopped by user",
+        )
+    )
+
+
 def _percentile(values: list[int], percentile: float) -> int:
     ordered = sorted(int(value) for value in values if value is not None)
     if not ordered:
@@ -192,7 +218,9 @@ class GenerationMonitoringService:
 
     def record_task_event(self, task: dict[str, Any]) -> None:
         status = _clean(task.get("status"))
-        if status not in {"success", "error"}:
+        if status == "error" and _is_cancellation_text(task.get("error")):
+            status = "canceled"
+        if status not in {"success", "error", "canceled"}:
             return
         task_id = _clean(task.get("id"))
         owner_id = _clean(task.get("owner_id")) or "anonymous"
@@ -222,6 +250,7 @@ class GenerationMonitoringService:
                 row.generation_duration_ms,
                 row.save_duration_ms,
                 row.error,
+                row.failure_reported_at,
                 row.task_created_at,
                 row.task_updated_at,
             )
@@ -241,6 +270,8 @@ class GenerationMonitoringService:
             row.generation_duration_ms = _int_or_none(stage_timings.get("generation")) or 0
             row.save_duration_ms = _int_or_none(stage_timings.get("save")) or 0
             row.error = _clean(task.get("error")) or None
+            if status != "error":
+                row.failure_reported_at = None
             row.task_created_at = _parse_datetime(task.get("created_at"))
             row.task_updated_at = _parse_datetime(task.get("updated_at"))
             current = (
@@ -256,6 +287,7 @@ class GenerationMonitoringService:
                 row.generation_duration_ms,
                 row.save_duration_ms,
                 row.error,
+                row.failure_reported_at,
                 row.task_created_at,
                 row.task_updated_at,
             )
@@ -286,6 +318,7 @@ class GenerationMonitoringService:
         normalized_task_id = _clean(task_id)
         if not normalized_task_id:
             raise ValueError("task_id is required")
+        is_cancellation_report = _is_cancellation_text(error)
 
         now = datetime.now()
         session = self._session()
@@ -298,6 +331,8 @@ class GenerationMonitoringService:
                 )
                 .one_or_none()
             )
+            if row is not None and row.status == "canceled":
+                return {"ok": True, "ignored": True, "reason": "canceled"}
             previous = None if row is None else (
                 row.status,
                 row.mode,
@@ -317,6 +352,20 @@ class GenerationMonitoringService:
                     task_created_at=now,
                 )
                 session.add(row)
+            if is_cancellation_report:
+                row.status = "canceled"
+                row.mode = "edit" if mode == "edit" else "generate"
+                row.model = _clean(model) or row.model
+                row.product_id = _int_or_none(product_id) or row.product_id
+                row.template_id = _int_or_none(template_id) or row.template_id
+                row.image_count = _positive_int(image_count, 1)
+                row.error = _clean(error) or row.error or "任务已中止"
+                row.failure_reported_at = None
+                row.task_updated_at = row.task_updated_at or now
+                row.updated_at = now
+                session.commit()
+                self._summary_cache.clear()
+                return {"ok": True, "ignored": True, "reason": "canceled"}
             row.status = "error"
             row.mode = "edit" if mode == "edit" else "generate"
             row.model = _clean(model) or row.model
@@ -421,7 +470,7 @@ class GenerationMonitoringService:
                 for row in session.execute(
                     text(
                         "SELECT duration_ms FROM generation_task_events "
-                        "WHERE duration_ms IS NOT NULL AND duration_ms > 0"
+                        "WHERE status IN ('success', 'error') AND duration_ms IS NOT NULL AND duration_ms > 0"
                     )
                 ).mappings()
             ]
@@ -530,6 +579,11 @@ class GenerationMonitoringService:
                     "configured_total_concurrency": int(queue_data.get("configured_total_concurrency") or 0),
                     "total_concurrency": int(queue_data.get("total_concurrency") or 0),
                     "owner_concurrency": int(queue_data.get("owner_concurrency") or 0),
+                    "effective_owner_concurrency": int(queue_data.get("effective_owner_concurrency") or 0),
+                    "dynamic_owner_concurrency_enabled": bool(queue_data.get("dynamic_owner_concurrency_enabled")),
+                    "dynamic_owner_concurrency_threshold": int(queue_data.get("dynamic_owner_concurrency_threshold") or 0),
+                    "dynamic_owner_concurrency_max": int(queue_data.get("dynamic_owner_concurrency_max") or 0),
+                    "active_owner_count": int(queue_data.get("active_owner_count") or 0),
                     "owner_pending_limit": int(queue_data.get("owner_pending_limit") or 0),
                     "stale_running_timeout_secs": int(queue_data.get("stale_running_timeout_secs") or 0),
                     "worker_heartbeat_secs": int(queue_data.get("worker_heartbeat_secs") or 0),

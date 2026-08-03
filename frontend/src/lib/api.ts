@@ -1,4 +1,5 @@
 import { httpRequest, request } from "@/lib/request";
+import { webConfig } from "@/lib/config";
 
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
@@ -34,6 +35,9 @@ export type SettingsConfig = {
     enabled?: boolean;
     executor?: string;
     owner_concurrency?: number | string;
+    dynamic_owner_concurrency_enabled?: boolean;
+    dynamic_owner_concurrency_threshold?: number | string;
+    dynamic_owner_concurrency_max?: number | string;
     owner_pending_limit?: number | string;
     [key: string]: unknown;
   };
@@ -42,8 +46,8 @@ export type SettingsConfig = {
   image_timeout_retry_secs?: number | string;
   image_storage?: {
     enabled: boolean;
-    mode: "local" | "webdav" | "minio" | "qiniu" | "both";
-    provider?: "webdav" | "minio" | "qiniu";
+    mode: "local" | "webdav" | "minio" | "both";
+    provider?: "webdav" | "minio";
     public_base_url: string;
     webdav_url?: string;
     webdav_username?: string;
@@ -60,7 +64,7 @@ export type SettingsConfig = {
   };
   image_reference_upload?: {
     enabled?: boolean;
-    provider?: "qiniu";
+    provider?: "oss";
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -78,7 +82,7 @@ export type ImageTask = {
   conversation_id?: string;
   product_id?: number;
   template_id?: number;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
+  data?: Array<{ b64_json?: string; url?: string; storage_rel?: string; revised_prompt?: string }>;
   error?: string;
   progress?: string;
   elapsed_secs?: number;
@@ -106,6 +110,7 @@ export type ImageTask = {
 export type ImageLibraryItem = {
   id: number;
   task_id: string;
+  owner_id: string;
   mode: "generate" | "edit";
   model?: ImageModel;
   prompt?: string;
@@ -239,6 +244,7 @@ export type LoginResponse = {
   subject_id: string;
   username?: string;
   name: string;
+  avatar_url?: string;
   token: string;
 };
 
@@ -248,6 +254,7 @@ export type CurrentUserResponse = {
   subject_id: string;
   username?: string;
   name: string;
+  avatar_url?: string;
 };
 
 export type CaptchaResponse = {
@@ -267,6 +274,7 @@ export type UserAccount = {
   created_at: string;
   updated_at: string;
   last_login_at?: string;
+  avatar_url?: string;
 };
 
 export type MonitoringUserStat = {
@@ -309,6 +317,11 @@ export type MonitoringQueueSummary = {
   configured_total_concurrency: number;
   total_concurrency: number;
   owner_concurrency: number;
+  effective_owner_concurrency: number;
+  dynamic_owner_concurrency_enabled: boolean;
+  dynamic_owner_concurrency_threshold: number;
+  dynamic_owner_concurrency_max: number;
+  active_owner_count: number;
   owner_pending_limit: number;
   stale_running_timeout_secs: number;
   worker_heartbeat_secs: number;
@@ -368,6 +381,14 @@ export async function login(username: string, password: string) {
   });
 }
 
+export function resolveApiAssetUrl(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^(https?:|data:|blob:)/i.test(raw)) return raw;
+  if (!raw.startsWith("/")) return raw;
+  return `${webConfig.apiUrl}${raw}`;
+}
+
 export async function fetchCaptcha() {
   return httpRequest<CaptchaResponse>(`/auth/captcha?_t=${Date.now()}`, {
     redirectOnUnauthorized: false,
@@ -394,9 +415,29 @@ export async function fetchCurrentUser() {
   });
 }
 
+export async function uploadAvatar(file: File) {
+  const formData = new FormData();
+  formData.append("avatar", file);
+  return httpRequest<CurrentUserResponse>("/api/auth/avatar", {
+    method: "POST",
+    body: formData,
+  });
+}
+
 export async function logout() {
   return httpRequest<{ ok: boolean }>("/api/auth/logout", {
     method: "POST",
+    redirectOnUnauthorized: false,
+  });
+}
+
+export async function changePassword(body: { currentPassword: string; newPassword: string }) {
+  return httpRequest<{ ok: boolean }>("/api/auth/change-password", {
+    method: "POST",
+    body: {
+      current_password: body.currentPassword,
+      new_password: body.newPassword,
+    },
     redirectOnUnauthorized: false,
   });
 }
@@ -563,12 +604,28 @@ export async function preuploadImageReferences(files: File[]) {
 }
 
 export async function fetchImageTasks(ids: string[]) {
-  const params = new URLSearchParams();
-  if (ids.length > 0) {
-    params.set("ids", ids.join(","));
+  const uniqueIds = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
+  if (!uniqueIds.length) {
+    return httpRequest<ImageTaskListResponse>(`/api/image-tasks?_t=${Date.now()}`);
   }
-  params.set("_t", String(Date.now()));
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
+
+  const chunkSize = 100;
+  const chunks = Array.from(
+    { length: Math.ceil(uniqueIds.length / chunkSize) },
+    (_, index) => uniqueIds.slice(index * chunkSize, (index + 1) * chunkSize),
+  );
+  const responses = await Promise.all(
+    chunks.map((chunk) =>
+      httpRequest<ImageTaskListResponse>("/api/image-tasks/query", {
+        method: "POST",
+        body: { ids: chunk },
+      }),
+    ),
+  );
+  return {
+    items: responses.flatMap((response) => response.items),
+    missing_ids: responses.flatMap((response) => response.missing_ids),
+  };
 }
 
 export async function fetchImageConversationsRemote() {
@@ -606,24 +663,53 @@ export async function clearImageConversationsRemote(headers?: Record<string, str
   });
 }
 
+function downloadErrorMessageFromValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return "";
+  const item = value as { detail?: unknown; error?: unknown; message?: unknown };
+  return (
+    downloadErrorMessageFromValue(item.detail) ||
+    downloadErrorMessageFromValue(item.error) ||
+    (typeof item.message === "string" ? item.message : "")
+  );
+}
+
+async function downloadErrorMessage(error: unknown) {
+  const data = (error as { response?: { data?: unknown } })?.response?.data;
+  if (data instanceof Blob) {
+    const text = await data.text();
+    if (!text) return "";
+    try {
+      return downloadErrorMessageFromValue(JSON.parse(text)) || text;
+    } catch {
+      return text;
+    }
+  }
+  return error instanceof Error ? error.message : "";
+}
+
 export async function downloadImageTaskZip(body: {
   folderName: string;
-  items: Array<{ url?: string; b64Json?: string; filename: string }>;
+  items: Array<{ taskId: string; imageIndex?: number; filename: string }>;
 }) {
-  const response = await request.request<Blob>({
-    url: "/api/image-tasks/download-zip",
-    method: "POST",
-    responseType: "blob",
-    data: {
-      folder_name: body.folderName,
-      items: body.items.map((item) => ({
-        url: item.url || "",
-        b64_json: item.b64Json || "",
-        filename: item.filename,
-      })),
-    },
-  });
-  return response.data;
+  try {
+    const response = await request.request<Blob>({
+      url: "/api/image-tasks/download-zip",
+      method: "POST",
+      responseType: "blob",
+      data: {
+        folder_name: body.folderName,
+        items: body.items.map((item) => ({
+          task_id: item.taskId,
+          image_index: item.imageIndex || 0,
+          filename: item.filename,
+        })),
+      },
+    });
+    return response.data;
+  } catch (error) {
+    throw new Error((await downloadErrorMessage(error)) || "打包下载失败");
+  }
 }
 
 export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
@@ -674,8 +760,20 @@ export async function fetchImageLibrary(options: {
   productId?: number;
   templateId?: number;
   favorite?: boolean;
+  allOwners?: boolean;
+  ownerId?: string;
 } = {}) {
-  const { limit = 80, offset = 0, cursor = null, q = "", productId = 0, templateId = 0, favorite = false } = options;
+  const {
+    limit = 80,
+    offset = 0,
+    cursor = null,
+    q = "",
+    productId = 0,
+    templateId = 0,
+    favorite = false,
+    allOwners = false,
+    ownerId = "",
+  } = options;
   const params = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
@@ -697,6 +795,12 @@ export async function fetchImageLibrary(options: {
   if (favorite) {
     params.set("favorite", "true");
   }
+  if (allOwners) {
+    params.set("all_owners", "true");
+  }
+  if (ownerId.trim()) {
+    params.set("owner_id", ownerId.trim());
+  }
   return httpRequest<ImageLibraryResponse>(`/api/image-library?${params.toString()}`);
 }
 
@@ -705,6 +809,30 @@ export async function updateImageLibraryItem(id: number, body: { favorite?: bool
     method: "PATCH",
     body,
   });
+}
+
+export async function bulkDeleteImageLibraryItems(ids: number[]) {
+  return httpRequest<{ requested: number; deleted: number; missing: number }>("/api/image-library/bulk-delete", {
+    method: "POST",
+    body: { ids },
+  });
+}
+
+export async function downloadImageLibraryZip(body: { ids: number[]; folderName?: string }) {
+  try {
+    const response = await request.request<Blob>({
+      url: "/api/image-library/download-zip",
+      method: "POST",
+      responseType: "blob",
+      data: {
+        ids: body.ids,
+        folder_name: body.folderName || "历史图库",
+      },
+    });
+    return response.data;
+  } catch (error) {
+    throw new Error((await downloadErrorMessage(error)) || "打包下载失败");
+  }
 }
 
 export async function fetchProducts(options: { q?: string; status?: string } = {}) {

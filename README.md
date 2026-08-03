@@ -4,13 +4,13 @@ RAW_PHOTO 是一个面向电商场景的 AI 生图工作台，主要用于主图
 
 ## 功能概览
 
-- 电商生图：支持文生图、图生图、参考图生成、批量任务和多画布比例。
+- 电商生图：支持文生图、图生图、参考图生成、文件夹批量生图、批量换商品和多画布比例。
 - 账号系统：支持用户注册、登录、普通用户和管理员角色。
 - 管理后台：管理员可管理用户、查看监控、查看任务状态和系统运行情况。
 - 任务队列：生成任务进入队列，由 worker 消费，避免多人同时使用时互相拖垮服务。
 - 并发控制：支持全局并发、单用户并发、单用户排队上限和 API Key 池。
 - API Key 池：可配置多个 OpenAI-compatible 中转站 Key，按池化方式分配生成任务。
-- 图片资产：支持本地保存，也支持对象存储，例如七牛云、MinIO/S3 兼容存储、阿里云 OSS S3 兼容模式。
+- 图片资产：支持本地保存，也支持 WebDAV、MinIO/S3 兼容存储、阿里云 OSS S3 兼容模式。
 - 监控与压测：内置任务队列压测脚本、监控接口和运行状态页面。
 - 内网部署：支持本地局域网运行，也支持 Docker Compose 部署到服务器。
 
@@ -23,7 +23,7 @@ RAW_PHOTO 是一个面向电商场景的 AI 生图工作台，主要用于主图
 | 队列 | Redis、Celery 或轻量 Redis worker |
 | 数据库 | MySQL / PostgreSQL / SQLite，生产建议 MySQL 或 PostgreSQL |
 | 图片处理 | Pillow |
-| 对象存储 | 本地、七牛云、WebDAV、MinIO/S3 兼容存储 |
+| 对象存储 | 本地、WebDAV、MinIO/S3 兼容存储、阿里云 OSS S3 兼容模式 |
 | 部署 | Docker、Docker Compose |
 | 测试 | unittest、k6、本地 mock 压测脚本 |
 
@@ -89,6 +89,7 @@ Copy-Item .env.example .env.local
 
 ```text
 GMKRAW_AUTH_KEY=replace-with-a-long-random-value
+GMKRAW_LEGACY_AUTH_KEY_ADMIN_ENABLED=false
 GMKRAW_OPENAI_RELAY_ENABLED=true
 GMKRAW_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
 GMKRAW_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
@@ -97,6 +98,8 @@ IMAGE_TASK_REDIS_URL=redis://127.0.0.1:6379/0
 ```
 
 如果使用多个中转站 Key，可使用环境变量或 `config.json` 配置 API Key 池。真实 Key 只放在 `.env.local` 或服务器环境变量里，不要提交到 GitHub。
+
+`GMKRAW_LEGACY_AUTH_KEY_ADMIN_ENABLED` 默认建议保持 `false`。只有需要临时兼容旧版 `auth-key` 管理员访问方式时才打开，正式环境应使用账号登录和管理员权限管理。
 
 ### 3. 启动 Redis
 
@@ -192,12 +195,12 @@ GMKRAW_OPENAI_RELAY_BASE_URL
 GMKRAW_OPENAI_RELAY_API_KEY
 ```
 
-如果使用七牛云或阿里云 OSS，还需要配置对应对象存储参数。
+如果使用阿里云 OSS，还需要配置 `GMKRAW_OSS_*` 对象存储参数。
 
 ### 3. 启动企业版内网栈
 
 ```powershell
-.\scripts\start-intranet.ps1 -EnvFile .env.intranet -WorkerReplicas 1 -Build
+.\scripts\start-intranet.ps1 -EnvFile .env.intranet -WorkerReplicas 2 -Build
 ```
 
 访问：
@@ -241,6 +244,9 @@ IMAGE_TASK_REDIS_URL=redis://:password@redis:6379/0
 IMAGE_TASK_TOTAL_CONCURRENCY=5
 IMAGE_TASK_WORKER_CONCURRENCY=5
 IMAGE_TASK_OWNER_CONCURRENCY=2
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_ENABLED=false
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_THRESHOLD=10
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_MAX=20
 IMAGE_TASK_OWNER_PENDING_LIMIT=30
 IMAGE_TASK_MAX_RETRIES=2
 ```
@@ -250,6 +256,7 @@ IMAGE_TASK_MAX_RETRIES=2
 - `IMAGE_TASK_TOTAL_CONCURRENCY`：全局同时生成任务数量上限。
 - `IMAGE_TASK_WORKER_CONCURRENCY`：单个 worker 的并发能力。
 - `IMAGE_TASK_OWNER_CONCURRENCY`：单个用户同时生成任务数量上限。
+- `IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_*`：低活跃用户时按全局空闲槽弹性提高单用户上限，超过阈值后回到固定上限。
 - `IMAGE_TASK_OWNER_PENDING_LIMIT`：单个用户排队加运行的任务上限。
 - `IMAGE_TASK_MAX_RETRIES`：失败自动重试次数。
 
@@ -318,6 +325,15 @@ cd frontend
 npm run build
 ```
 
+### 前端浏览器自动化测试
+
+Playwright 测试会在真实 Chromium 浏览器里跑登录、注册、图片生成和历史图库基础流程，测试请求使用 mock 数据，不会调用真实生图 API：
+
+```powershell
+cd frontend
+npm run test:e2e
+```
+
 ### 队列压测
 
 本地 mock 压测不会调用真实上游生图 API，适合用来验证队列、并发和数据库写入能力：
@@ -380,7 +396,7 @@ scripts/k6-image-workspace.js
 ## 安全注意事项
 
 - 不要提交 `.env.local`、`.env`、`config.json`、`data/`。
-- 不要把 API Key、阿里云 AccessKey、七牛云密钥、数据库密码写进 README。
+- 不要把 API Key、阿里云 AccessKey、数据库密码写进 README。
 - GitHub 公开仓库中只保留 `.env.example` 和 `config.example.json` 这种占位示例。
 - 已经泄露过的 Key 建议轮换。
 - 生产环境建议使用 RAM 子账号，并按最小权限授权对象存储。

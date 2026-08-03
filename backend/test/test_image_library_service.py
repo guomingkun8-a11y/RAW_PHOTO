@@ -18,6 +18,7 @@ class ImageLibraryServiceTests(unittest.TestCase):
         return SimpleNamespace(
             id=1,
             task_id="task-1",
+            owner_id="local-admin",
             mode="generate",
             model="gpt-image-2",
             prompt="prompt",
@@ -106,7 +107,7 @@ class ImageLibraryServiceTests(unittest.TestCase):
             finally:
                 service.engine.dispose()
 
-    def test_admin_list_images_is_limited_to_own_history(self):
+    def test_admin_list_images_can_include_all_owners(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
             try:
@@ -116,14 +117,16 @@ class ImageLibraryServiceTests(unittest.TestCase):
                 result = service.list_images(
                     identity={"id": "admin-1", "role": "admin"},
                     base_url="http://app.test",
+                    include_all_owners=True,
                 )
 
-                self.assertEqual(result["total"], 1)
-                self.assertEqual(result["items"][0]["task_id"], "admin-task")
+                self.assertEqual(result["total"], 2)
+                self.assertEqual({item["task_id"] for item in result["items"]}, {"admin-task", "user-task"})
+                self.assertIn("owner_id", result["items"][0])
             finally:
                 service.engine.dispose()
 
-    def test_admin_update_image_is_limited_to_own_history(self):
+    def test_admin_update_image_can_edit_other_users_images(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
             try:
@@ -135,7 +138,63 @@ class ImageLibraryServiceTests(unittest.TestCase):
                     deleted=True,
                 )
 
-                self.assertIsNone(result)
+                self.assertIsNotNone(result)
+                self.assertEqual(result["owner_id"], "user-1")
+            finally:
+                service.engine.dispose()
+
+    def test_bulk_delete_images_respects_owner_scope(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="own-task", owner_id="owner-1")
+                self.insert_image(service, image_id=2, task_id="other-task", owner_id="owner-2")
+
+                result = service.bulk_delete_images(
+                    identity={"id": "owner-1", "role": "user"},
+                    image_ids=[1, 2],
+                )
+                remaining = service.list_images(
+                    identity={"id": "owner-1", "role": "admin"},
+                    base_url="http://app.test",
+                    include_all_owners=True,
+                )
+
+                self.assertEqual(result, {"requested": 2, "deleted": 1, "missing": 1})
+                self.assertEqual({item["id"] for item in remaining["items"]}, {2})
+            finally:
+                service.engine.dispose()
+
+    def test_admin_bulk_delete_images_can_delete_other_users_images(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="user-task", owner_id="user-1")
+
+                result = service.bulk_delete_images(
+                    identity={"id": "admin-1", "role": "admin"},
+                    image_ids=[1],
+                )
+
+                self.assertEqual(result["deleted"], 1)
+            finally:
+                service.engine.dispose()
+
+    def test_list_images_by_ids_preserves_requested_order_and_owner_scope(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="first-task", owner_id="owner-1")
+                self.insert_image(service, image_id=2, task_id="second-task", owner_id="owner-1")
+                self.insert_image(service, image_id=3, task_id="other-task", owner_id="owner-2")
+
+                result = service.list_images_by_ids(
+                    identity={"id": "owner-1", "role": "user"},
+                    base_url="http://app.test",
+                    image_ids=[2, 3, 1],
+                )
+
+                self.assertEqual([item["id"] for item in result], [2, 1])
             finally:
                 service.engine.dispose()
 

@@ -22,8 +22,8 @@ class SecurityConfigTests(unittest.TestCase):
                         "passphrase": "legacy-passphrase",
                     },
                     "image_reference_upload": {
-                        "qiniu_access_key": "legacy-qiniu-access",
-                        "qiniu_secret_key": "legacy-qiniu-secret",
+                        "oss_access_key": "legacy-oss-access",
+                        "oss_secret_key": "legacy-oss-secret",
                     },
                     "image_storage": {
                         "enabled": True,
@@ -63,8 +63,10 @@ class SecurityConfigTests(unittest.TestCase):
             self.assertEqual(public["backup"]["secret_access_key"], "")
             self.assertEqual(public["backup"]["passphrase"], "")
             self.assertTrue(public["backup"]["has_secret_access_key"])
-            self.assertEqual(public["image_reference_upload"]["qiniu_access_key"], "")
-            self.assertEqual(public["image_reference_upload"]["qiniu_secret_key"], "")
+            self.assertEqual(public["image_reference_upload"]["oss_access_key"], "")
+            self.assertEqual(public["image_reference_upload"]["oss_secret_key"], "")
+            self.assertTrue(public["image_reference_upload"]["has_oss_access_key"])
+            self.assertTrue(public["image_reference_upload"]["has_oss_secret_key"])
             self.assertEqual(public["image_storage"]["webdav_password"], "")
             self.assertNotIn("password", public["image_storage"]["webdav_url"])
             self.assertEqual(public["openai_relay"]["api_key"], "")

@@ -16,7 +16,7 @@ export type ImageConversationMode = "generate" | "edit";
 export type StoredReferenceImage = {
   name: string;
   type: string;
-  dataUrl: string;
+  dataUrl?: string;
   url?: string;
 };
 
@@ -56,6 +56,10 @@ export type ImageBatchReplacePlan = {
   folderImages: StoredReferenceImage[];
 };
 
+export type ImageBatchFolderPlan = {
+  folderImages: StoredReferenceImage[];
+};
+
 export type ImageTurn = {
   id: string;
   prompt: string;
@@ -63,6 +67,7 @@ export type ImageTurn = {
   mode: ImageConversationMode;
   referenceImages: StoredReferenceImage[];
   batchReplace?: ImageBatchReplacePlan;
+  batchFolder?: ImageBatchFolderPlan;
   preserveSubject?: boolean;
   count: number;
   size: string;
@@ -108,6 +113,11 @@ const ANONYMOUS_IMAGE_CONVERSATIONS_KEY = "items:anonymous";
 const IMAGE_CONVERSATIONS_LEGACY_MIGRATION_KEY = "legacy_migration_v1";
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
 let imageConversationMigrationPromise: Promise<void> | null = null;
+const INLINE_IMAGE_REMOTE_LIMIT = 2048;
+
+function isImageDataUrl(value: string) {
+  return /^data:image\/[a-z0-9.+-]+;base64,/i.test(value);
+}
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
   const qualityCheck = image.qualityCheck && typeof image.qualityCheck === "object"
@@ -161,7 +171,7 @@ function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceIm
   return {
     name: image.name || "reference.png",
     type: image.type || "image/png",
-    dataUrl: image.dataUrl,
+    dataUrl: typeof image.dataUrl === "string" && image.dataUrl ? image.dataUrl : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
   };
 }
@@ -176,12 +186,29 @@ function normalizeBatchReplacePlan(value: unknown): ImageBatchReplacePlan | unde
   }
   const productImage = normalizeReferenceImage(plan.productImage);
   const folderImages = plan.folderImages
-    .filter((image): image is StoredReferenceImage => Boolean(image?.dataUrl))
+    .filter((image): image is StoredReferenceImage => Boolean(image?.dataUrl || image?.url))
     .map(normalizeReferenceImage);
-  if (!productImage.dataUrl || folderImages.length === 0) {
+  if (!(productImage.dataUrl || productImage.url) || folderImages.length === 0) {
     return undefined;
   }
   return { productImage, folderImages };
+}
+
+function normalizeBatchFolderPlan(value: unknown): ImageBatchFolderPlan | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const plan = value as Partial<ImageBatchFolderPlan>;
+  if (!Array.isArray(plan.folderImages)) {
+    return undefined;
+  }
+  const folderImages = plan.folderImages
+    .filter((image): image is StoredReferenceImage => Boolean(image?.dataUrl || image?.url))
+    .map(normalizeReferenceImage);
+  if (folderImages.length === 0) {
+    return undefined;
+  }
+  return { folderImages };
 }
 
 function dataUrlMimeType(dataUrl: string) {
@@ -197,7 +224,10 @@ function getLegacyReferenceImages(source: Record<string, unknown>): StoredRefere
           return false;
         }
         const candidate = image as StoredReferenceImage;
-        return typeof candidate.dataUrl === "string" && candidate.dataUrl.length > 0;
+        return (
+          (typeof candidate.dataUrl === "string" && candidate.dataUrl.length > 0)
+          || (typeof candidate.url === "string" && candidate.url.length > 0)
+        );
       })
       .map(normalizeReferenceImage);
   }
@@ -228,6 +258,14 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
         : normalizedImages.some((image) => image.status === "canceled")
           ? "canceled"
           : "success";
+  const validStatus =
+    turn.status === "queued" ||
+    turn.status === "generating" ||
+    turn.status === "success" ||
+    turn.status === "error" ||
+    turn.status === "canceled"
+      ? turn.status
+      : derivedStatus;
 
   return {
     id: String(turn.id || `${Date.now()}`),
@@ -236,6 +274,7 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     mode: turn.mode === "edit" ? "edit" : "generate",
     referenceImages: getLegacyReferenceImages(turn),
     batchReplace: normalizeBatchReplacePlan(turn.batchReplace),
+    batchFolder: normalizeBatchFolderPlan(turn.batchFolder),
     preserveSubject: turn.preserveSubject === true,
     count: Math.max(1, Number(turn.count || normalizedImages.length || 1)),
     size: typeof turn.size === "string" ? turn.size : "",
@@ -246,14 +285,9 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     templateId: Number(turn.templateId || 0) > 0 ? Number(turn.templateId) : undefined,
     images: normalizedImages,
     createdAt: String(turn.createdAt || new Date().toISOString()),
-    status:
-      turn.status === "queued" ||
-      turn.status === "generating" ||
-      turn.status === "success" ||
-      turn.status === "error" ||
-      turn.status === "canceled"
-        ? turn.status
-        : derivedStatus,
+    status: normalizedImages.some((image) => image.status === "loading")
+      ? validStatus === "queued" ? "queued" : "generating"
+      : derivedStatus,
     error: typeof turn.error === "string" ? turn.error : undefined,
     promptDeleted: turn.promptDeleted === true,
     resultsDeleted: turn.resultsDeleted === true,
@@ -299,6 +333,63 @@ function normalizeConversation(conversation: ImageConversation & Record<string, 
   };
 }
 
+function slimRemoteValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(slimRemoteValue);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const source = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  const hasUrl = typeof source.url === "string" && source.url.trim().length > 0;
+  for (const [key, child] of Object.entries(source)) {
+    if (key === "b64_json") {
+      continue;
+    }
+    if (
+      key === "dataUrl"
+      && typeof child === "string"
+      && isImageDataUrl(child)
+      && (hasUrl || child.length > INLINE_IMAGE_REMOTE_LIMIT)
+    ) {
+      continue;
+    }
+    result[key] = slimRemoteValue(child);
+  }
+  return result;
+}
+
+function compactStoredValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(compactStoredValue);
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const source = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  const hasUrl = typeof source.url === "string" && source.url.trim().length > 0;
+  for (const [key, child] of Object.entries(source)) {
+    if (key === "b64_json" && hasUrl) {
+      continue;
+    }
+    if (key === "dataUrl" && hasUrl && typeof child === "string" && isImageDataUrl(child)) {
+      continue;
+    }
+    result[key] = compactStoredValue(child);
+  }
+  return result;
+}
+
+function slimConversationForRemote(conversation: ImageConversation): ImageConversationApiPayload {
+  return slimRemoteValue(normalizeConversation(conversation)) as ImageConversationApiPayload;
+}
+
+function compactConversationForStorage(conversation: ImageConversation): ImageConversation {
+  return compactStoredValue(normalizeConversation(conversation)) as ImageConversation;
+}
+
 function sortImageConversations(conversations: ImageConversation[]): ImageConversation[] {
   return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
@@ -308,8 +399,122 @@ function getTimestamp(value: string) {
   return Number.isFinite(time) ? time : 0;
 }
 
+function mergeReferenceImage(
+  previous: StoredReferenceImage | undefined,
+  latest: StoredReferenceImage | undefined,
+): StoredReferenceImage | undefined {
+  if (!previous) return latest;
+  if (!latest) return previous;
+  return {
+    name: latest.name || previous.name,
+    type: latest.type || previous.type,
+    dataUrl: latest.dataUrl || previous.dataUrl,
+    url: latest.url || previous.url,
+  };
+}
+
+function mergeReferenceImages(
+  previous: StoredReferenceImage[] | undefined,
+  latest: StoredReferenceImage[] | undefined,
+): StoredReferenceImage[] {
+  const previousItems = previous || [];
+  const latestItems = latest || [];
+  const length = Math.max(previousItems.length, latestItems.length);
+  const merged: StoredReferenceImage[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const item = mergeReferenceImage(previousItems[index], latestItems[index]);
+    if (item?.dataUrl || item?.url) merged.push(normalizeReferenceImage(item));
+  }
+  return merged;
+}
+
+function mergeBatchFolderPlan(
+  previous: ImageBatchFolderPlan | undefined,
+  latest: ImageBatchFolderPlan | undefined,
+): ImageBatchFolderPlan | undefined {
+  const folderImages = mergeReferenceImages(previous?.folderImages, latest?.folderImages);
+  return folderImages.length ? { folderImages } : undefined;
+}
+
+function mergeBatchReplacePlan(
+  previous: ImageBatchReplacePlan | undefined,
+  latest: ImageBatchReplacePlan | undefined,
+): ImageBatchReplacePlan | undefined {
+  const productImage = mergeReferenceImage(previous?.productImage, latest?.productImage);
+  const folderImages = mergeReferenceImages(previous?.folderImages, latest?.folderImages);
+  if (!(productImage?.dataUrl || productImage?.url) || !folderImages.length) return undefined;
+  return { productImage: normalizeReferenceImage(productImage), folderImages };
+}
+
+function preserveReferenceInputs(previous: ImageConversation, latest: ImageConversation) {
+  const previousTurns = new Map(previous.turns.map((turn) => [turn.id, turn]));
+  let changed = false;
+  const turns = latest.turns.map((turn) => {
+    const previousTurn = previousTurns.get(turn.id);
+    if (!previousTurn) return turn;
+    const referenceImages = mergeReferenceImages(previousTurn.referenceImages, turn.referenceImages);
+    const batchReplace = mergeBatchReplacePlan(previousTurn.batchReplace, turn.batchReplace);
+    const batchFolder = mergeBatchFolderPlan(previousTurn.batchFolder, turn.batchFolder);
+    if (
+      referenceImages === turn.referenceImages
+      && batchReplace === turn.batchReplace
+      && batchFolder === turn.batchFolder
+    ) {
+      return turn;
+    }
+    changed = true;
+    return { ...turn, referenceImages, batchReplace, batchFolder };
+  });
+  return changed ? { ...latest, turns } : latest;
+}
+
 function pickLatestConversation(current: ImageConversation, next: ImageConversation) {
-  return getTimestamp(next.updatedAt) >= getTimestamp(current.updatedAt) ? next : current;
+  const latest = getTimestamp(next.updatedAt) >= getTimestamp(current.updatedAt) ? next : current;
+  const previous = latest === next ? current : next;
+  return preserveSuccessfulImages(previous, preserveReferenceInputs(previous, latest));
+}
+
+function imageMergeKey(image: StoredImage) {
+  return image.taskId || image.id;
+}
+
+function hasGeneratedImageData(image: StoredImage) {
+  return image.status === "success" && Boolean(image.b64_json || image.url);
+}
+
+function deriveTurnStatusFromImages(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
+  const loading = turn.images.some((image) => image.status === "loading");
+  const failed = turn.images.filter((image) => image.status === "error").length;
+  const canceled = turn.images.some((image) => image.status === "canceled");
+  const success = turn.images.some((image) => image.status === "success");
+  if (loading) return { status: turn.images.some((image) => image.taskStatus === "running") ? "generating" : "queued", error: undefined };
+  if (failed) return { status: "error", error: `其中 ${failed} 张未成功生成` };
+  if (canceled) return { status: "canceled", error: undefined };
+  if (success) return { status: "success", error: undefined };
+  return { status: "success", error: undefined };
+}
+
+function preserveSuccessfulImages(previous: ImageConversation, latest: ImageConversation) {
+  const previousTurns = new Map(previous.turns.map((turn) => [turn.id, turn]));
+  let changed = false;
+  const turns = latest.turns.map((turn) => {
+    const previousTurn = previousTurns.get(turn.id);
+    if (!previousTurn) return turn;
+    const previousImages = new Map(previousTurn.images.map((image) => [imageMergeKey(image), image]));
+    let turnChanged = false;
+    const images = turn.images.map((image) => {
+      const previousImage = previousImages.get(imageMergeKey(image));
+      if (image.status === "loading" && previousImage && hasGeneratedImageData(previousImage)) {
+        turnChanged = true;
+        return previousImage;
+      }
+      return image;
+    });
+    if (!turnChanged) return turn;
+    changed = true;
+    return { ...turn, ...deriveTurnStatusFromImages({ ...turn, images }), images };
+  });
+  return changed ? { ...latest, turns } : latest;
 }
 
 async function mergeMigratedConversations(
@@ -366,7 +571,7 @@ async function currentImageConversationStorageKey() {
 
 async function writeStoredImageConversations(conversations: ImageConversation[]): Promise<void> {
   const key = await currentImageConversationStorageKey();
-  await singleImageConversationStorage.setItem(key, sortImageConversations(conversations));
+  await singleImageConversationStorage.setItem(key, sortImageConversations(conversations.map(compactConversationForStorage)));
 }
 
 async function currentAuthHeaders() {
@@ -385,7 +590,7 @@ async function readStoredImageConversations(): Promise<ImageConversation[]> {
 
 async function syncRemoteConversation(conversation: ImageConversation, headers?: Record<string, string>) {
   try {
-    await upsertImageConversationRemote(conversation as ImageConversationApiPayload, headers);
+    await upsertImageConversationRemote(slimConversationForRemote(conversation), headers);
   } catch {
     // The account-scoped IndexedDB copy remains available if the API is briefly unreachable.
   }
@@ -404,8 +609,14 @@ export async function listImageConversations(): Promise<ImageConversation[]> {
       remote.items.map((item) => normalizeConversation(item as ImageConversation & Record<string, unknown>)),
     );
     if (remoteItems.length) {
-      await writeStoredImageConversations(remoteItems);
-      return remoteItems;
+      const conversationMap = new Map(localItems.map((item) => [item.id, item]));
+      for (const conversation of remoteItems) {
+        const current = conversationMap.get(conversation.id);
+        conversationMap.set(conversation.id, current ? pickLatestConversation(current, conversation) : conversation);
+      }
+      const mergedItems = sortImageConversations([...conversationMap.values()]);
+      await writeStoredImageConversations(mergedItems);
+      return mergedItems;
     }
     if (localItems.length) {
       void syncRemoteConversations(localItems);
@@ -429,7 +640,7 @@ export async function saveImageConversations(
     }
     await singleImageConversationStorage.setItem(
       await currentImageConversationStorageKey(),
-      sortImageConversations([...conversationMap.values()]),
+      sortImageConversations([...conversationMap.values()].map(compactConversationForStorage)),
     );
     void syncRemoteConversations(conversations.map(normalizeConversation));
   });

@@ -11,6 +11,7 @@ import api.ai as ai_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
+TEST_IDENTITY = {"id": "test-user", "username": "tester", "name": "Tester", "role": "user"}
 PNG_BYTES = b"\x89PNG\r\n\x1a\n"
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
@@ -23,6 +24,9 @@ class ImagesEditsApiTests(unittest.TestCase):
             self.handle_calls.append(payload)
             return {"created": 1, "data": [{"b64_json": base64.b64encode(b"out").decode("ascii")}]}
 
+        self.identity_patcher = mock.patch.object(ai_module, "require_identity", return_value=TEST_IDENTITY)
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         self.handler_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.handler_patcher.start()
         self.addCleanup(self.handler_patcher.stop)

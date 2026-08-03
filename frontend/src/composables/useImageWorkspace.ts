@@ -27,6 +27,7 @@ import {
   renameImageConversation,
   saveImageConversation,
   saveImageConversations,
+  type ImageBatchFolderPlan,
   type ImageBatchReplacePlan,
   type ImageConversation,
   type ImageConversationMode,
@@ -50,6 +51,7 @@ const SCENE_IMAGE_MAX_DIMENSION = 2048;
 const SCENE_IMAGE_WEBP_QUALITY = 0.92;
 const DEFAULT_OWNER_CONCURRENCY = 3;
 const DEFAULT_OWNER_PENDING_LIMIT = 30;
+const TASK_STATUS_PERSIST_INTERVAL_MS = 5000;
 const BATCH_REPLACE_BASE_PROMPT = [
   "以第一张参考图作为唯一商品主体，逐张处理第二张参考图。",
   "把第二张参考图中的原商品替换为第一张参考图里的商品。",
@@ -61,8 +63,14 @@ const HIGH_RISK_CLAIM_REPLACEMENTS: Array<[RegExp, string]> = [
   [/杀菌率\s*99(?:\.\d+)?\s*%?/gi, "清洁表现"],
   [/99(?:\.\d+)?\s*%?\s*杀菌率?/gi, "清洁表现"],
   [/杀灭细菌|灭活病毒|抗病毒|医用级|医疗级|消毒|杀菌|医用/gi, "清洁护理"],
+  [/使用前后(?:变化|对比|差异|效果)?/gi, "不同使用状态展示"],
+  [/清洁前后/gi, "清洁场景展示"],
+  [/功效(?:承诺|宣称)?|绝对化功效/gi, "中性卖点表达"],
+  [/虚假(?:榜单|排名|测评结论|用户评价|销量)|虚构(?:榜单|排名|测评结论|用户评价|销量)/gi, "虚构商业背书"],
+  [/医疗(?:承诺|背书|认证)?/gi, "医疗相关承诺"],
 ];
-const IMAGE_PROMPT_COMPLIANCE_GUARD = "合规约束：画面文字只保留中性产品信息；不要生成医疗、消杀、抗微生物、病毒相关或等级背书类功效宣称，不要新增功效徽章、百分比承诺或认证标识。";
+const IMAGE_PROMPT_COMPLIANCE_GUARD = "合规约束：画面文字只保留中性产品信息；不要生成医疗、消杀、抗微生物、病毒相关或等级背书类宣传内容，不要新增承诺徽章、百分比承诺或认证标识。";
+const IMAGE_PROMPT_COMPLIANCE_MARKER = "合规约束：";
 const IMAGE_LAYOUT_GUARD_PREFIX = "画面结构约束：";
 const IMAGE_SINGLE_LAYOUT_GUARD = `${IMAGE_LAYOUT_GUARD_PREFIX}只生成一张完整独立图片，只展示一个主场景，不要拼图、不要分屏、不要九宫格、不要多面板，不要把多个场景或多张成品图合在同一张画布里。`;
 const IMAGE_MULTI_COUNT_DEFAULT = 4;
@@ -72,6 +80,7 @@ const activeImageTurnQueueIds = new Set<string>();
 const canceledImageTaskIds = new Set<string>();
 const reportedFailureTaskIds = new Set<string>();
 const submittedImageTaskIds = new Set<string>();
+const conversationTaskPersistedAt = new Map<string, number>();
 
 type DeleteConfirm =
   | { type: "one"; id: string }
@@ -87,6 +96,27 @@ type VisibleFailureReport = {
   productId?: number;
   templateId?: number;
 };
+
+function isCanceledFailureReport(report: VisibleFailureReport) {
+  if (canceledImageTaskIds.has(report.taskId)) return true;
+  const text = String(report.error || "").toLowerCase();
+  if (!text) return false;
+  return [
+    "任务已中止",
+    "任务已取消",
+    "已中止",
+    "已取消",
+    "用户中止",
+    "用户取消",
+    "主动中止",
+    "主动取消",
+    "canceled",
+    "cancelled",
+    "aborted",
+    "user stopped",
+    "stopped by user",
+  ].some((marker) => text.includes(marker));
+}
 
 function clampImageCount(value: string) {
   return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
@@ -112,6 +142,13 @@ function stripHighRiskClaims(prompt: string) {
   for (const [pattern, replacement] of HIGH_RISK_CLAIM_REPLACEMENTS) cleaned = cleaned.replace(pattern, replacement);
   return cleaned.trim();
 }
+function stripExistingPromptGuards(prompt: string) {
+  const cleaned = prompt.trim();
+  const positions = [IMAGE_LAYOUT_GUARD_PREFIX, IMAGE_PROMPT_COMPLIANCE_MARKER]
+    .map((marker) => cleaned.indexOf(marker))
+    .filter((position) => position >= 0);
+  return positions.length ? cleaned.slice(0, Math.min(...positions)).trim() : cleaned;
+}
 function appendPromptGuard(prompt: string, guard: string, marker: string) {
   const cleaned = prompt.trim();
   if (cleaned.includes(marker)) return cleaned;
@@ -127,9 +164,9 @@ function buildImageLayoutGuard(imageIndex: number, imageCount: number, batchRepl
   return `${IMAGE_LAYOUT_GUARD_PREFIX}这是第 ${current}/${total} 张独立成品图；本次只生成这一张图，可以选择一个不同场景或卖点表达，但不要拼图、不要分屏、不要九宫格、不要多面板，不要把其他编号或其他场景放进同一张画布里，画面中也不要写“第${current}张”。`;
 }
 function buildCompliantImagePrompt(prompt: string, imageIndex = 0, imageCount = 1, batchReplace = false) {
-  const cleaned = stripHighRiskClaims(prompt);
+  const cleaned = stripHighRiskClaims(stripExistingPromptGuards(prompt));
   const withLayoutGuard = appendPromptGuard(cleaned, buildImageLayoutGuard(imageIndex, imageCount, batchReplace), IMAGE_LAYOUT_GUARD_PREFIX);
-  return appendPromptGuard(withLayoutGuard, IMAGE_PROMPT_COMPLIANCE_GUARD, IMAGE_PROMPT_COMPLIANCE_GUARD);
+  return appendPromptGuard(withLayoutGuard, IMAGE_PROMPT_COMPLIANCE_GUARD, IMAGE_PROMPT_COMPLIANCE_MARKER);
 }
 function chineseCount(value: string) {
   const digits: Record<string, number> = { 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
@@ -173,7 +210,10 @@ function positiveInteger(value: unknown, fallback: number) {
 }
 function taskSubmissionLimits(config: SettingsConfig | null) {
   const queue = config?.image_task_queue;
-  const ownerConcurrency = positiveInteger(queue?.owner_concurrency, DEFAULT_OWNER_CONCURRENCY);
+  const fixedOwnerConcurrency = positiveInteger(queue?.owner_concurrency, DEFAULT_OWNER_CONCURRENCY);
+  const ownerConcurrency = queue?.dynamic_owner_concurrency_enabled
+    ? positiveInteger(queue.dynamic_owner_concurrency_max, fixedOwnerConcurrency)
+    : fixedOwnerConcurrency;
   const ownerPendingLimit = positiveInteger(queue?.owner_pending_limit, DEFAULT_OWNER_PENDING_LIMIT);
   const ownerReserve = Math.max(2, ownerConcurrency);
   const ownerWindow = Math.max(1, ownerPendingLimit - ownerReserve);
@@ -205,7 +245,12 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number)
   return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, type, quality));
 }
 async function optimizeSceneReference(reference: StoredReferenceImage, fallbackName: string) {
-  const original = dataUrlToFile(reference.dataUrl, reference.name || fallbackName, reference.type);
+  const original = reference.dataUrl
+    ? dataUrlToFile(reference.dataUrl, reference.name || fallbackName, reference.type)
+    : reference.url
+      ? await fetchImageAsFile(reference.url, reference.name || fallbackName)
+      : null;
+  if (!original) throw new Error("参考图数据不可用");
   if (original.size < SCENE_IMAGE_OPTIMIZE_MIN_BYTES) return original;
   try {
     const bitmap = await createImageBitmap(original);
@@ -314,13 +359,31 @@ function progressLabel(progress?: string) {
   };
   return labels[value] || value;
 }
+function friendlyImageError(value?: string) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  const lowered = text.toLowerCase();
+  if (
+    text.includes("内容安全")
+    || text.includes("安全策略")
+    || text.includes("提示已被")
+    || lowered.includes("content policy")
+    || lowered.includes("safety policy")
+    || lowered.includes("policy violation")
+    || lowered.includes("moderation")
+    || lowered.includes("blocked")
+  ) {
+    return "提示词被内容安全策略拦截，请改成更中性的商品视觉描述后重试";
+  }
+  return text;
+}
 function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
   if (task.status === "success") {
     const first = task.data?.[0];
     if (!first?.b64_json && !first?.url) return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: "未返回图片数据" };
-    return { ...image, taskId: task.id, status: "success", taskStatus: undefined, progress: undefined, b64_json: first.b64_json, url: first.url, revised_prompt: first.revised_prompt, error: undefined, durationMs: task.duration_ms };
+    return { ...image, taskId: task.id, status: "success", taskStatus: undefined, progress: undefined, b64_json: first.url ? undefined : first.b64_json, url: first.url, revised_prompt: first.revised_prompt, error: undefined, durationMs: task.duration_ms };
   }
-  if (task.status === "error") return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: task.error || "生成失败", durationMs: task.duration_ms };
+  if (task.status === "error") return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: friendlyImageError(task.error) || "生成失败", durationMs: task.duration_ms };
   if (task.status === "canceled") return { ...image, taskId: task.id, status: "canceled", taskStatus: undefined, progress: undefined, error: task.error || "任务已中止", durationMs: task.duration_ms };
   const taskStatus = task.status === "queued" ? "queued" : task.status === "running" ? "running" : image.taskStatus;
   const batch = task.batch_progress;
@@ -341,6 +404,7 @@ function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> 
 
 async function reportFailures(reports: VisibleFailureReport[]) {
   const unique = reports.filter((report) => {
+    if (isCanceledFailureReport(report)) return false;
     if (!report.taskId || reportedFailureTaskIds.has(report.taskId)) return false;
     reportedFailureTaskIds.add(report.taskId);
     return true;
@@ -481,12 +545,16 @@ export function useImageWorkspace(isAdmin: boolean) {
   async function persistConversation(conversation: ImageConversation) {
     conversations.value = sortConversations([conversation, ...conversations.value.filter((item) => item.id !== conversation.id)]);
     await saveImageConversation(conversation);
+    conversationTaskPersistedAt.set(conversation.id, Date.now());
   }
   async function updateConversation(conversationId: string, updater: (current: ImageConversation | null) => ImageConversation, persist = true) {
     const current = conversations.value.find((item) => item.id === conversationId) || null;
     const next = updater(current);
     conversations.value = sortConversations([next, ...conversations.value.filter((item) => item.id !== conversationId)]);
-    if (persist) await saveImageConversation(next);
+    if (persist) {
+      await saveImageConversation(next);
+      conversationTaskPersistedAt.set(conversationId, Date.now());
+    }
   }
   function clearComposer() {
     imagePrompt.value = "";
@@ -559,7 +627,10 @@ export function useImageWorkspace(isAdmin: boolean) {
       if (!file) return;
       batchProductImage.value = await fileToReference(file);
       preserveSubject.value = true;
-      toast.success("已上传主图，批量替换会以这张图作为商品主体");
+      if (batchFolderImages.value.length && !imagePrompt.value.trim()) {
+        imagePrompt.value = "把主图商品替换到每张文件夹图片中，保持原图场景、光线、构图和风格不变。";
+      }
+      toast.success("已上传主图，继续选择文件夹即可批量换商品");
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取主图失败"); }
   }
   async function pickBatchFolder() {
@@ -569,11 +640,13 @@ export function useImageWorkspace(isAdmin: boolean) {
       batchFolderImages.value = await Promise.all(files.map(fileToReference));
       imageCount.value = String(batchFolderImages.value.length);
       preserveSubject.value = true;
-      if (!imagePrompt.value.trim()) imagePrompt.value = "把主图商品替换到每张文件夹图片中，保持原图场景、光线、构图和风格不变。";
-      toast.success(`已读取 ${files.length} 张文件夹图片`);
+      if (batchProductImage.value && !imagePrompt.value.trim()) {
+        imagePrompt.value = "把主图商品替换到每张文件夹图片中，保持原图场景、光线、构图和风格不变。";
+      }
+      toast.success(batchProductImage.value ? `已读取 ${files.length} 张文件夹图片，可批量换商品` : `已读取 ${files.length} 张文件夹图片，输入提示词后可批量生图`);
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取文件夹失败"); }
   }
-  function clearBatch() { batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量替换素材"); }
+  function clearBatch() { batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量素材"); }
 
   function createLoadingImages(turnId: string, count: number): StoredImage[] {
     return Array.from({ length: count }, (_, index) => ({ id: `${turnId}-${index}`, taskId: `${turnId}-${index}`, status: "loading", startTime: Date.now() }));
@@ -590,6 +663,11 @@ export function useImageWorkspace(isAdmin: boolean) {
     activeImageTurnQueueIds.add(queueKey);
     const preparedReferences = new Map<string, ReferenceUploadItem>();
     const directReferenceDataUrls = new Set<string>();
+    const shouldPersistTaskSnapshot = (tasks: ImageTask[]) => {
+      if (tasks.some((task) => task.status === "success" || task.status === "error" || task.status === "canceled")) return true;
+      const lastPersisted = conversationTaskPersistedAt.get(conversationId) || 0;
+      return Date.now() - lastPersisted >= TASK_STATUS_PERSIST_INTERVAL_MS;
+    };
 
     const applyTasks = async (tasks: ImageTask[]) => {
       for (const task of tasks) {
@@ -614,19 +692,30 @@ export function useImageWorkspace(isAdmin: boolean) {
           return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
         });
         return { ...conversation, updatedAt: new Date().toISOString(), turns };
-      });
+      }, shouldPersistTaskSnapshot(tasks));
       await reportFailures(failures);
     };
 
+    const sourceReferenceIndex = (image: StoredImage) =>
+      typeof image.sourceImageIndex === "number" && Number.isInteger(image.sourceImageIndex) && image.sourceImageIndex >= 0
+        ? image.sourceImageIndex
+        : undefined;
     const taskReferenceImages = (image: StoredImage) => {
-      const sourceImage = activeTurn.batchReplace && typeof image.sourceImageIndex === "number" ? activeTurn.batchReplace.folderImages[image.sourceImageIndex] : undefined;
-      return activeTurn.batchReplace && sourceImage ? [activeTurn.batchReplace.productImage, sourceImage] : activeTurn.referenceImages;
+      const sourceIndex = sourceReferenceIndex(image);
+      const sourceImage = activeTurn.batchReplace && sourceIndex !== undefined ? activeTurn.batchReplace.folderImages[sourceIndex] : undefined;
+      if (activeTurn.batchReplace && sourceImage) return [activeTurn.batchReplace.productImage, sourceImage];
+      const batchSourceImage = activeTurn.batchFolder && sourceIndex !== undefined ? activeTurn.batchFolder.folderImages[sourceIndex] : undefined;
+      if (batchSourceImage) return [batchSourceImage];
+      const indexedReference = sourceIndex !== undefined ? activeTurn.referenceImages[sourceIndex] : undefined;
+      return indexedReference ? [indexedReference] : activeTurn.referenceImages;
     };
     const submitImage = async (image: StoredImage, imageIndex: number) => {
       const taskId = image.taskId || image.id;
       if (canceledImageTaskIds.has(taskId)) return null;
       const payload = await buildReferencePayload(taskReferenceImages(image), taskId, preparedReferences);
-      if (activeTurn.mode === "edit" && !payload.files.length && !payload.urls.length) throw new Error("未找到可用于继续编辑的参考图");
+      if (activeTurn.mode === "edit" && !payload.files.length && !payload.urls.length) {
+        throw new Error(activeTurn.batchFolder ? "未能读取这张文件夹图片，请确认原图未损坏后重试" : "未找到可用于继续编辑的参考图");
+      }
       const taskPrompt = buildCompliantImagePrompt(activeTurn.prompt, imageIndex, activeTurn.images.length, Boolean(activeTurn.batchReplace));
       const taskModel = resolveAllowedImageModel(activeTurn.model);
       const task = activeTurn.mode === "edit"
@@ -651,7 +740,7 @@ export function useImageWorkspace(isAdmin: boolean) {
               : image),
           }),
         };
-      });
+      }, false);
     };
 
     const failImagesAfterSubmission = async (failures: Array<{ image: StoredImage; message: string }>) => {
@@ -666,6 +755,9 @@ export function useImageWorkspace(isAdmin: boolean) {
             const taskId = image.taskId || image.id;
             const message = failureMap.get(taskId);
             if (!message || image.status !== "loading") return image;
+            if (isCanceledFailureReport({ taskId, error: message })) {
+              return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
+            }
             reports.push({ taskId, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
             return { ...image, status: "error" as const, taskStatus: undefined, progress: undefined, error: message };
           });
@@ -680,6 +772,31 @@ export function useImageWorkspace(isAdmin: boolean) {
     const sameReference = (left: StoredReferenceImage, right: StoredReferenceImage) =>
       Boolean(left.dataUrl && right.dataUrl && left.dataUrl === right.dataUrl)
       || Boolean(left.url && right.url && left.url === right.url);
+    const attachPreparedReferenceUrl = async (reference: StoredReferenceImage, url: string) => {
+      if (!url) return;
+      const withUrl = (candidate: StoredReferenceImage) =>
+        sameReference(candidate, reference) ? { ...candidate, url } : candidate;
+      await updateConversation(conversationId, (current) => {
+        const conversation = current || snapshot;
+        const turns = conversation.turns.map((turn) => {
+          if (turn.id !== activeTurn.id) return turn;
+          return {
+            ...turn,
+            referenceImages: turn.referenceImages.map(withUrl),
+            batchReplace: turn.batchReplace
+              ? {
+                  productImage: withUrl(turn.batchReplace.productImage),
+                  folderImages: turn.batchReplace.folderImages.map(withUrl),
+                }
+              : undefined,
+            batchFolder: turn.batchFolder
+              ? { folderImages: turn.batchFolder.folderImages.map(withUrl) }
+              : undefined,
+          };
+        });
+        return { ...conversation, updatedAt: new Date().toISOString(), turns };
+      }, false);
+    };
     const referencePreuploadEnabled = () => settingsConfig.value?.image_reference_upload?.enabled !== false;
     const referenceReady = (reference: StoredReferenceImage) => {
       const publicUrl = String(reference.url || "").trim();
@@ -688,15 +805,30 @@ export function useImageWorkspace(isAdmin: boolean) {
         || (
           reference.dataUrl
           && (!referencePreuploadEnabled() || preparedReferences.has(reference.dataUrl) || directReferenceDataUrls.has(reference.dataUrl))
-        ),
+        )
+        || publicUrl,
       );
     };
-    const taskReferencesReady = (image: StoredImage) => activeTurn.mode !== "edit" || taskReferenceImages(image).every(referenceReady);
+    const hasKnownSubmittedTask = (image: StoredImage) =>
+      Boolean(image.taskId && (submittedImageTaskIds.has(image.taskId) || image.taskStatus === "queued" || image.taskStatus === "running"));
+    const shouldPollExistingTask = (image: StoredImage) =>
+      Boolean(
+        image.taskId
+        && (
+          hasKnownSubmittedTask(image)
+          || (activeTurn.mode === "edit" && taskReferenceImages(image).length === 0)
+        ),
+      );
+    const taskReferencesReady = (image: StoredImage) => {
+      if (activeTurn.mode !== "edit" || hasKnownSubmittedTask(image)) return true;
+      const references = taskReferenceImages(image);
+      return references.length > 0 && references.every(referenceReady);
+    };
     const dependentLoadingImages = (reference: StoredReferenceImage) => {
       const latestTurn = conversations.value.find((item) => item.id === conversationId)?.turns.find((turn) => turn.id === activeTurn.id);
       return latestTurn?.images.filter((image) =>
         image.status === "loading"
-        && !submittedImageTaskIds.has(image.taskId || image.id)
+        && !hasKnownSubmittedTask(image)
         && taskReferenceImages(image).some((candidate) => sameReference(candidate, reference)),
       ) || [];
     };
@@ -718,6 +850,8 @@ export function useImageWorkspace(isAdmin: boolean) {
       if (activeTurn.batchReplace) {
         addPlan(activeTurn.batchReplace.productImage, false);
         activeTurn.batchReplace.folderImages.forEach((reference) => addPlan(reference, true));
+      } else if (activeTurn.batchFolder) {
+        activeTurn.batchFolder.folderImages.forEach((reference) => addPlan(reference, false));
       } else {
         activeTurn.referenceImages.forEach((reference) => addPlan(reference, false));
       }
@@ -726,6 +860,11 @@ export function useImageWorkspace(isAdmin: boolean) {
       let completedUploads = 0;
       const uploadPlan = async (plan: ReferenceUploadPlan, index: number) => {
         const { reference } = plan;
+        const dataUrl = reference.dataUrl;
+        if (!dataUrl) {
+          completedUploads += 1;
+          return;
+        }
         if (unmounted || !dependentLoadingImages(reference).length) {
           completedUploads += 1;
           return;
@@ -735,7 +874,7 @@ export function useImageWorkspace(isAdmin: boolean) {
           const fallbackName = `${activeTurn.id}-${index + 1}.png`;
           const file = plan.optimizeScene
             ? await optimizeSceneReference(reference, fallbackName)
-            : dataUrlToFile(reference.dataUrl, reference.name || fallbackName, reference.type);
+            : dataUrlToFile(dataUrl, reference.name || fallbackName, reference.type);
           if (unmounted || !dependentLoadingImages(reference).length) {
             completedUploads += 1;
             return;
@@ -753,7 +892,8 @@ export function useImageWorkspace(isAdmin: boolean) {
           }
           const item = response?.items[0];
           if (!item?.url) throw new Error("参考图预上传结果不完整");
-          preparedReferences.set(reference.dataUrl, item);
+          preparedReferences.set(dataUrl, item);
+          await attachPreparedReferenceUrl(reference, item.url);
           completedUploads += 1;
           await setReferenceProgress(reference, `参考图已就绪 ${completedUploads}/${plans.length}，等待入队`);
         } catch (error) {
@@ -783,7 +923,7 @@ export function useImageWorkspace(isAdmin: boolean) {
       if (available <= 0) return 0;
 
       const selected = loadingImages
-        .filter((image) => !submittedImageTaskIds.has(image.taskId || image.id) && !canceledImageTaskIds.has(image.taskId || image.id) && taskReferencesReady(image))
+        .filter((image) => !hasKnownSubmittedTask(image) && !canceledImageTaskIds.has(image.taskId || image.id) && taskReferencesReady(image))
         .slice(0, available);
       if (!selected.length) return 0;
       selected.forEach((image) => submittedImageTaskIds.add(image.taskId || image.id));
@@ -823,7 +963,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     let uploadPromise: Promise<void> = Promise.resolve();
 
     try {
-      if (activeTurn.mode === "edit" && !activeTurn.referenceImages.length && !activeTurn.batchReplace) throw new Error("未找到可用于继续编辑的参考图");
+      if (activeTurn.mode === "edit" && !activeTurn.referenceImages.length && !activeTurn.batchReplace && !activeTurn.batchFolder) throw new Error("未找到可用于继续编辑的参考图");
       const initialTaskIds = activeTurn.images.flatMap((image) => image.status === "loading" && image.taskId ? [image.taskId] : []);
       if (initialTaskIds.length) {
         try {
@@ -839,7 +979,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         }
       }
       const turnAfterRecovery = conversations.value.find((item) => item.id === conversationId)?.turns.find((turn) => turn.id === activeTurn.id);
-      const hasUnsubmittedImages = turnAfterRecovery?.images.some((image) => image.status === "loading" && !submittedImageTaskIds.has(image.taskId || image.id));
+      const hasUnsubmittedImages = turnAfterRecovery?.images.some((image) => image.status === "loading" && !hasKnownSubmittedTask(image));
       if (hasUnsubmittedImages && activeTurn.mode === "edit") {
         uploadsFinished = false;
         uploadPromise = preuploadTurnReferences().finally(() => { uploadsFinished = true; });
@@ -852,17 +992,23 @@ export function useImageWorkspace(isAdmin: boolean) {
         const loadingImages = latestTurn?.images.filter((image) => image.status === "loading") || [];
         if (!loadingImages.length) break;
         const submittedIds = loadingImages.flatMap((image) => image.taskId && submittedImageTaskIds.has(image.taskId) ? [image.taskId] : []);
-        if (!submittedIds.length && uploadsFinished) {
-          const unresolved = loadingImages.filter((image) => !taskReferencesReady(image));
+        const pollTaskIds = loadingImages.flatMap((image) => {
+          if (!image.taskId) return [];
+          return shouldPollExistingTask(image)
+            ? [image.taskId]
+            : [];
+        });
+        if (!pollTaskIds.length && uploadsFinished) {
+          const unresolved = loadingImages.filter((image) => !shouldPollExistingTask(image) && !taskReferencesReady(image));
           if (unresolved.length) {
             await failImagesAfterSubmission(unresolved.map((image) => ({ image, message: "参考图未能生成可用的公开地址" })));
             continue;
           }
         }
-        await sleep(submittedIds.length ? 2000 : 500);
-        if (!submittedIds.length) continue;
+        await sleep(pollTaskIds.length ? 2000 : 500);
+        if (!pollTaskIds.length) continue;
         try {
-          const taskList = await fetchImageTasks(submittedIds);
+          const taskList = await fetchImageTasks(pollTaskIds);
           consecutiveErrors = 0;
           const timeoutTask = !isOpenAIRelayEnabled.value ? taskList.items.find((task) => task.status === "error" && task.error?.includes("超时") && task.conversation_id && !retryingIds.has(task.id)) : undefined;
           if (timeoutTask && timeoutTask.conversation_id) {
@@ -870,9 +1016,10 @@ export function useImageWorkspace(isAdmin: boolean) {
             timeoutRetry.value = { conversationId: timeoutTask.conversation_id, taskId: timeoutTask.id, taskError: timeoutTask.error || "生图超时" };
             await applyTasks([timeoutTask]);
           } else if (taskList.items.length) await applyTasks(taskList.items);
-          if (taskList.missing_ids.length) {
-            taskList.missing_ids.forEach((taskId) => submittedImageTaskIds.delete(taskId));
-            await updateWaitingImages(new Set(taskList.missing_ids), "任务记录未找到，正在重新入队");
+          const missingSubmittedIds = taskList.missing_ids.filter((taskId) => submittedIds.includes(taskId));
+          if (missingSubmittedIds.length) {
+            missingSubmittedIds.forEach((taskId) => submittedImageTaskIds.delete(taskId));
+            await updateWaitingImages(new Set(missingSubmittedIds), "任务记录未找到，正在重新入队");
           }
         } catch (error) {
           consecutiveErrors += 1;
@@ -882,11 +1029,27 @@ export function useImageWorkspace(isAdmin: boolean) {
       await uploadPromise;
       await loadQuota();
     } catch (error) {
-      const message = error instanceof Error ? error.message : "生成图片失败";
+      const message = friendlyImageError(error instanceof Error ? error.message : "") || "生成图片失败";
       const failures: VisibleFailureReport[] = [];
       await updateConversation(conversationId, (current) => {
         const conversation = current || snapshot;
-        return { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((turn) => turn.id !== activeTurn.id ? turn : { ...turn, status: "error", error: message, images: turn.images.map((image) => { if (image.status !== "loading") return image; failures.push({ taskId: image.taskId || image.id, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId }); return { ...image, status: "error", error: message }; }) }) };
+        return {
+          ...conversation,
+          updatedAt: new Date().toISOString(),
+          turns: conversation.turns.map((turn) => {
+            if (turn.id !== activeTurn.id) return turn;
+            const images = turn.images.map((image) => {
+              const taskId = image.taskId || image.id;
+              if (image.status !== "loading") return image;
+              if (isCanceledFailureReport({ taskId, error: message })) {
+                return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
+              }
+              failures.push({ taskId, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
+              return { ...image, status: "error" as const, taskStatus: undefined, progress: undefined, error: message };
+            });
+            return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+          }),
+        };
       });
       await reportFailures(failures);
       toast.error(message);
@@ -908,9 +1071,10 @@ export function useImageWorkspace(isAdmin: boolean) {
     if (isSubmitting.value) return;
     const rawPrompt = imagePrompt.value.trim();
     const prompt = stripHighRiskClaims(rawPrompt);
-    const isBatch = Boolean(batchProductImage.value && batchFolderImages.value.length);
-    if (!prompt && !isBatch) { toast.error("请输入提示词"); return; }
-    if (batchFolderImages.value.length && !batchProductImage.value) { toast.error("请先上传要替换进去的主图"); return; }
+    const hasBatchFolder = batchFolderImages.value.length > 0;
+    const isBatchReplace = Boolean(batchProductImage.value && hasBatchFolder);
+    const isBatchFolder = Boolean(hasBatchFolder && !batchProductImage.value);
+    if (!prompt && !isBatchReplace) { toast.error("请输入提示词"); return; }
     if (batchProductImage.value && !batchFolderImages.value.length) { toast.error("请先上传包含场景图的文件夹"); return; }
     isSubmitting.value = true;
     try {
@@ -918,12 +1082,13 @@ export function useImageWorkspace(isAdmin: boolean) {
       const now = new Date().toISOString();
       const conversationId = target?.id || createId();
       const turnId = createId();
-      const batchReplace: ImageBatchReplacePlan | undefined = isBatch && batchProductImage.value ? { productImage: batchProductImage.value, folderImages: batchFolderImages.value } : undefined;
-      const effectiveReferences = batchReplace ? [batchReplace.productImage, ...batchReplace.folderImages] : referenceImages.value;
+      const batchReplace: ImageBatchReplacePlan | undefined = isBatchReplace && batchProductImage.value ? { productImage: batchProductImage.value, folderImages: batchFolderImages.value } : undefined;
+      const batchFolder: ImageBatchFolderPlan | undefined = isBatchFolder ? { folderImages: batchFolderImages.value } : undefined;
+      const effectiveReferences = batchReplace ? [batchReplace.productImage, ...batchReplace.folderImages] : batchFolder ? batchFolder.folderImages : referenceImages.value;
       const mode: ImageConversationMode = effectiveReferences.length ? "edit" : "generate";
       const effectivePrompt = batchReplace ? buildBatchReplacePrompt(prompt) : prompt;
       const selectedCount = parsedCount.value;
-      const count = batchReplace ? batchReplace.folderImages.length : resolveImageCountFromPrompt(prompt, selectedCount);
+      const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : resolveImageCountFromPrompt(prompt, selectedCount);
       const submitModel = resolveAllowedImageModel(imageModel.value);
       imageModel.value = submitModel;
       const turn: ImageTurn = {
@@ -933,6 +1098,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         mode,
         referenceImages: mode === "edit" ? effectiveReferences : [],
         batchReplace,
+        batchFolder,
         preserveSubject: mode === "edit" && (preserveSubject.value || Boolean(batchReplace)),
         count,
         size: `${imageWidth.value || 1024}x${imageHeight.value || 1024}`,
@@ -940,22 +1106,24 @@ export function useImageWorkspace(isAdmin: boolean) {
         tier: imageTier.value,
         quality: imageQuality.value,
         templateId: selectedTemplateId.value || undefined,
-        images: batchReplace ? createBatchLoadingImages(turnId, batchReplace.folderImages) : createLoadingImages(turnId, count),
+        images: batchReplace ? createBatchLoadingImages(turnId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(turnId, batchFolder.folderImages) : createLoadingImages(turnId, count),
         createdAt: now,
         status: "queued",
       };
-      const conversation: ImageConversation = target ? { ...target, updatedAt: now, turns: [...target.turns, turn] } : { id: conversationId, title: buildConversationTitle(batchReplace ? `批量换商品 ${batchReplace.folderImages.length} 张` : prompt), createdAt: now, updatedAt: now, turns: [turn] };
+      const conversationTitle = batchReplace ? `批量换商品 ${batchReplace.folderImages.length} 张` : batchFolder ? `文件夹批量生图 ${batchFolder.folderImages.length} 张` : prompt;
+      const conversation: ImageConversation = target ? { ...target, updatedAt: now, turns: [...target.turns, turn] } : { id: conversationId, title: buildConversationTitle(conversationTitle), createdAt: now, updatedAt: now, turns: [turn] };
       setSelectedConversationId(conversationId, false);
       clearComposer();
       await persistConversation(conversation);
       void runConversationQueue(conversationId, turnId);
       if (batchReplace) toast.success(`已创建批量替换任务：${batchReplace.folderImages.length} 张图`);
+      else if (batchFolder) toast.success(`已创建文件夹批量生图任务：${batchFolder.folderImages.length} 张图`);
       else if (target) toast.success("已追加到选中的图片任务");
       else toast.success("已创建新图片任务并开始处理");
       if (!batchReplace && selectedCount === 1 && count > 1) {
         toast.info(`检测到多张独立图片需求，本次已按 ${count} 张独立任务生成`);
       }
-      if (rawPrompt && rawPrompt !== prompt) toast.info("已自动替换高风险功效宣称，避免生成违规宣传文字");
+      if (rawPrompt && rawPrompt !== prompt) toast.info("已自动替换高风险宣传表达，避免生成违规宣传文字");
     } finally {
       isSubmitting.value = false;
     }
@@ -968,8 +1136,9 @@ export function useImageWorkspace(isAdmin: boolean) {
     const now = new Date().toISOString();
     const nextId = createId();
     const batchReplace = source.batchReplace;
-    const count = batchReplace ? batchReplace.folderImages.length : Math.max(1, source.count || source.images.length || 1);
-    const nextTurn: ImageTurn = { ...source, id: nextId, model: resolveAllowedImageModel(source.model), createdAt: now, status: "queued", error: undefined, images: batchReplace ? createBatchLoadingImages(nextId, batchReplace.folderImages) : createLoadingImages(nextId, count), count };
+    const batchFolder = source.batchFolder;
+    const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : Math.max(1, source.count || source.images.length || 1);
+    const nextTurn: ImageTurn = { ...source, id: nextId, model: resolveAllowedImageModel(source.model), createdAt: now, status: "queued", error: undefined, images: batchReplace ? createBatchLoadingImages(nextId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(nextId, batchFolder.folderImages) : createLoadingImages(nextId, count), count };
     await persistConversation({ ...conversation, updatedAt: now, turns: [...conversation.turns, nextTurn] });
     void runConversationQueue(conversation.id, nextId);
     toast.success("已开始重新生成");
@@ -1069,7 +1238,13 @@ export function useImageWorkspace(isAdmin: boolean) {
   }
   async function continueEdit(image: StoredImage | StoredReferenceImage) {
     try {
-      const reference = "dataUrl" in image ? { referenceImage: image, file: dataUrlToFile(image.dataUrl, image.name, image.type) } : await storedImageToReference(image, `conversation-${Date.now()}.png`);
+      const reference = "name" in image && "type" in image
+        ? image.dataUrl
+          ? { referenceImage: image, file: dataUrlToFile(image.dataUrl, image.name, image.type) }
+          : image.url
+            ? await storedImageToReference({ id: `reference-${Date.now()}`, status: "success", url: image.url }, image.name || `conversation-${Date.now()}.png`)
+            : null
+        : await storedImageToReference(image, `conversation-${Date.now()}.png`);
       if (!reference) return;
       referenceImages.value = [...referenceImages.value, reference.referenceImage];
       imagePrompt.value = "";

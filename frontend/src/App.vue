@@ -14,7 +14,12 @@ const isAuth = computed(() => Boolean(route.meta.auth));
   <main class="min-h-[100dvh] overflow-x-hidden bg-[#F8FAFC] text-slate-900 transition-colors duration-200 dark:bg-[#0f1115] dark:text-stone-100">
     <RouterView v-if="isAuth" />
     <AppShell v-else>
-      <RouterView />
+      <RouterView v-slot="{ Component, route: currentRoute }">
+        <KeepAlive>
+          <component :is="Component" v-if="currentRoute.meta.keepAlive" :key="currentRoute.name" />
+        </KeepAlive>
+        <component :is="Component" v-if="!currentRoute.meta.keepAlive" :key="currentRoute.fullPath" />
+      </RouterView>
     </AppShell>
   </main>
 </template>

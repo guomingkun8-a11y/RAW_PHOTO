@@ -6,7 +6,7 @@
 - 后端任务队列：`worker` 消费 Redis 队列。
 - 状态存储：MySQL 保存账号、图库、任务、监控事件。
 - 队列传输：Redis 只负责任务投递、全局并发 slot 和 worker 心跳。
-- 图片资产：继续使用七牛云，不要求切 MinIO。
+- 图片资产：参考图和长期图片资产使用阿里云 OSS；生成图存储通过 `minio` provider 接入 OSS S3 兼容接口。
 
 ## 推荐起步参数
 
@@ -47,10 +47,11 @@ GMKRAW_AUTH_KEY
 MYSQL_PASSWORD
 MYSQL_ROOT_PASSWORD
 REDIS_PASSWORD
-GMKRAW_QINIU_ACCESS_KEY
-GMKRAW_QINIU_SECRET_KEY
-GMKRAW_QINIU_BUCKET
-GMKRAW_QINIU_DOMAIN
+GMKRAW_OSS_ENDPOINT
+GMKRAW_OSS_ACCESS_KEY_ID
+GMKRAW_OSS_ACCESS_KEY_SECRET
+GMKRAW_OSS_BUCKET
+GMKRAW_OSS_REGION
 GMKRAW_OPENAI_RELAY_BASE_URL
 GMKRAW_OPENAI_RELAY_API_KEY
 ```
@@ -58,7 +59,7 @@ GMKRAW_OPENAI_RELAY_API_KEY
 3. 启动完整内网栈：
 
 ```powershell
-.\scripts\start-intranet.ps1 -EnvFile .env.intranet -WorkerReplicas 1 -Build
+.\scripts\start-intranet.ps1 -EnvFile .env.intranet -WorkerReplicas 2 -Build
 ```
 
 4. 浏览器访问：

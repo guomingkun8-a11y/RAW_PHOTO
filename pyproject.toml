@@ -20,7 +20,6 @@ dependencies = [
     "celery>=5.5.0",
     "minio>=7.2.15",
     "redis>=5.0.0",
-    "qiniu>=7.18.0",
     "captcha>=0.7.1",
 ]
 

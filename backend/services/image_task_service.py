@@ -34,6 +34,17 @@ TASK_STATUS_CANCELED = "canceled"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 DEFAULT_EMPTY_TASK_LIST_LIMIT = 200
+CONTENT_POLICY_ERROR_MARKERS = (
+    "内容安全",
+    "安全策略",
+    "提示已被",
+    "content policy",
+    "content_policy",
+    "safety policy",
+    "policy violation",
+    "moderation",
+    "blocked",
+)
 
 
 def _now_iso() -> str:
@@ -83,6 +94,11 @@ def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
 
 
+def _is_content_policy_error_message(value: object) -> bool:
+    text = _clean(value).lower()
+    return bool(text and any(marker in text for marker in CONTENT_POLICY_ERROR_MARKERS))
+
+
 def _owner_id(identity: dict[str, object]) -> str:
     return _clean(identity.get("id")) or "anonymous"
 
@@ -98,6 +114,18 @@ def _owner_activity_counts(items: list[tuple[str, dict[str, Any]]]) -> dict[str,
         elif status == TASK_STATUS_RUNNING:
             activity["running_tasks"] += 1
     return counts
+
+
+def _active_owner_count(items: list[tuple[str, dict[str, Any]]], candidate_owner_id: str = "") -> int:
+    owners = {
+        _clean(task.get("owner_id")) or "anonymous"
+        for _key, task in items
+        if task.get("status") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+    }
+    owner_id = _clean(candidate_owner_id)
+    if owner_id:
+        owners.add(owner_id)
+    return len(owners)
 
 
 def _task_key(owner_id: str, task_id: str) -> str:
@@ -193,8 +221,8 @@ def _public_task(
         item["duration_ms"] = task.get("duration_ms")
     if isinstance(task.get("stage_timings_ms"), dict):
         item["stage_timings_ms"] = task.get("stage_timings_ms")
-    if task.get("attempts"):
-        item["attempts"] = task.get("attempts")
+    if task.get("attempts") is not None:
+        item["attempts"] = int(task.get("attempts") or 0)
     if task.get("max_retries"):
         item["max_retries"] = task.get("max_retries")
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
@@ -269,6 +297,15 @@ class ImageTaskService:
         self._local_concurrency_limit = max(1, min(self._worker_concurrency, self._total_concurrency))
         self._run_semaphore = threading.BoundedSemaphore(self._local_concurrency_limit)
         self._owner_concurrency = max(1, int(queue_settings.get("owner_concurrency") or 2))
+        self._dynamic_owner_concurrency_enabled = bool(queue_settings.get("dynamic_owner_concurrency_enabled"))
+        self._dynamic_owner_concurrency_threshold = max(
+            1,
+            int(queue_settings.get("dynamic_owner_concurrency_threshold") or 10),
+        )
+        self._dynamic_owner_concurrency_max = max(
+            self._owner_concurrency,
+            int(queue_settings.get("dynamic_owner_concurrency_max") or self._owner_concurrency),
+        )
         self._owner_pending_limit = max(1, int(queue_settings.get("owner_pending_limit") or 50))
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -596,6 +633,18 @@ class ImageTaskService:
     def _worker_thread_count(self) -> int:
         return max(1, min(self._worker_concurrency, self._total_concurrency))
 
+    def _effective_owner_concurrency(self, active_owner_count: int) -> int:
+        if not self._dynamic_owner_concurrency_enabled:
+            return self._owner_concurrency
+        owner_count = max(1, int(active_owner_count or 1))
+        if owner_count > self._dynamic_owner_concurrency_threshold:
+            return self._owner_concurrency
+        elastic_share = max(1, self._total_concurrency // owner_count)
+        return max(
+            self._owner_concurrency,
+            min(self._dynamic_owner_concurrency_max, elastic_share),
+        )
+
     def work_forever(self, stop_event: threading.Event | None = None, timeout_secs: int = 5) -> None:
         if self.task_queue is None:
             raise RuntimeError("image task queue is not configured")
@@ -707,6 +756,14 @@ class ImageTaskService:
             running_tasks = 0
             stale_running_tasks = 0
             owner_activity = _owner_activity_counts(items)
+            active_owner_count = len(
+                [
+                    owner_id
+                    for owner_id, activity in owner_activity.items()
+                    if activity["queued_tasks"] or activity["running_tasks"]
+                ]
+            )
+            effective_owner_concurrency = self._effective_owner_concurrency(active_owner_count or 1)
             for _key, task in items:
                 status = task.get("status")
                 if status == TASK_STATUS_QUEUED:
@@ -755,6 +812,11 @@ class ImageTaskService:
                 "configured_total_concurrency": self._configured_total_concurrency,
                 "total_concurrency": self._total_concurrency,
                 "owner_concurrency": self._owner_concurrency,
+                "effective_owner_concurrency": effective_owner_concurrency,
+                "dynamic_owner_concurrency_enabled": self._dynamic_owner_concurrency_enabled,
+                "dynamic_owner_concurrency_threshold": self._dynamic_owner_concurrency_threshold,
+                "dynamic_owner_concurrency_max": self._dynamic_owner_concurrency_max,
+                "active_owner_count": active_owner_count,
                 "owner_pending_limit": self._owner_pending_limit,
                 "stale_running_timeout_secs": self._stale_running_timeout_secs,
                 "worker_heartbeat_secs": self._worker_heartbeat_secs,
@@ -790,9 +852,13 @@ class ImageTaskService:
                     self._save_locked()
                 return _public_task(task)
             if self._row_level_store:
+                unfinished_items = self.task_store.list_unfinished()
+                active_owner_count = _active_owner_count(unfinished_items, owner)
                 active_count = self.task_store.count_tasks(owner, {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING})
                 running_count = self.task_store.count_tasks(owner, {TASK_STATUS_RUNNING})
             else:
+                unfinished_items = list(self._tasks.items())
+                active_owner_count = _active_owner_count(unfinished_items, owner)
                 active_count = sum(
                     1
                     for task_item in self._tasks.values()
@@ -806,7 +872,8 @@ class ImageTaskService:
                 )
             if active_count >= self._owner_pending_limit:
                 raise ValueError("user task queue is full; wait for existing tasks to finish")
-            if running_count >= self._owner_concurrency:
+            effective_owner_concurrency = self._effective_owner_concurrency(active_owner_count)
+            if running_count >= effective_owner_concurrency:
                 payload["progress"] = "waiting_for_user_concurrency"
             task = {
                 "id": task_id,
@@ -1094,15 +1161,19 @@ class ImageTaskService:
             task = self._get_task_locked(key)
             if task is None or task.get("status") != TASK_STATUS_QUEUED:
                 return False
+            owner_id = _clean(task.get("owner_id")) or "anonymous"
             if not self._row_level_store:
-                owner_id = _clean(task.get("owner_id")) or "anonymous"
+                all_active_tasks = list(self._tasks.items())
+                effective_owner_concurrency = self._effective_owner_concurrency(
+                    _active_owner_count(all_active_tasks, owner_id),
+                )
                 active_tasks = [
                     task_item
-                    for task_item in self._tasks.values()
+                    for _key, task_item in all_active_tasks
                     if task_item.get("owner_id") == owner_id
                     and task_item.get("status") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
                 ]
-                if not can_claim_task_fairly(active_tasks, task, self._owner_concurrency):
+                if not can_claim_task_fairly(active_tasks, task, effective_owner_concurrency):
                     return False
             updates = {
                 "status": TASK_STATUS_RUNNING,
@@ -1120,9 +1191,12 @@ class ImageTaskService:
                     stage_timings["queue"] = 0
             updates["stage_timings_ms"] = stage_timings
             if self._row_level_store:
+                effective_owner_concurrency = self._effective_owner_concurrency(
+                    _active_owner_count(self.task_store.list_unfinished(), owner_id),
+                )
                 return self.task_store.claim_task(
                     key,
-                    owner_concurrency=self._owner_concurrency,
+                    owner_concurrency=effective_owner_concurrency,
                     updates=updates,
                 ) is not None
             return self._persist_updates_locked(key, updates, expected_status=TASK_STATUS_QUEUED) is not None
@@ -1242,6 +1316,8 @@ class ImageTaskService:
         stage_timings_ms: dict[str, int] | None = None,
     ) -> bool:
         if self.task_queue is None or self.run_inline:
+            return False
+        if _is_content_policy_error_message(error_message):
             return False
         should_enqueue = False
         with self._lock:

@@ -14,7 +14,7 @@ import { getDefaultRouteForRole, setStoredAuthSession } from "@/store/auth";
 export default function LoginPage() {
   const router = useRouter();
   const { isCheckingAuth } = useRedirectIfAuthenticated();
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -90,7 +90,6 @@ export default function LoginPage() {
               value={password}
               onChange={(event) => setPassword(event.target.value)}
               autoComplete="current-password"
-              placeholder="默认密码 admin123456"
               className="h-10 rounded-md border-slate-200 bg-white shadow-none dark:border-white/10 dark:bg-white/[0.04]"
             />
           </label>
@@ -105,9 +104,6 @@ export default function LoginPage() {
           登录
         </Button>
 
-        <p className="mt-4 text-xs leading-5 text-slate-500 dark:text-stone-400">
-          初始管理员：admin / admin123456。上线后建议在用户管理里修改密码。
-        </p>
       </form>
     </section>
   );

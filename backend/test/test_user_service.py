@@ -5,6 +5,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.user_service import DEFAULT_ADMIN_ID, UserService, UserSessionModel
 
@@ -28,6 +29,62 @@ class UserServiceTests(unittest.TestCase):
             self.assertTrue(token.startswith("bt-"))
             self.assertEqual(service.authenticate_token(token)["username"], "new-user")
             service.close()
+
+    def test_set_avatar_saves_image_and_replaces_old_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            avatar_dir = Path(tmp_dir) / "avatars"
+            database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
+            with mock.patch("services.user_service.AVATAR_DIR", avatar_dir):
+                service = UserService(database_url)
+                identity, _token = service.register_user(
+                    username="avatar-user",
+                    password="secret123",
+                    name="Avatar User",
+                )
+                user_id = str(identity["id"])
+
+                updated = service.set_avatar(
+                    user_id,
+                    filename="avatar.png",
+                    content_type="image/png",
+                    payload=b"\x89PNG\r\n\x1a\navatar",
+                )
+
+                self.assertEqual(updated["avatar_url"], f"/avatars/{user_id}.png")
+                self.assertTrue((avatar_dir / f"{user_id}.png").is_file())
+
+                updated = service.set_avatar(
+                    user_id,
+                    filename="avatar.jpg",
+                    content_type="image/jpeg",
+                    payload=b"\xff\xd8\xffavatar",
+                )
+
+                self.assertEqual(updated["avatar_url"], f"/avatars/{user_id}.jpg")
+                self.assertFalse((avatar_dir / f"{user_id}.png").exists())
+                self.assertTrue((avatar_dir / f"{user_id}.jpg").is_file())
+                service.close()
+
+    def test_set_avatar_rejects_non_image_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            avatar_dir = Path(tmp_dir) / "avatars"
+            database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
+            with mock.patch("services.user_service.AVATAR_DIR", avatar_dir):
+                service = UserService(database_url)
+                identity, _token = service.register_user(
+                    username="bad-avatar-user",
+                    password="secret123",
+                    name="Bad Avatar User",
+                )
+
+                with self.assertRaises(ValueError):
+                    service.set_avatar(
+                        str(identity["id"]),
+                        filename="avatar.txt",
+                        content_type="text/plain",
+                        payload=b"not an image",
+                    )
+                service.close()
 
     def test_cleanup_expired_sessions_removes_expired_and_revoked_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -97,6 +154,39 @@ class UserServiceTests(unittest.TestCase):
             self.assertIsNotNone(updated)
             self.assertEqual(updated["role"], "user")
             self.assertTrue(service.get_user(DEFAULT_ADMIN_ID)["enabled"])
+            service.close()
+
+    def test_change_password_requires_current_password_and_revokes_current_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
+            service = UserService(database_url)
+            identity, token = service.register_user(
+                username="password-user",
+                password="secret123",
+                name="Password User",
+            )
+
+            with self.assertRaisesRegex(ValueError, "当前密码不正确"):
+                service.change_password(
+                    user_id=str(identity["id"]),
+                    current_password="wrong123",
+                    new_password="secret456",
+                    revoke_token=token,
+                )
+
+            updated = service.change_password(
+                user_id=str(identity["id"]),
+                current_password="secret123",
+                new_password="secret456",
+                revoke_token=token,
+            )
+
+            self.assertEqual(updated["username"], "password-user")
+            self.assertIsNone(service.authenticate_token(token))
+            self.assertIsNone(service.authenticate_password("password-user", "secret123"))
+            next_identity, next_token = service.authenticate_password("password-user", "secret456")
+            self.assertEqual(next_identity["username"], "password-user")
+            self.assertTrue(next_token.startswith("bt-"))
             service.close()
 
 

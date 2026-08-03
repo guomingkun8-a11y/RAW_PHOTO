@@ -11,10 +11,14 @@ from services.reference_image_uploader import ReferenceUploadResult
 
 
 AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
+TEST_IDENTITY = {"id": "test-user", "username": "tester", "name": "Tester", "role": "user"}
 
 
 class ImageUploadsApiTests(unittest.TestCase):
     def setUp(self):
+        self.identity_patcher = mock.patch.object(image_uploads_module, "require_identity", return_value=TEST_IDENTITY)
+        self.identity_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         app = FastAPI()
         app.include_router(image_uploads_module.create_router())
         self.client = TestClient(app)

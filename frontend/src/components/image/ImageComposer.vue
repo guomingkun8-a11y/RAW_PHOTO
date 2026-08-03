@@ -16,7 +16,7 @@ import {
   X,
   Zap,
 } from "@lucide/vue";
-import { computed, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
 import { analyzeImagePrompt, type ImageModel, type PromptTemplate } from "@/lib/api";
 import { formatImageModel, imageModelFeatures, isImageModel } from "@/lib/image-models";
@@ -78,28 +78,58 @@ const aspectOptions = [
   { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "自动", icon: Zap },
 ];
 const countOptions = ["1", "2", "3", "4", "6", "8"];
+const previewWidth = 280;
+const previewMaxHeight = 340;
+const promptMinHeight = 76;
+const promptMaxHeight = 240;
 
 const modelLabel = computed(() => formatImageModel(imageModel.value));
 const modelFeatures = computed(() => imageModelFeatures(imageModel.value));
 const qualityLabel = computed(() => qualityOptions.find((item) => item.value === imageQuality.value)?.label || "自动");
 const hasReferences = computed(() => props.referenceImages.length > 0);
 const hasBatch = computed(() => Boolean(props.batchProductImage || props.batchFolderImages.length));
-const batchReady = computed(() => Boolean(props.batchProductImage && props.batchFolderImages.length));
-const canSubmit = computed(() => !props.isSubmitting && (Boolean(prompt.value.trim()) || batchReady.value));
+const isBatchReplaceMode = computed(() => Boolean(props.batchProductImage && props.batchFolderImages.length));
+const isFolderBatchMode = computed(() => Boolean(!props.batchProductImage && props.batchFolderImages.length));
+const canSubmit = computed(() => !props.isSubmitting && (Boolean(prompt.value.trim()) || isBatchReplaceMode.value));
 const canPreserve = computed(() => hasReferences.value || hasBatch.value);
-const promptPlaceholder = computed(() => batchReady.value ? "补充批量替换要求..." : hasReferences.value ? "描述你希望如何修改参考图..." : "输入商品图片生成需求...");
-const submitText = computed(() => props.isSubmitting ? "提交中" : batchReady.value ? "批量替换" : hasReferences.value ? "编辑图片" : "生成图片");
+const promptPlaceholder = computed(() => isBatchReplaceMode.value ? "补充批量替换要求..." : isFolderBatchMode.value ? "输入要套用到每张文件夹图片的生成要求..." : hasReferences.value ? "描述你希望如何修改参考图..." : "输入商品图片生成需求...");
+const submitText = computed(() => props.isSubmitting ? "提交中" : isBatchReplaceMode.value ? "批量替换" : isFolderBatchMode.value ? "批量生图" : hasReferences.value ? "编辑图片" : "生成图片");
 const promptShellState = computed(() => ({
   "is-active": isFocused.value || Boolean(prompt.value.trim()) || hasReferences.value || hasBatch.value,
   "is-focused": isFocused.value,
   "is-submitting": props.isSubmitting,
 }));
+const visiblePromptTemplates = computed(() => props.promptTemplates.filter((item) => item.enabled !== false));
+const referencePreview = ref<{
+  src: string;
+  name: string;
+  left: number;
+  top: number;
+  width: number;
+} | null>(null);
 
 function formatModel(value: string) {
   return formatImageModel(value);
 }
+function templateCategoryLabel(value: string) {
+  const labels: Record<string, string> = {
+    main: "主图",
+    white: "白底",
+    scene: "场景",
+    detail: "详情",
+  };
+  return labels[value] || value || "通用";
+}
 function clampCount(value: string) {
   imageCount.value = value === "" ? "" : String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
+}
+function resizePromptTextarea() {
+  const element = textarea.value;
+  if (!element) return;
+  element.style.height = "auto";
+  const nextHeight = Math.min(Math.max(element.scrollHeight, promptMinHeight), promptMaxHeight);
+  element.style.height = `${nextHeight}px`;
+  element.style.overflowY = element.scrollHeight > promptMaxHeight ? "auto" : "hidden";
 }
 function setAspect(option: typeof aspectOptions[number]) {
   imageRatio.value = option.ratio;
@@ -107,11 +137,46 @@ function setAspect(option: typeof aspectOptions[number]) {
   imageWidth.value = option.width;
   imageHeight.value = option.height;
 }
-function selectTemplate(templateId: string) {
-  const value = templateId === "none" ? null : Number(templateId);
+function showReferencePreview(image: StoredReferenceImage, index: number, event: MouseEvent | FocusEvent) {
+  const target = event.currentTarget as HTMLElement | null;
+  const src = image.dataUrl || image.url || "";
+  if (!target || !src) return;
+  const rect = target.getBoundingClientRect();
+  const padding = 12;
+  const gap = 10;
+  const width = Math.max(160, Math.min(previewWidth, window.innerWidth - padding * 2));
+  const maxLeft = Math.max(padding, window.innerWidth - width - padding);
+  const left = Math.min(Math.max(rect.left, padding), maxLeft);
+  const belowTop = rect.bottom + gap;
+  const top = belowTop + previewMaxHeight <= window.innerHeight - padding
+    ? belowTop
+    : Math.max(padding, rect.top - previewMaxHeight - gap);
+
+  referencePreview.value = {
+    src,
+    name: image.name || `reference-${index + 1}`,
+    left,
+    top,
+    width,
+  };
+}
+function referenceSource(image: StoredReferenceImage) {
+  return image.dataUrl || image.url || "";
+}
+function hideReferencePreview() {
+  referencePreview.value = null;
+}
+async function selectTemplate(templateId: string) {
+  const parsed = Number(templateId);
+  const value = templateId === "none" || !Number.isFinite(parsed) ? null : parsed;
   selectedTemplateId.value = value;
   const template = props.promptTemplates.find((item) => item.id === value);
-  if (!template) return;
+  if (!template) {
+    await nextTick();
+    resizePromptTextarea();
+    textarea.value?.focus();
+    return;
+  }
   prompt.value = template.content;
   if (template.model && props.imageModels.includes(template.model) && isImageModel(template.model)) imageModel.value = template.model;
   if (template.quality) imageQuality.value = template.quality;
@@ -125,6 +190,8 @@ function selectTemplate(templateId: string) {
     }
   }
   preserveSubject.value = template.preserve_subject;
+  await nextTick();
+  resizePromptTextarea();
   textarea.value?.focus();
 }
 function pickReferences() {
@@ -156,11 +223,16 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
   promptAssistAction.value = action;
   promptAssistNote.value = "AI 正在分析参考图...";
   try {
+    const analyzableImages = props.referenceImages
+      .filter((image) => image.dataUrl)
+      .slice(0, 4)
+      .map((image) => ({ name: image.name, dataUrl: image.dataUrl || "" }));
+    if (!analyzableImages.length) throw new Error("当前历史参考图已瘦身为 URL，请先加入本地图片后再分析");
     const result = await analyzeImagePrompt({
       action,
       mode: "single",
       prompt: prompt.value.trim(),
-      images: props.referenceImages.slice(0, 4).map((image) => ({ name: image.name, dataUrl: image.dataUrl })),
+      images: analyzableImages,
     });
     const analysis = [
       result.analysis.subject && `主体识别：${result.analysis.subject}`,
@@ -180,37 +252,95 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
     promptAssistAction.value = null;
   }
 }
+
+watch(prompt, () => {
+  void nextTick(resizePromptTextarea);
+}, { flush: "post" });
+
+onMounted(() => {
+  void nextTick(resizePromptTextarea);
+  window.addEventListener("resize", resizePromptTextarea);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("resize", resizePromptTextarea);
+});
 </script>
 
 <template>
   <section class="composer-prompt-shell rounded-[22px] border border-black/[0.08] bg-white p-3 shadow-sm dark:border-white/10 dark:bg-[#171a21]" :class="[promptShellState, isDragging ? 'is-dragging ring-4 ring-[#4F7CFF]/15' : '']" @dragenter.prevent="isDragging = true" @dragover.prevent="isDragging = true" @dragleave.self="isDragging = false" @drop="onDrop">
       <div v-if="referenceImages.length" class="mb-3 flex gap-2 overflow-x-auto">
-        <div v-for="(image, index) in referenceImages" :key="`${image.name}-${index}`" class="group relative size-16 shrink-0 overflow-hidden rounded-xl border border-black/[0.06] dark:border-white/10">
-          <img :src="image.dataUrl" alt="参考图" class="h-full w-full object-cover" />
-          <button type="button" class="absolute right-1 top-1 inline-flex size-6 items-center justify-center rounded-lg bg-slate-950/75 text-white opacity-100 sm:opacity-0 sm:group-hover:opacity-100" aria-label="移除参考图" @click="emit('removeReference', index)">
+        <div
+          v-for="(image, index) in referenceImages"
+          :key="`${image.name}-${index}`"
+          class="group relative size-16 shrink-0 rounded-xl border border-black/[0.06] outline-none ring-[#4F7CFF]/30 transition focus-visible:ring-[3px] dark:border-white/10"
+          tabindex="0"
+          :aria-label="image.name || `reference image ${index + 1}`"
+          data-reference-thumb
+          @mouseenter="showReferencePreview(image, index, $event)"
+          @mouseleave="hideReferencePreview"
+          @focusin="showReferencePreview(image, index, $event)"
+          @focusout="hideReferencePreview"
+          @keydown.escape.stop="hideReferencePreview"
+        >
+          <img :src="referenceSource(image)" alt="参考图" class="h-full w-full rounded-xl object-cover" />
+          <button type="button" class="absolute right-1 top-1 inline-flex size-6 items-center justify-center rounded-lg bg-slate-950/75 text-white opacity-100 sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100" aria-label="移除参考图" @click="hideReferencePreview(); emit('removeReference', index)">
             <X class="size-3" />
           </button>
         </div>
       </div>
 
       <div v-if="hasBatch" class="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-[#4F7CFF]/20 bg-[#4F7CFF]/[0.06] px-3 py-2">
-        <Replace class="size-4 text-[#315be8]" />
+        <Replace v-if="batchProductImage" class="size-4 text-[#315be8]" />
+        <FolderUp v-else class="size-4 text-[#315be8]" />
         <div class="min-w-0 flex-1 text-xs text-slate-600 dark:text-stone-300">
-          主图 {{ batchProductImage ? '已上传' : '未上传' }}，文件夹 {{ batchFolderImages.length }} 张
+          <div class="font-semibold text-slate-700 dark:text-stone-100">
+            {{ batchProductImage ? '批量换商品' : '文件夹批量生图' }}
+          </div>
+          <div class="mt-0.5">
+            {{ batchProductImage ? `主图已上传，文件夹 ${batchFolderImages.length} 张；每张场景图会独立替换商品` : `已读取 ${batchFolderImages.length} 张图片；输入提示词后每张图独立生成` }}
+          </div>
         </div>
         <button type="button" class="rounded-xl px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50" @click="emit('clearBatch')">清空</button>
+      </div>
+
+      <div v-if="visiblePromptTemplates.length" class="mb-3 rounded-xl border border-black/[0.06] bg-[#F8FAFC] px-3 py-2 dark:border-white/10 dark:bg-white/[0.04]">
+        <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+          <span class="text-xs font-semibold text-slate-500 dark:text-stone-400">提示词模板</span>
+          <button type="button" class="studio-button rounded-lg px-2 py-1 text-[12px] font-semibold" :class="selectedTemplateId == null ? 'bg-[#4F7CFF]/10 text-[#315be8]' : 'text-slate-500 hover:bg-white dark:text-stone-400 dark:hover:bg-white/[0.06]'" @click="selectTemplate('none')">
+            自定义输入
+          </button>
+        </div>
+        <div class="composer-template-list grid max-h-[118px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+          <button
+            v-for="item in visiblePromptTemplates"
+            :key="item.id"
+            type="button"
+            class="composer-template-card studio-button flex min-h-11 min-w-0 items-center gap-2 rounded-xl border px-3 py-2 text-left text-[13px] font-semibold transition"
+            :class="item.id === selectedTemplateId ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200'"
+            :aria-pressed="item.id === selectedTemplateId"
+            :title="item.name"
+            @click="selectTemplate(String(item.id))"
+          >
+            <span class="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500 dark:bg-white/[0.08] dark:text-stone-400">{{ templateCategoryLabel(item.category) }}</span>
+            <span class="min-w-0 truncate">{{ item.name }}</span>
+          </button>
+        </div>
       </div>
 
       <textarea
         ref="textarea"
         v-model="prompt"
         :placeholder="promptPlaceholder"
-        class="min-h-[96px] w-full resize-none bg-transparent px-1 py-1 text-[16px] leading-7 text-slate-950 outline-none placeholder:text-slate-400 dark:text-stone-50"
+        class="w-full resize-none overflow-y-hidden bg-transparent px-1 py-1 text-[16px] leading-7 text-slate-950 outline-none placeholder:text-slate-400 dark:text-stone-50"
+        :style="{ minHeight: `${promptMinHeight}px`, maxHeight: `${promptMaxHeight}px` }"
+        data-testid="image-prompt-input"
         @paste="onPaste"
+        @input="resizePromptTextarea"
         @focus="isFocused = true"
         @blur="isFocused = false"
       />
-      <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="onFiles" />
+      <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" data-testid="reference-file-input" @change="onFiles" />
 
       <section class="composer-settings mt-2 rounded-xl border border-black/[0.06] bg-[#F8FAFC] dark:border-white/10 dark:bg-white/[0.04]" :class="{ 'is-open': settingsOpen }">
         <button
@@ -218,6 +348,7 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
           class="composer-settings-trigger flex w-full cursor-pointer flex-wrap items-center justify-between gap-2 px-3 py-2 text-left text-sm font-semibold text-slate-700 dark:text-stone-200"
           :aria-expanded="settingsOpen"
           aria-controls="composer-settings-panel"
+          data-testid="image-settings-toggle"
           @click="settingsOpen = !settingsOpen"
         >
           <span class="inline-flex items-center gap-2"><SlidersHorizontal class="size-4" />模型与画布</span>
@@ -265,7 +396,7 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
               </div>
 
               <div>
-                <label class="mb-2 block text-xs font-semibold text-slate-500">数量与模板</label>
+                <label class="mb-2 block text-xs font-semibold text-slate-500">生成数量</label>
                 <div class="grid grid-cols-3 gap-2">
                   <button v-for="value in countOptions" :key="value" type="button" class="studio-button h-9 rounded-xl border text-[13px] font-medium" :class="imageCount === value ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" @click="imageCount = value">{{ value }} 张</button>
                 </div>
@@ -273,10 +404,6 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
                   <input :value="imageCount" type="number" min="1" max="100" aria-label="自定义张数" class="studio-input h-10 px-3 text-center" @input="clampCount(($event.target as HTMLInputElement).value)" />
                   <span class="text-xs text-slate-400">张</span>
                 </div>
-                <select :value="selectedTemplateId == null ? 'none' : String(selectedTemplateId)" class="studio-input mt-2 h-10 px-3 text-sm" @change="selectTemplate(($event.target as HTMLSelectElement).value)">
-                  <option value="none">不使用模板</option>
-                  <option v-for="item in promptTemplates" :key="item.id" :value="String(item.id)">{{ item.name }}</option>
-                </select>
               </div>
             </div>
           </div>
@@ -289,24 +416,24 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
             <MessageSquarePlus class="size-4" />
             新建任务
           </button>
-          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" @click="pickReferences">
+          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" data-testid="pick-reference-button" @click="pickReferences">
             <ImagePlus class="size-4" />
             图片
           </button>
-          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" @click="emit('pickBatchFolder')">
+          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" data-testid="pick-batch-folder-button" @click="emit('pickBatchFolder')">
             <FolderUp class="size-4" />
-            文件夹
+            批量文件夹
           </button>
-          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" @click="emit('pickBatchProduct')">
+          <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" data-testid="pick-batch-product-button" @click="emit('pickBatchProduct')">
             <PackageCheck class="size-4" />
-            主图
+            换商品主图
           </button>
           <button v-for="item in [{ action: 'suggest', label: '建议' }, { action: 'optimize', label: '优化' }, { action: 'enhance', label: '润色' }]" :key="item.action" type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" :disabled="!hasReferences || Boolean(promptAssistAction)" @click="assist(item.action as 'suggest' | 'optimize' | 'enhance')">
             <Sparkles class="size-4" :class="promptAssistAction === item.action ? 'ai-orbit' : ''" />
             {{ item.label }}
           </button>
         </div>
-        <button type="button" class="studio-button inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-slate-950 px-5 text-[15px] font-semibold text-white shadow-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none dark:bg-white dark:text-slate-950 dark:hover:bg-stone-100 dark:disabled:bg-stone-700 dark:disabled:text-stone-400" :disabled="!canSubmit" @click="emit('submit')">
+        <button type="button" class="studio-button inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-slate-950 px-5 text-[15px] font-semibold text-white shadow-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none dark:bg-white dark:text-slate-950 dark:hover:bg-stone-100 dark:disabled:bg-stone-700 dark:disabled:text-stone-400" :disabled="!canSubmit" data-testid="generate-submit-button" @click="emit('submit')">
           <LoaderCircle v-if="isSubmitting" class="size-4 animate-spin" />
           <ArrowUp v-else class="size-4" />
           {{ submitText }}
@@ -315,6 +442,17 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
 
       <div v-if="promptAssistNote" class="mt-2 text-[12px] font-medium text-[#4F7CFF]">{{ promptAssistNote }}</div>
   </section>
+  <Teleport to="body">
+    <div
+      v-if="referencePreview"
+      data-reference-preview
+      class="reference-image-preview fixed z-40 rounded-xl border border-black/[0.08] bg-white p-2 shadow-[0_18px_44px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21]"
+      :style="{ left: `${referencePreview.left}px`, top: `${referencePreview.top}px`, width: `${referencePreview.width}px` }"
+    >
+      <img :src="referencePreview.src" :alt="referencePreview.name" class="max-h-[min(62vh,340px)] w-full rounded-lg bg-slate-100 object-contain dark:bg-white/[0.06]" />
+      <div class="mt-2 truncate px-1 text-[12px] font-medium text-slate-600 dark:text-stone-300">{{ referencePreview.name }}</div>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -323,6 +461,11 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
   isolation: isolate;
   overflow: hidden;
   transition: border-color 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
+}
+
+.reference-image-preview {
+  pointer-events: none;
+  animation: reference-preview-in 150ms var(--studio-ease);
 }
 
 .composer-prompt-shell::before {
@@ -431,8 +574,24 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
   }
 }
 
+@keyframes reference-preview-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .composer-prompt-shell::before {
+    animation: none;
+  }
+
+  .reference-image-preview {
     animation: none;
   }
 
@@ -444,6 +603,12 @@ async function assist(action: "suggest" | "optimize" | "enhance") {
   .composer-settings-panel-enter-from,
   .composer-settings-panel-leave-to {
     transform: none;
+  }
+}
+
+@media (hover: none) {
+  .reference-image-preview {
+    display: none;
   }
 }
 </style>

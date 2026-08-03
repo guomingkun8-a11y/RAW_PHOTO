@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 import api.ai as ai_module
 
 AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}
+TEST_IDENTITY = {"id": "test-user", "username": "tester", "name": "Tester", "role": "user"}
 PNG_DATA_URL = "data:image/png;base64," + base64.b64encode(b"fake-png").decode("ascii")
 JPEG_DATA_URL = "data:image/jpeg;base64," + base64.b64encode(b"fake-jpeg").decode("ascii")
 
@@ -25,12 +26,15 @@ class ImageEditsJsonApiTests(unittest.TestCase):
             self.calls.append(payload)
             return {"created": 1, "data": [{"b64_json": "ZmFrZQ=="}]}
 
+        self.identity_patcher = mock.patch.object(ai_module, "require_identity", return_value=TEST_IDENTITY)
         self.handle_patcher = mock.patch.object(ai_module.openai_v1_image_edit, "handle", fake_handle)
         self.relay_patcher = mock.patch.object(ai_module.openai_relay_service, "is_enabled", return_value=False)
         self.filter_patcher = mock.patch.object(ai_module, "filter_or_log", mock.AsyncMock())
+        self.identity_patcher.start()
         self.handle_patcher.start()
         self.relay_patcher.start()
         self.filter_patcher.start()
+        self.addCleanup(self.identity_patcher.stop)
         self.addCleanup(self.handle_patcher.stop)
         self.addCleanup(self.relay_patcher.stop)
         self.addCleanup(self.filter_patcher.stop)

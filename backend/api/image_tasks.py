@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import base64
-import io
+import mimetypes
 import re
+import tempfile
 import zipfile
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
-from curl_cffi import requests
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from api.image_inputs import collect_http_image_urls, parse_image_edit_request, read_image_sources
+from api.image_inputs import _download_image_url, collect_http_image_urls, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.generation_monitoring_service import generation_monitoring_service
+from services.image_storage_service import image_storage_service
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
 from services import openai_relay_service, reference_image_uploader
+
+ZIP_MAX_ITEM_BYTES = 50 * 1024 * 1024
+ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024
+ZIP_SPOOL_MEMORY_BYTES = 8 * 1024 * 1024
+ZIP_STREAM_CHUNK_BYTES = 1024 * 1024
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -51,14 +57,18 @@ class ImageFailureReportRequest(BaseModel):
 
 
 class ImageZipItem(BaseModel):
-    url: str = ""
-    b64_json: str = ""
+    task_id: str = Field(..., min_length=1, max_length=191)
+    image_index: int = Field(default=0, ge=0, le=100)
     filename: str = "image.png"
 
 
 class ImageZipDownloadRequest(BaseModel):
     folder_name: str = Field(default="AI-Image-Results", min_length=1, max_length=120)
     items: list[ImageZipItem] = Field(default_factory=list, min_length=1, max_length=100)
+
+
+class ImageTaskQueryRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list, min_length=1, max_length=500)
 
 
 def _parse_task_ids(value: str) -> list[str]:
@@ -72,9 +82,6 @@ def _zip_safe_name(value: str, fallback: str) -> str:
 
 
 def _image_ext_from_content_type(content_type: str, fallback_name: str) -> str:
-    suffix = fallback_name.rsplit(".", 1)[-1].lower() if "." in fallback_name else ""
-    if suffix in {"png", "jpg", "jpeg", "webp", "gif", "avif"}:
-        return "jpg" if suffix == "jpeg" else suffix
     content_type = content_type.lower()
     if "jpeg" in content_type:
         return "jpg"
@@ -84,6 +91,9 @@ def _image_ext_from_content_type(content_type: str, fallback_name: str) -> str:
         return "gif"
     if "avif" in content_type:
         return "avif"
+    suffix = fallback_name.rsplit(".", 1)[-1].lower() if "." in fallback_name else ""
+    if suffix in {"png", "jpg", "jpeg", "webp", "gif", "avif"}:
+        return "jpg" if suffix == "jpeg" else suffix
     return "png"
 
 
@@ -96,47 +106,114 @@ def _zip_content_disposition(filename: str) -> str:
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
-def _download_zip_payload(body: ImageZipDownloadRequest) -> tuple[io.BytesIO, str]:
+def _storage_rel_from_url(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    path = parsed.path if parsed.scheme or parsed.netloc else str(url or "").split("?", 1)[0]
+    marker = "/images/"
+    if marker not in path:
+        return ""
+    return unquote(path.split(marker, 1)[1]).lstrip("/")
+
+
+def _task_image_payload(task: dict[str, object], image_index: int) -> tuple[bytes, str, str]:
+    data = task.get("data")
+    if not isinstance(data, list) or image_index >= len(data):
+        raise ValueError("task image is unavailable")
+    item = data[image_index]
+    if not isinstance(item, dict):
+        raise ValueError("task image is unavailable")
+
+    storage_rel = str(item.get("storage_rel") or "").strip() or _storage_rel_from_url(str(item.get("url") or ""))
+    if storage_rel:
+        image_bytes = image_storage_service.get_bytes(storage_rel)
+        content_type = mimetypes.guess_type(storage_rel)[0] or ""
+        return image_bytes, content_type, storage_rel
+
+    encoded = str(item.get("b64_json") or "").strip()
+    if encoded:
+        estimated_size = len(encoded) * 3 // 4
+        if estimated_size > ZIP_MAX_ITEM_BYTES:
+            raise ValueError("task image exceeds download limit")
+        try:
+            return base64.b64decode(encoded, validate=True), "image/png", "image.png"
+        except Exception as exc:
+            raise ValueError("task image is invalid") from exc
+
+    url = str(item.get("url") or "").strip()
+    if url:
+        try:
+            image_bytes, filename, content_type = _download_image_url(url)
+        except HTTPException as exc:
+            raise ValueError("task image URL is unavailable") from exc
+        return image_bytes, content_type, filename
+
+    raise ValueError("task image is not stored locally")
+
+
+def _download_zip_payload(
+    identity: dict[str, object],
+    body: ImageZipDownloadRequest,
+):
     folder_name = _zip_safe_name(body.folder_name, "AI-Image-Results")
+    task_ids = list(dict.fromkeys(item.task_id.strip() for item in body.items if item.task_id.strip()))
+    task_list = image_task_service.list_tasks(identity, task_ids)
+    task_map = {
+        str(task.get("id") or ""): task
+        for task in task_list.get("items", [])
+        if isinstance(task, dict) and task.get("id")
+    }
     used_names: set[str] = set()
-    buf = io.BytesIO()
+    archive = tempfile.SpooledTemporaryFile(max_size=ZIP_SPOOL_MEMORY_BYTES, mode="w+b")
     added = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for index, item in enumerate(body.items, start=1):
-            raw_name = _zip_safe_name(item.filename, f"image-{index}.png")
-            payload = b""
-            content_type = ""
-            if item.b64_json:
-                try:
-                    payload = base64.b64decode(item.b64_json)
-                    content_type = "image/png"
-                except Exception:
+    total_bytes = 0
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for index, item in enumerate(body.items, start=1):
+                task = task_map.get(item.task_id.strip())
+                if task is None:
                     continue
-            elif item.url:
                 try:
-                    response = requests.get(item.url, timeout=60, impersonate="chrome")
-                    if response.status_code >= 400:
-                        continue
-                    payload = response.content or b""
-                    content_type = response.headers.get("content-type", "")
-                except Exception:
+                    image_bytes, content_type, source_name = _task_image_payload(task, item.image_index)
+                except (HTTPException, ValueError):
                     continue
-            if not payload:
-                continue
-            stem = raw_name.rsplit(".", 1)[0] if "." in raw_name else raw_name
-            ext = _image_ext_from_content_type(content_type, raw_name)
-            name = f"{stem}.{ext}"
-            counter = 2
-            while name in used_names:
-                name = f"{stem}-{counter}.{ext}"
-                counter += 1
-            used_names.add(name)
-            zf.writestr(f"{folder_name}/{name}", payload)
-            added += 1
-    if added == 0:
-        raise ValueError("no downloadable images")
-    buf.seek(0)
-    return buf, f"{folder_name}.zip"
+                if not image_bytes or len(image_bytes) > ZIP_MAX_ITEM_BYTES:
+                    continue
+                total_bytes += len(image_bytes)
+                if total_bytes > ZIP_MAX_TOTAL_BYTES:
+                    raise ValueError("download package exceeds size limit")
+
+                raw_name = _zip_safe_name(item.filename, f"image-{index}.png")
+                stem = raw_name.rsplit(".", 1)[0] if "." in raw_name else raw_name
+                ext = _image_ext_from_content_type(content_type, source_name or raw_name)
+                name = f"{stem}.{ext}"
+                counter = 2
+                while name in used_names:
+                    name = f"{stem}-{counter}.{ext}"
+                    counter += 1
+                used_names.add(name)
+                with zf.open(f"{folder_name}/{name}", "w") as target:
+                    view = memoryview(image_bytes)
+                    for offset in range(0, len(view), ZIP_STREAM_CHUNK_BYTES):
+                        target.write(view[offset : offset + ZIP_STREAM_CHUNK_BYTES])
+                added += 1
+        if added == 0:
+            raise ValueError("no downloadable images")
+        archive.seek(0)
+        return archive, f"{folder_name}.zip"
+    except Exception:
+        archive.close()
+        raise
+
+
+def _stream_zip_payload(payload):
+    try:
+        while True:
+            chunk = payload.read(ZIP_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        payload.close()
 
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
@@ -158,15 +235,23 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
+    @router.post("/api/image-tasks/query")
+    async def query_image_tasks(
+        body: ImageTaskQueryRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        return await run_in_threadpool(image_task_service.list_tasks, identity, body.ids)
+
     @router.post("/api/image-tasks/download-zip")
     async def download_image_task_zip(body: ImageZipDownloadRequest, authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        identity = require_identity(authorization)
         try:
-            payload, filename = await run_in_threadpool(_download_zip_payload, body)
+            payload, filename = await run_in_threadpool(_download_zip_payload, identity, body)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         headers = {"Content-Disposition": _zip_content_disposition(filename)}
-        return StreamingResponse(payload, media_type="application/zip", headers=headers)
+        return StreamingResponse(_stream_zip_payload(payload), media_type="application/zip", headers=headers)
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(

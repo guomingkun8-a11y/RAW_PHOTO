@@ -34,4 +34,4 @@ The Docker image contains `config.example.json`, not the local `config.json`. Th
 
 ## External rotation
 
-Credential rotation is an external provider action and cannot be completed by source-code changes. Rotate Qiniu, relay, backup, proxy, and review-service credentials in their provider consoles before production rollout.
+Credential rotation is an external provider action and cannot be completed by source-code changes. Rotate OSS, relay, backup, proxy, and review-service credentials in their provider consoles before production rollout.

@@ -40,6 +40,9 @@ IMAGE_TASK_MAX_RETRIES=2
 IMAGE_TASK_TOTAL_CONCURRENCY=8
 IMAGE_TASK_WORKER_CONCURRENCY=3
 IMAGE_TASK_OWNER_CONCURRENCY=2
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_ENABLED=false
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_THRESHOLD=10
+IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_MAX=20
 IMAGE_TASK_OWNER_PENDING_LIMIT=50
 ```
 
@@ -66,7 +69,7 @@ uv run python backend/scripts/migrate_image_task_assets.py --dry-run
 uv run python backend/scripts/migrate_image_task_assets.py
 ```
 
-The dry run only counts legacy assets. The write command stores task inputs and inline Base64 results as object references, then updates task JSON. It does not delete the original local image files. For Qiniu, set `GMKRAW_QINIU_TASK_PREFIX` for task assets and reserve `GMKRAW_QINIU_PREFIX` for public reference-image uploads.
+The dry run only counts legacy assets. The write command stores task inputs and inline Base64 results as object references, then updates task JSON. It does not delete the original local image files. For Aliyun OSS, set `GMKRAW_MINIO_ROOT_PATH` for generated task assets and `GMKRAW_OSS_REFERENCE_PREFIX` for public reference-image uploads.
 
 Capture the current throughput and reliability baseline before changing worker concurrency:
 
@@ -95,7 +98,7 @@ Only Worker processes perform startup recovery and requeue unfinished database t
 
 With `IMAGE_TASK_EXECUTOR=celery`, `worker.py` delegates to a Celery worker with late acknowledgements, one-task prefetch, worker-loss rejection, and Redis visibility recovery. With the default `redis` executor, the existing lightweight worker loop remains available for local development.
 
-For a local enterprise-shaped stack with MySQL, password-protected Redis, and Qiniu object storage:
+For a local enterprise-shaped stack with MySQL, password-protected Redis, and Aliyun OSS object storage:
 
 ```bash
 docker compose --env-file .env.local -f docker-compose.enterprise.yml up --build

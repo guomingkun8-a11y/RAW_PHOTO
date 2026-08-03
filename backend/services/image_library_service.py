@@ -382,13 +382,22 @@ class ImageLibraryService:
         template_id: int = 0,
         favorite_only: bool = False,
         include_deleted: bool = False,
+        include_all_owners: bool = False,
+        owner_id_filter: str = "",
     ) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "local-admin"
+        is_admin = _clean(identity.get("role")) == "admin"
+        all_owners = is_admin and include_all_owners
+        requested_owner_id = _clean(owner_id_filter)
         session = self._session()
         Model = self.Model
         try:
             query = session.query(Model)
-            query = query.filter(Model.owner_id == owner_id)
+            if all_owners:
+                if requested_owner_id:
+                    query = query.filter(Model.owner_id == requested_owner_id)
+            else:
+                query = query.filter(Model.owner_id == owner_id)
             if not include_deleted:
                 query = query.filter(Model.deleted_at.is_(None))
             if product_id > 0:
@@ -403,7 +412,8 @@ class ImageLibraryService:
                     text("MATCH(prompt, revised_prompt) AGAINST (:keyword IN NATURAL LANGUAGE MODE)")
                 ).params(keyword=keyword)
             total_key = (
-                owner_id,
+                "all" if all_owners else owner_id,
+                requested_owner_id if all_owners else "",
                 include_deleted,
                 product_id,
                 template_id,
@@ -459,10 +469,13 @@ class ImageLibraryService:
         deleted: bool | None = None,
     ) -> dict[str, Any] | None:
         owner_id = _clean(identity.get("id")) or "local-admin"
+        is_admin = _clean(identity.get("role")) == "admin"
         session = self._session()
         Model = self.Model
         try:
-            query = session.query(Model).filter(Model.id == image_id, Model.owner_id == owner_id)
+            query = session.query(Model).filter(Model.id == image_id)
+            if not is_admin:
+                query = query.filter(Model.owner_id == owner_id)
             row = query.one_or_none()
             if row is None:
                 return None
@@ -474,6 +487,67 @@ class ImageLibraryService:
             session.commit()
             self._count_cache.clear()
             return self._public_item(row, "")
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def list_images_by_ids(
+        self,
+        *,
+        identity: dict[str, object],
+        base_url: str,
+        image_ids: list[int],
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        owner_id = _clean(identity.get("id")) or "local-admin"
+        is_admin = _clean(identity.get("role")) == "admin"
+        ids = list(dict.fromkeys(int(image_id) for image_id in image_ids if int(image_id) > 0))
+        if not ids:
+            return []
+
+        session = self._session()
+        Model = self.Model
+        try:
+            query = session.query(Model).filter(Model.id.in_(ids))
+            if not is_admin:
+                query = query.filter(Model.owner_id == owner_id)
+            if not include_deleted:
+                query = query.filter(Model.deleted_at.is_(None))
+            rows = query.all()
+            row_map = {int(row.id): row for row in rows}
+            return [self._public_item(row_map[image_id], base_url) for image_id in ids if image_id in row_map]
+        finally:
+            session.close()
+
+    def bulk_delete_images(
+        self,
+        *,
+        identity: dict[str, object],
+        image_ids: list[int],
+    ) -> dict[str, int]:
+        owner_id = _clean(identity.get("id")) or "local-admin"
+        is_admin = _clean(identity.get("role")) == "admin"
+        ids = list(dict.fromkeys(int(image_id) for image_id in image_ids if int(image_id) > 0))
+        if not ids:
+            return {"requested": 0, "deleted": 0, "missing": 0}
+
+        session = self._session()
+        Model = self.Model
+        try:
+            query = session.query(Model).filter(Model.id.in_(ids), Model.deleted_at.is_(None))
+            if not is_admin:
+                query = query.filter(Model.owner_id == owner_id)
+            rows = query.all()
+            now = datetime.now()
+            for row in rows:
+                row.deleted_at = now
+                row.updated_at = now
+            session.commit()
+            self._count_cache.clear()
+            deleted = len(rows)
+            return {"requested": len(ids), "deleted": deleted, "missing": max(0, len(ids) - deleted)}
         except Exception:
             session.rollback()
             raise
@@ -495,6 +569,7 @@ class ImageLibraryService:
         return {
             "id": row.id,
             "task_id": row.task_id,
+            "owner_id": row.owner_id,
             "mode": row.mode,
             "model": row.model,
             "prompt": row.prompt,

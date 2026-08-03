@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hmac
 import io
 import json
 import time
@@ -11,9 +9,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlparse
 
-from curl_cffi import CurlMime, requests
+from curl_cffi import requests
 from fastapi import HTTPException
 from minio import Minio
 from minio.error import S3Error
@@ -24,14 +22,8 @@ from services.config import DATA_DIR, config
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
-REMOTE_MODES = {"webdav", "minio", "qiniu", "both"}
-QINIU_REGION_HOSTS = {
-    "z0": "https://rs-z0.qiniuapi.com",
-    "z1": "https://rs-z1.qiniuapi.com",
-    "z2": "https://rs-z2.qiniuapi.com",
-    "na0": "https://rs-na0.qiniuapi.com",
-    "as0": "https://rs-as0.qiniuapi.com",
-}
+REMOTE_PROVIDERS = {"webdav", "minio"}
+REMOTE_MODES = {"webdav", "minio", "both"}
 
 
 class ImageStorageError(RuntimeError):
@@ -137,29 +129,29 @@ def _local_enabled(mode: str) -> bool:
 
 def _item_remote_provider(item: dict[str, object], fallback: str = "") -> str:
     provider = _clean(item.get("remote_provider")).lower()
-    if provider in {"webdav", "minio", "qiniu"}:
+    if provider in REMOTE_PROVIDERS:
         return provider
+    if provider:
+        return ""
     if item.get("minio"):
         return "minio"
-    if item.get("qiniu"):
-        return "qiniu"
     if item.get("webdav"):
         return "webdav"
     if item.get("remote"):
         fallback = _clean(fallback).lower()
-        return fallback if fallback in {"webdav", "minio", "qiniu"} else "webdav"
+        return fallback if fallback in REMOTE_PROVIDERS else "webdav"
     return ""
 
 
 def _has_remote(item: dict[str, object]) -> bool:
-    return bool(item.get("remote") or item.get("webdav") or item.get("minio") or item.get("qiniu"))
+    return bool(_item_remote_provider(item))
 
 
 def _storage_label(local: bool, remote: bool, provider: str) -> str:
     if local and remote:
         return "both"
     if remote:
-        return provider if provider in {"webdav", "minio", "qiniu"} else "remote"
+        return provider if provider in REMOTE_PROVIDERS else "remote"
     return "local"
 
 
@@ -340,141 +332,6 @@ class MinIOClient:
             return {"ok": False, "status": 0, "error": str(exc) or exc.__class__.__name__}
 
 
-class QiniuClient:
-    def __init__(self, settings: dict[str, object]):
-        self.access_key = _clean(settings.get("qiniu_access_key"))
-        self.secret_key = _clean(settings.get("qiniu_secret_key"))
-        self.bucket = _clean(settings.get("qiniu_bucket"))
-        self.domain = _clean(settings.get("qiniu_domain")).rstrip("/")
-        self.upload_url = _clean(settings.get("qiniu_upload_url")).rstrip("/")
-        self.prefix = _clean(settings.get("qiniu_prefix")).strip("/")
-        self.region = _clean(settings.get("qiniu_region")).lower() or "z0"
-        self.private = _bool(settings.get("qiniu_private"), False)
-        if not self.access_key or not self.secret_key or not self.bucket or not self.domain or not self.upload_url:
-            raise ImageStorageError("Qiniu settings are incomplete")
-
-    @staticmethod
-    def _urlsafe(data: bytes) -> str:
-        return base64.urlsafe_b64encode(data).decode("ascii")
-
-    def object_name(self, rel: str) -> str:
-        safe_rel = _safe_relative_path(rel)
-        return "/".join(part for part in (self.prefix, safe_rel) if part)
-
-    def _public_url(self, object_name: str) -> str:
-        domain = self.domain
-        if not domain.startswith(("http://", "https://")):
-            domain = f"https://{domain}"
-        return f"{domain}/{quote(object_name, safe='/')}"
-
-    def _download_url(self, object_name: str) -> str:
-        public_url = self._public_url(object_name)
-        if not self.private:
-            return public_url
-        deadline = int(time.time()) + 3600
-        parsed = urlparse(public_url)
-        signed_path = parsed.path
-        sign_data = f"{signed_path}?e={deadline}".encode("utf-8")
-        signature = self._urlsafe(hmac.new(self.secret_key.encode("utf-8"), sign_data, hashlib.sha1).digest())
-        token = f"{self.access_key}:{signature}"
-        return f"{public_url}?{urlencode({'e': deadline, 'token': token})}"
-
-    def _upload_token(self, object_name: str) -> str:
-        policy = {
-            "scope": f"{self.bucket}:{object_name}",
-            "deadline": int(time.time()) + 3600,
-        }
-        encoded_policy = self._urlsafe(json.dumps(policy, separators=(",", ":")).encode("utf-8"))
-        signature = self._urlsafe(
-            hmac.new(self.secret_key.encode("utf-8"), encoded_policy.encode("utf-8"), hashlib.sha1).digest()
-        )
-        return f"{self.access_key}:{signature}:{encoded_policy}"
-
-    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
-        object_name = self.object_name(rel)
-        try:
-            from services.reference_image_uploader import _upload_to_qiniu_sdk
-
-            return _upload_to_qiniu_sdk(
-                payload,
-                Path(rel).name,
-                content_type,
-                key=object_name,
-                timeout=30,
-                upload_settings={
-                    "qiniu_access_key": self.access_key,
-                    "qiniu_secret_key": self.secret_key,
-                    "qiniu_bucket": self.bucket,
-                    "qiniu_domain": self.domain,
-                    "qiniu_upload_url": self.upload_url,
-                },
-            )
-        except ImportError:
-            pass
-
-        last_error = ""
-        for attempt in range(1, 4):
-            multipart = CurlMime()
-            try:
-                multipart.addpart(name="token", data=self._upload_token(object_name))
-                multipart.addpart(name="key", data=object_name)
-                multipart.addpart(name="file", filename=Path(rel).name, content_type=content_type, data=payload)
-                response = requests.post(self.upload_url, multipart=multipart, timeout=30)
-                if 200 <= response.status_code < 300:
-                    return self._public_url(object_name)
-                last_error = f"HTTP {response.status_code}"
-                if response.status_code not in {408, 429, 500, 502, 503, 504}:
-                    break
-            except Exception as exc:
-                last_error = str(exc)
-            finally:
-                multipart.close()
-            if attempt < 3:
-                time.sleep(0.8 * attempt)
-        raise ImageStorageError(f"Qiniu upload failed after 3 attempts: {last_error or 'no response'}")
-
-    def get(self, rel: str) -> bytes:
-        object_name = self.object_name(rel)
-        try:
-            response = requests.get(self._download_url(object_name), timeout=60)
-        except Exception as exc:
-            raise ImageStorageError(f"Qiniu download failed: {exc}") from exc
-        if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="image not found")
-        if response.status_code >= 400:
-            raise ImageStorageError(f"Qiniu download failed: HTTP {response.status_code}")
-        return bytes(response.content)
-
-    def delete(self, rel: str) -> bool:
-        object_name = self.object_name(rel)
-        entry = self._urlsafe(f"{self.bucket}:{object_name}".encode("utf-8"))
-        path = f"/delete/{entry}"
-        host = QINIU_REGION_HOSTS.get(self.region, QINIU_REGION_HOSTS["z0"])
-        signature = self._urlsafe(hmac.new(self.secret_key.encode("utf-8"), f"{path}\n".encode("utf-8"), hashlib.sha1).digest())
-        try:
-            response = requests.post(
-                f"{host}{path}",
-                headers={"Authorization": f"QBox {self.access_key}:{signature}"},
-                timeout=60,
-            )
-        except Exception as exc:
-            raise ImageStorageError(f"Qiniu delete failed: {exc}") from exc
-        if response.status_code in {200, 612}:
-            return response.status_code == 200
-        raise ImageStorageError(f"Qiniu delete failed: HTTP {response.status_code}")
-
-    def test(self) -> dict[str, object]:
-        rel = ".gmkraw_qiniu_test.txt"
-        try:
-            self.put(rel, b"gmkraw qiniu test\n", "text/plain")
-            self.delete(rel)
-            return {"ok": True, "status": 200, "error": None}
-        except ImageStorageError as exc:
-            return {"ok": False, "status": 0, "error": str(exc)}
-        except Exception as exc:
-            return {"ok": False, "status": 0, "error": str(exc) or exc.__class__.__name__}
-
-
 class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
@@ -494,16 +351,12 @@ class ImageStorageService:
         if mode == "webdav":
             return "webdav"
         provider = _clean(item.get("provider")).lower()
-        if mode == "qiniu":
-            return "qiniu"
-        return provider if provider in {"webdav", "minio", "qiniu"} else "webdav"
+        return provider if provider in REMOTE_PROVIDERS else "webdav"
 
     def _remote_client(self, provider: str, settings: dict[str, object] | None = None):
         item = settings or self.settings()
         if provider == "minio":
             return MinIOClient(item)
-        if provider == "qiniu":
-            return QiniuClient(item)
         return WebDAVClient(item)
 
     def _load_index(self) -> dict[str, dict[str, object]]:
@@ -549,7 +402,7 @@ class ImageStorageService:
             raise ImageStorageError("image storage path must use a supported image extension")
         settings = self.settings()
         mode = _clean(settings.get("mode")).lower() or "local"
-        if mode not in {"local", "webdav", "minio", "qiniu", "both"}:
+        if mode not in {"local", "webdav", "minio", "both"}:
             mode = "local"
         remote_provider = self.remote_provider(settings)
         stored_local = False
@@ -580,7 +433,6 @@ class ImageStorageService:
             "remote_provider": remote_provider if stored_remote else "",
             "webdav": stored_remote and remote_provider == "webdav",
             "minio": stored_remote and remote_provider == "minio",
-            "qiniu": stored_remote and remote_provider == "qiniu",
             "remote_url": remote_url,
             "asset_type": _clean(asset_type) or "generated",
         }
@@ -699,7 +551,6 @@ class ImageStorageService:
                             "remote_provider": provider,
                             "webdav": provider == "webdav",
                             "minio": provider == "minio",
-                            "qiniu": provider == "qiniu",
                         }
                         changed = True
                         continue
@@ -756,7 +607,6 @@ class ImageStorageService:
                     "remote_provider": "",
                     "webdav": False,
                     "minio": False,
-                    "qiniu": False,
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 }
                 changed = True
@@ -791,7 +641,6 @@ class ImageStorageService:
                         "storage": storage,
                         "webdav": remote and provider == "webdav",
                         "minio": remote and provider == "minio",
-                        "qiniu": remote and provider == "qiniu",
                     }
                     indexed[rel] = item
                     changed = True
@@ -874,7 +723,6 @@ class ImageStorageService:
                 "remote_provider": provider,
                 "webdav": provider == "webdav",
                 "minio": provider == "minio",
-                "qiniu": provider == "qiniu",
                 "remote_url": remote_url,
                 **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
             }
@@ -901,9 +749,6 @@ class ImageStorageService:
 
     def test_minio(self) -> dict[str, object]:
         return MinIOClient(self.settings()).test()
-
-    def test_qiniu(self) -> dict[str, object]:
-        return QiniuClient(self.settings()).test()
 
 
 image_storage_service = ImageStorageService()

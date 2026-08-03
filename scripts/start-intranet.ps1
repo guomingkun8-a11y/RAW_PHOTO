@@ -1,6 +1,6 @@
 param(
     [string]$EnvFile = ".env.intranet",
-    [int]$WorkerReplicas = 1,
+    [int]$WorkerReplicas = 2,
     [switch]$Build
 )
 
@@ -16,12 +16,12 @@ if (-not (Test-Path -LiteralPath $ComposeFile)) {
 
 if (-not (Test-Path -LiteralPath $ResolvedEnvFile)) {
     Write-Host "Env file not found: $ResolvedEnvFile"
-    Write-Host "Create it from .env.example, fill passwords/Qiniu/relay settings, then run this script again."
+    Write-Host "Create it from .env.example, fill passwords/OSS/relay settings, then run this script again."
     exit 1
 }
 
-if ($WorkerReplicas -lt 1) {
-    throw "WorkerReplicas must be >= 1"
+if ($WorkerReplicas -lt 2 -or $WorkerReplicas -gt 4) {
+    throw "WorkerReplicas must be between 2 and 4 for this deployment profile"
 }
 
 $compose = @(

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { LoaderCircle, LockKeyhole, LogIn, RefreshCw, User, UserPlus } from "@lucide/vue";
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
@@ -18,8 +18,11 @@ const isRegister = computed(() => mode.value === "register");
 const title = computed(() => (isRegister.value ? "创建账号" : "欢迎回来"));
 const subtitle = computed(() => (isRegister.value ? "新账号默认是普通用户，注册后直接进入工作台。" : "登录后继续处理图片生成、素材和历史任务。"));
 
-const loginUsername = ref("admin");
+const loginUsername = ref("");
 const loginPassword = ref("");
+const loginUsernameInput = ref<HTMLInputElement | null>(null);
+const loginPasswordInput = ref<HTMLInputElement | null>(null);
+const loginReadonly = ref(true);
 const registerUsername = ref("");
 const registerName = ref("");
 const registerPassword = ref("");
@@ -29,6 +32,7 @@ const captchaImage = ref("");
 const captchaCode = ref("");
 const isSubmitting = ref(false);
 const isLoadingCaptcha = ref(false);
+let credentialClearTimers: number[] = [];
 
 const switchLink = computed(() => ({
   name: isRegister.value ? "login" : "register",
@@ -40,6 +44,27 @@ function targetAfterAuth(role: "admin" | "user") {
   return next.startsWith("/") ? next : getDefaultRouteForRole(role);
 }
 
+function clearLoginCredentials() {
+  loginUsername.value = "";
+  loginPassword.value = "";
+  if (loginUsernameInput.value) loginUsernameInput.value.value = "";
+  if (loginPasswordInput.value) loginPasswordInput.value.value = "";
+}
+
+function unlockLoginFields() {
+  loginReadonly.value = false;
+  credentialClearTimers.forEach((timer) => window.clearTimeout(timer));
+  credentialClearTimers = [];
+}
+
+function scheduleCredentialClear() {
+  clearLoginCredentials();
+  credentialClearTimers.forEach((timer) => window.clearTimeout(timer));
+  credentialClearTimers = [50, 250, 800, 1600].map((delay) =>
+    window.setTimeout(clearLoginCredentials, delay),
+  );
+}
+
 async function persistSession(data: Awaited<ReturnType<typeof login>>) {
   const session = {
     key: data.token,
@@ -47,6 +72,7 @@ async function persistSession(data: Awaited<ReturnType<typeof login>>) {
     subjectId: data.subject_id,
     username: data.username,
     name: data.name,
+    avatarUrl: data.avatar_url || "",
   };
   await setStoredAuthSession(session);
   setSession(session);
@@ -124,7 +150,12 @@ watch(isRegister, (next) => {
 });
 
 onMounted(() => {
+  void nextTick(scheduleCredentialClear);
   if (isRegister.value) void refreshCaptcha();
+});
+
+onBeforeUnmount(() => {
+  credentialClearTimers.forEach((timer) => window.clearTimeout(timer));
 });
 </script>
 
@@ -141,8 +172,8 @@ onMounted(() => {
     <div class="auth-stage" :class="{ 'is-register': isRegister }">
       <div class="auth-panel">
         <div class="auth-mode" role="tablist" aria-label="认证方式">
-          <RouterLink :to="{ name: 'login', query: route.query }" class="auth-mode__item" :class="{ 'is-active': !isRegister }">登录</RouterLink>
-          <RouterLink :to="{ name: 'register', query: route.query }" class="auth-mode__item" :class="{ 'is-active': isRegister }">注册</RouterLink>
+          <RouterLink :to="{ name: 'login', query: route.query }" class="auth-mode__item" :class="{ 'is-active': !isRegister }" data-testid="auth-login-tab">登录</RouterLink>
+          <RouterLink :to="{ name: 'register', query: route.query }" class="auth-mode__item" :class="{ 'is-active': isRegister }" data-testid="auth-register-tab">注册</RouterLink>
         </div>
 
         <header class="auth-header">
@@ -154,41 +185,41 @@ onMounted(() => {
         </header>
 
         <div class="auth-forms">
-          <form class="auth-form auth-form--login" :aria-hidden="isRegister" @submit.prevent="handleLogin">
+          <form class="auth-form auth-form--login" :aria-hidden="isRegister" autocomplete="off" data-testid="login-form" @submit.prevent="handleLogin">
             <label class="auth-field">
               <span>用户名</span>
               <div class="auth-input-wrap">
                 <User class="size-4" />
-                <input v-model="loginUsername" autocomplete="username" aria-label="用户名" />
+                <input ref="loginUsernameInput" v-model="loginUsername" name="gmkraw_login_account" autocomplete="off" autocapitalize="none" spellcheck="false" :readonly="loginReadonly" aria-label="用户名" data-testid="login-username" @focus="unlockLoginFields" @mousedown="unlockLoginFields" @touchstart="unlockLoginFields" />
               </div>
             </label>
             <label class="auth-field">
               <span>密码</span>
               <div class="auth-input-wrap">
                 <LockKeyhole class="size-4" />
-                <input v-model="loginPassword" type="password" autocomplete="current-password" aria-label="密码" placeholder="默认密码 admin123456" />
+                <input ref="loginPasswordInput" v-model="loginPassword" name="gmkraw_login_secret" type="password" autocomplete="new-password" :readonly="loginReadonly" aria-label="密码" data-testid="login-password" @focus="unlockLoginFields" @mousedown="unlockLoginFields" @touchstart="unlockLoginFields" />
               </div>
             </label>
-            <button type="submit" class="auth-submit" :disabled="isSubmitting || isRegister">
+            <button type="submit" class="auth-submit" :disabled="isSubmitting || isRegister" data-testid="login-submit">
               <LoaderCircle v-if="isSubmitting && !isRegister" class="size-4 animate-spin" />
               <LogIn v-else class="size-4" />
               登录工作台
             </button>
           </form>
 
-          <form class="auth-form auth-form--register" :aria-hidden="!isRegister" @submit.prevent="handleRegister">
+          <form class="auth-form auth-form--register" :aria-hidden="!isRegister" data-testid="register-form" @submit.prevent="handleRegister">
             <label class="auth-field">
               <span>用户名</span>
               <div class="auth-input-wrap">
                 <User class="size-4" />
-                <input v-model="registerUsername" autocomplete="username" aria-label="用户名" />
+                <input v-model="registerUsername" autocomplete="username" aria-label="用户名" data-testid="register-username" />
               </div>
             </label>
             <label class="auth-field">
               <span>名称</span>
               <div class="auth-input-wrap">
                 <UserPlus class="size-4" />
-                <input v-model="registerName" autocomplete="name" aria-label="名称" />
+                <input v-model="registerName" autocomplete="name" aria-label="名称" data-testid="register-name" />
               </div>
             </label>
             <div class="auth-field-grid">
@@ -196,14 +227,14 @@ onMounted(() => {
                 <span>密码</span>
                 <div class="auth-input-wrap">
                   <LockKeyhole class="size-4" />
-                  <input v-model="registerPassword" type="password" autocomplete="new-password" aria-label="密码" />
+                  <input v-model="registerPassword" type="password" autocomplete="new-password" aria-label="密码" data-testid="register-password" />
                 </div>
               </label>
               <label class="auth-field">
                 <span>确认密码</span>
                 <div class="auth-input-wrap">
                   <LockKeyhole class="size-4" />
-                  <input v-model="registerConfirmPassword" type="password" autocomplete="new-password" aria-label="确认密码" />
+                  <input v-model="registerConfirmPassword" type="password" autocomplete="new-password" aria-label="确认密码" data-testid="register-confirm-password" />
                 </div>
               </label>
             </div>
@@ -211,16 +242,16 @@ onMounted(() => {
               <span>图形验证码</span>
               <div class="auth-captcha">
                 <div class="auth-input-wrap">
-                  <input v-model="captchaCode" autocomplete="off" aria-label="图形验证码" placeholder="输入右侧字符" />
+                  <input v-model="captchaCode" autocomplete="off" aria-label="图形验证码" placeholder="输入右侧字符" data-testid="register-captcha-code" />
                 </div>
-                <button type="button" class="auth-captcha__image" :disabled="isLoadingCaptcha" @click="refreshCaptcha" aria-label="刷新验证码">
+                <button type="button" class="auth-captcha__image" :disabled="isLoadingCaptcha" data-testid="register-captcha-refresh" @click="refreshCaptcha" aria-label="刷新验证码">
                   <LoaderCircle v-if="isLoadingCaptcha" class="size-4 animate-spin" />
                   <img v-else-if="captchaImage" :src="captchaImage" alt="图形验证码" />
                   <RefreshCw v-else class="size-4" />
                 </button>
               </div>
             </label>
-            <button type="submit" class="auth-submit" :disabled="isSubmitting || !isRegister">
+            <button type="submit" class="auth-submit" :disabled="isSubmitting || !isRegister" data-testid="register-submit">
               <LoaderCircle v-if="isSubmitting && isRegister" class="size-4 animate-spin" />
               <UserPlus v-else class="size-4" />
               注册并进入
@@ -228,7 +259,7 @@ onMounted(() => {
           </form>
         </div>
 
-        <RouterLink :to="switchLink" class="auth-switch">
+        <RouterLink :to="switchLink" class="auth-switch" data-testid="auth-mode-switch">
           {{ isRegister ? "已有账号，返回登录" : "没有账号，立即注册" }}
         </RouterLink>
       </div>

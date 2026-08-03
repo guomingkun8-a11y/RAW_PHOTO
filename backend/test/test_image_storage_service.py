@@ -66,26 +66,6 @@ class FakeMinIOClient:
         return {"ok": True, "status": 200, "error": None}
 
 
-class FakeQiniuClient:
-    uploaded: dict[str, bytes] = {}
-
-    def __init__(self, _settings):
-        pass
-
-    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
-        self.uploaded[rel] = payload
-        return f"https://cdn.example.test/{rel}"
-
-    def get(self, rel: str) -> bytes:
-        return self.uploaded[rel]
-
-    def delete(self, rel: str) -> bool:
-        return self.uploaded.pop(rel, None) is not None
-
-    def test(self) -> dict[str, object]:
-        return {"ok": True, "status": 200, "error": None}
-
-
 class ImageStorageServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -120,7 +100,6 @@ class ImageStorageServiceTests(unittest.TestCase):
         FakeWebDAVClient.deleted = []
         FakeMinIOClient.uploaded = {}
         FakeMinIOClient.deleted = []
-        FakeQiniuClient.uploaded = {}
 
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
@@ -167,29 +146,6 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertFalse((self.images_dir / stored.rel).exists())
         self.assertIn(stored.rel, FakeMinIOClient.uploaded)
         self.assertEqual(payload, FakeMinIOClient.uploaded[stored.rel])
-
-    def test_qiniu_mode_uploads_without_local_file(self):
-        self.settings.update({
-            "enabled": True,
-            "mode": "qiniu",
-            "provider": "qiniu",
-            "qiniu_access_key": "access",
-            "qiniu_secret_key": "secret",
-            "qiniu_bucket": "raw-photo",
-            "qiniu_domain": "https://cdn.example.test",
-            "qiniu_upload_url": "https://upload-z0.qiniup.com",
-            "qiniu_prefix": "gmkraw/task-assets",
-            "qiniu_region": "z0",
-            "qiniu_private": False,
-        })
-        with mock.patch("services.image_storage_service.QiniuClient", FakeQiniuClient):
-            stored = self.service().save(png_bytes(), "http://app.test")
-            payload = self.service().get_bytes(stored.rel)
-
-        self.assertEqual(stored.storage, "qiniu")
-        self.assertFalse((self.images_dir / stored.rel).exists())
-        self.assertIn(stored.rel, FakeQiniuClient.uploaded)
-        self.assertEqual(payload, FakeQiniuClient.uploaded[stored.rel])
 
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()
@@ -239,29 +195,26 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.settings.update({
             "enabled": True,
             "mode": "both",
-            "provider": "qiniu",
-            "qiniu_access_key": "access",
-            "qiniu_secret_key": "secret",
-            "qiniu_bucket": "raw-photo",
-            "qiniu_domain": "https://cdn.example.test",
-            "qiniu_upload_url": "https://upload-z0.qiniup.com",
-            "qiniu_prefix": "gmkraw/task-assets",
-            "qiniu_region": "z0",
-            "qiniu_private": False,
+            "provider": "minio",
+            "minio_endpoint": "http://minio.example.test:9000",
+            "minio_access_key": "access",
+            "minio_secret_key": "secret",
+            "minio_bucket": "raw-photo",
+            "minio_secure": False,
         })
         for name in ("one.png", "two.png"):
             path = self.images_dir / "2026" / "07" / "21" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(png_bytes())
 
-        with mock.patch("services.image_storage_service.QiniuClient", FakeQiniuClient):
+        with mock.patch("services.image_storage_service.MinIOClient", FakeMinIOClient):
             first = self.service().sync_all(workers=2)
             second = self.service().sync_all(workers=2)
 
         self.assertEqual(first, {"uploaded": 2, "skipped": 0, "failed": 0})
         self.assertEqual(second, {"uploaded": 0, "skipped": 2, "failed": 0})
         items = self.service()._load_clean_index()
-        self.assertTrue(all(item["qiniu"] and item["storage"] == "both" for item in items.values()))
+        self.assertTrue(all(item["minio"] and item["storage"] == "both" for item in items.values()))
 
     def test_test_webdav_writes_and_deletes_probe_file(self):
         self.settings.update({

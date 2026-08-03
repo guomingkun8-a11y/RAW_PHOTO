@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import os
 import secrets
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -19,6 +20,8 @@ DEFAULT_ADMIN_PASSWORD = "admin123456"
 PASSWORD_ITERATIONS = 260_000
 SESSION_DAYS = 7
 SESSION_TOUCH_INTERVAL_SECONDS = 60
+AVATAR_DIR = Path(__file__).resolve().parents[2] / "data" / "avatars"
+AVATAR_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 AuthRole = Literal["admin", "user"]
 
@@ -56,6 +59,28 @@ def _hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
     return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def _avatar_url(user_id: str) -> str:
+    clean_id = _clean(user_id)
+    if not clean_id:
+        return ""
+    for extension in AVATAR_EXTENSIONS:
+        if (AVATAR_DIR / f"{clean_id}{extension}").is_file():
+            return f"/avatars/{clean_id}{extension}"
+    return ""
+
+
+def _detect_avatar_extension(payload: bytes) -> str:
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if payload.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if payload.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if len(payload) >= 12 and payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return ".webp"
+    return ""
 
 
 def _verify_password(password: str, password_hash: str) -> bool:
@@ -265,6 +290,41 @@ class UserService:
         finally:
             session.close()
 
+    def change_password(self, *, user_id: str, current_password: str, new_password: str, revoke_token: str = "") -> dict[str, object]:
+        normalized_id = _clean(user_id)
+        current_password = _clean(current_password)
+        new_password = _clean(new_password)
+        if not normalized_id:
+            raise ValueError("用户不存在")
+        if not current_password:
+            raise ValueError("请输入当前密码")
+        if len(new_password) < 6:
+            raise ValueError("新密码至少 6 位")
+        if current_password == new_password:
+            raise ValueError("新密码不能和当前密码相同")
+
+        session = self._session()
+        try:
+            user = session.query(UserModel).filter(UserModel.id == normalized_id).one_or_none()
+            if user is None or user.enabled != "1":
+                raise ValueError("用户不存在或已停用")
+            if not _verify_password(current_password, user.password_hash):
+                raise ValueError("当前密码不正确")
+            user.password_hash = _hash_password(new_password)
+            user.updated_at = _now()
+            token_hash = _hash_token(revoke_token) if _clean(revoke_token) else ""
+            if token_hash:
+                row = session.query(UserSessionModel).filter(UserSessionModel.token_hash == token_hash).one_or_none()
+                if row is not None:
+                    row.revoked_at = _now()
+            session.commit()
+            return self._public_user(user)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def list_users(self) -> dict[str, Any]:
         session = self._session()
         try:
@@ -379,6 +439,40 @@ class UserService:
     def disable_user(self, user_id: str) -> dict[str, object] | None:
         return self.update_user(user_id, {"enabled": False})
 
+    def set_avatar(self, user_id: str, *, filename: str, content_type: str, payload: bytes) -> dict[str, object]:
+        normalized_id = _clean(user_id)
+        if not normalized_id:
+            raise ValueError("用户不存在")
+        if not payload:
+            raise ValueError("头像文件不能为空")
+        if len(payload) > 2 * 1024 * 1024:
+            raise ValueError("头像不能超过 2MB")
+
+        extension = _detect_avatar_extension(payload)
+        if not extension:
+            raise ValueError("只支持 PNG、JPG、WEBP 或 GIF 头像")
+
+        session = self._session()
+        try:
+            user = session.query(UserModel).filter(UserModel.id == normalized_id).one_or_none()
+            if user is None or user.enabled != "1":
+                raise ValueError("用户不存在或已停用")
+            AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+            for old_extension in AVATAR_EXTENSIONS:
+                old_path = AVATAR_DIR / f"{normalized_id}{old_extension}"
+                if old_path.exists() and old_extension != extension:
+                    old_path.unlink()
+            target = AVATAR_DIR / f"{normalized_id}{extension}"
+            target.write_bytes(payload)
+            user.updated_at = _now()
+            session.commit()
+            return self._public_user(user)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     @staticmethod
     def _public_user(row: UserModel) -> dict[str, object]:
         return {
@@ -391,6 +485,7 @@ class UserService:
             "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else "",
             "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else "",
             "last_login_at": row.last_login_at.strftime("%Y-%m-%d %H:%M:%S") if row.last_login_at else "",
+            "avatar_url": _avatar_url(row.id),
         }
 
 

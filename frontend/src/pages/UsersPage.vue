@@ -21,6 +21,7 @@ import {
   fetchAuditLogs,
   fetchUsers,
   updateUser,
+  resolveApiAssetUrl,
   type AuditLogItem,
   type AuthRole,
   type UserAccount,
@@ -65,10 +66,21 @@ const confirming = ref(false);
 const editing = ref<Draft | null>(null);
 const confirmAction = ref<ConfirmAction | null>(null);
 
+function userRolePriority(role: AuthRole | string | undefined) {
+  return role === "admin" ? 0 : 1;
+}
+
+function sortUsersByRole(users: UserAccount[]) {
+  return [...users].sort((a, b) => {
+    return userRolePriority(a.role) - userRolePriority(b.role);
+  });
+}
+
 const filtered = computed(() => {
   const keyword = query.value.trim().toLowerCase();
-  if (!keyword) return items.value;
-  return items.value.filter((item) =>
+  const sorted = sortUsersByRole(items.value);
+  if (!keyword) return sorted;
+  return sorted.filter((item) =>
     [item.username, item.name, item.role, item.id].some((value) =>
       String(value || "").toLowerCase().includes(keyword),
     ),
@@ -348,8 +360,9 @@ onMounted(load);
         <article v-for="item in filtered" :key="item.id" class="studio-card bg-white p-5 dark:bg-[#171a21]">
           <div class="flex items-start justify-between gap-3">
             <div class="flex min-w-0 items-center gap-3">
-              <span class="grid size-12 shrink-0 place-items-center rounded-2xl bg-slate-950 text-lg font-semibold text-white dark:bg-white dark:text-slate-950">
-                {{ (item.name || item.username).slice(0, 1).toUpperCase() }}
+              <span class="grid size-12 shrink-0 place-items-center overflow-hidden rounded-2xl bg-slate-950 text-lg font-semibold text-white dark:bg-white dark:text-slate-950">
+                <img v-if="item.avatar_url" :src="resolveApiAssetUrl(item.avatar_url)" alt="" class="h-full w-full object-cover" loading="lazy" decoding="async" />
+                <template v-else>{{ (item.name || item.username).slice(0, 1).toUpperCase() }}</template>
               </span>
               <div class="min-w-0">
                 <h2 class="truncate text-lg font-semibold text-slate-950 dark:text-stone-50">{{ item.name || item.username }}</h2>

@@ -8,6 +8,7 @@ export type StoredAuthSession = {
   subjectId: string;
   username?: string;
   name: string;
+  avatarUrl?: string;
 };
 
 export const AUTH_KEY_STORAGE_KEY = "gmkraw_auth_key";
@@ -30,6 +31,7 @@ function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession |
     subjectId: String(candidate.subjectId || "").trim(),
     username: String(candidate.username || "").trim(),
     name: String(candidate.name || "").trim(),
+    avatarUrl: String(candidate.avatarUrl || "").trim(),
   };
 }
 

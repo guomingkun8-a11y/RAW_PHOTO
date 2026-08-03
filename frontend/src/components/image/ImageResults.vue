@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Archive, Check, Clock3, Copy, Download, Edit3, LoaderCircle, RefreshCw, Trash2, XCircle } from "@lucide/vue";
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { toast } from "vue-sonner";
 
 import { downloadImageTaskZip } from "@/lib/api";
@@ -11,8 +11,11 @@ const props = withDefaults(defineProps<{
   conversation: ImageConversation | null;
   allowTimeoutRetryContinue?: boolean;
   timeoutRetry?: { taskId: string; taskError: string } | null;
+  userName?: string;
+  userInitial?: string;
+  userAvatarUrl?: string;
   formatConversationTime: (value: string) => string;
-}>(), { conversation: null, allowTimeoutRetryContinue: false, timeoutRetry: null });
+}>(), { conversation: null, allowTimeoutRetryContinue: false, timeoutRetry: null, userName: "用户", userInitial: "U", userAvatarUrl: "" });
 
 const emit = defineEmits<{
   openLightbox: [images: Array<{ id: string; src: string; name?: string }>, index: number];
@@ -30,15 +33,67 @@ const emit = defineEmits<{
 
 const now = ref(Date.now());
 const downloadingTurnId = ref<string | null>(null);
+const expandedTurnIds = ref<Set<string>>(new Set());
+const displayUserName = computed(() => props.userName.trim() || "用户");
+const displayUserInitial = computed(() => {
+  const source = props.userInitial.trim() || displayUserName.value;
+  return source.slice(0, 1).toUpperCase() || "U";
+});
+const FULL_TURN_WINDOW = 6;
+const COLLAPSED_PREVIEW_LIMIT = 4;
+const hasLoadingImages = computed(() => Boolean(props.conversation?.turns.some((turn) => turn.images.some((image) => image.status === "loading"))));
+const collapsedTurnIds = computed(() => {
+  const turns = props.conversation?.turns || [];
+  if (turns.length <= FULL_TURN_WINDOW) return new Set<string>();
+  const keepFrom = Math.max(0, turns.length - FULL_TURN_WINDOW);
+  return new Set(
+    turns.flatMap((turn, index) => {
+      const hasTimeoutAction = Boolean(props.timeoutRetry && turn.images.some((image) => image.taskId === props.timeoutRetry?.taskId));
+      const isActive = turn.status === "queued" || turn.status === "generating" || hasTimeoutAction;
+      return !isActive && index < keepFrom ? [turn.id] : [];
+    }),
+  );
+});
 let timer = 0;
-onMounted(() => { timer = window.setInterval(() => { now.value = Date.now(); }, 1000); });
-onBeforeUnmount(() => window.clearInterval(timer));
+function startElapsedTimer() {
+  if (timer) return;
+  timer = window.setInterval(() => { now.value = Date.now(); }, 1000);
+}
+function stopElapsedTimer() {
+  if (!timer) return;
+  window.clearInterval(timer);
+  timer = 0;
+}
+watch(hasLoadingImages, (active) => {
+  if (active) startElapsedTimer();
+  else stopElapsedTimer();
+}, { immediate: true });
+watch(() => props.conversation?.id, () => { expandedTurnIds.value = new Set(); });
+onBeforeUnmount(stopElapsedTimer);
 
 function imageSrc(image: StoredImage) {
   return image.b64_json ? `data:image/png;base64,${image.b64_json}` : image.url || "";
 }
+function referenceSrc(image: StoredReferenceImage) {
+  return image.dataUrl || image.url || "";
+}
 function imageItems(turn: ImageTurn) {
   return turn.images.filter((image) => image.status === "success" && imageSrc(image)).map((image) => ({ id: image.id, src: imageSrc(image), name: image.sourceName || `${image.id}.png` }));
+}
+function successImages(turn: ImageTurn) {
+  return turn.images.filter((image) => image.status === "success" && imageSrc(image));
+}
+function previewImages(turn: ImageTurn) {
+  return successImages(turn).slice(-COLLAPSED_PREVIEW_LIMIT);
+}
+function isTurnCollapsed(turn: ImageTurn) {
+  return collapsedTurnIds.value.has(turn.id) && !expandedTurnIds.value.has(turn.id);
+}
+function toggleTurnExpanded(turnId: string) {
+  const next = new Set(expandedTurnIds.value);
+  if (next.has(turnId)) next.delete(turnId);
+  else next.add(turnId);
+  expandedTurnIds.value = next;
 }
 function elapsed(image: StoredImage) {
   if (typeof image.elapsedSecs === "number") return `${image.elapsedSecs.toFixed(1)}s`;
@@ -74,7 +129,7 @@ function downloadImage(image: StoredImage) {
 async function downloadZip(turn: ImageTurn) {
   if (downloadingTurnId.value) return;
   const images = turn.images.filter(
-    (image) => image.status === "success" && (image.url || image.b64_json),
+    (image) => image.status === "success" && image.taskId,
   );
   if (!images.length) {
     toast.error("当前没有可下载的图片");
@@ -87,8 +142,7 @@ async function downloadZip(turn: ImageTurn) {
     const blob = await downloadImageTaskZip({
       folderName,
       items: images.map((image, index) => ({
-        url: image.url,
-        b64Json: image.b64_json,
+        taskId: image.taskId!,
         filename: `${String(index + 1).padStart(2, "0")}-${image.sourceName || "image.png"}`,
       })),
     });
@@ -129,12 +183,28 @@ function copyPrompt(prompt: string) {
     </div>
 
     <template v-for="turn in conversation.turns" :key="turn.id">
-      <article class="flex justify-end">
-        <div class="max-w-[min(760px,88%)] rounded-2xl rounded-tr-md bg-slate-950 px-4 py-3 text-white shadow-sm dark:bg-white dark:text-slate-950">
+      <article v-if="isTurnCollapsed(turn)" class="flex items-start gap-3">
+        <div class="mt-1 grid size-8 shrink-0 place-items-center overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-black/[0.06] dark:bg-white/[0.08] dark:ring-white/10 sm:size-9" aria-label="家可美头像">
+          <img src="/jiakemei-mark.svg" alt="" class="size-5 rounded-lg sm:size-6" loading="lazy" decoding="async" />
+        </div>
+        <button type="button" class="min-w-0 flex-1 rounded-2xl rounded-tl-md border border-dashed border-black/[0.08] bg-white px-4 py-3 text-left text-sm text-slate-600 shadow-sm transition hover:border-[#4F7CFF]/25 hover:bg-[#F8FAFC] dark:border-white/10 dark:bg-[#171a21] dark:text-stone-300 dark:hover:bg-white/[0.06]" @click="toggleTurnExpanded(turn.id)">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="font-semibold text-slate-800 dark:text-stone-100">已折叠较早轮次</span>
+            <span class="text-xs text-slate-400">{{ statusLabel(turn) }} · {{ successImages(turn).length }}/{{ turn.images.length }} 张</span>
+          </div>
+          <div v-if="previewImages(turn).length" class="mt-3 flex gap-2 overflow-hidden">
+            <img v-for="image in previewImages(turn)" :key="image.id" :src="imageSrc(image)" :alt="image.sourceName || '生成图片预览'" class="size-12 shrink-0 rounded-xl object-cover" loading="lazy" decoding="async" />
+          </div>
+        </button>
+      </article>
+
+      <template v-else>
+      <article class="flex items-start justify-end gap-2 sm:gap-3">
+        <div class="max-w-[calc(100%-44px)] rounded-2xl rounded-tr-md bg-slate-950 px-4 py-3 text-white shadow-sm dark:bg-white dark:text-slate-950 sm:max-w-[min(720px,84%)]">
           <p v-if="turn.prompt" class="whitespace-pre-wrap text-sm leading-6">{{ turn.prompt }}</p>
           <div v-else class="text-sm text-white/60 dark:text-slate-500">提示词已删除</div>
           <div v-if="turn.referenceImages.length" class="mt-3 flex gap-2 overflow-x-auto">
-            <img v-for="image in turn.referenceImages" :key="image.name + image.dataUrl.slice(-12)" :src="image.dataUrl" alt="参考图" class="size-14 shrink-0 rounded-xl border border-white/15 object-cover" />
+            <img v-for="(image, index) in turn.referenceImages" :key="`${image.name}-${referenceSrc(image).slice(-12)}-${index}`" :src="referenceSrc(image)" alt="参考图" class="size-14 shrink-0 rounded-xl border border-white/15 object-cover" loading="lazy" decoding="async" />
           </div>
           <div class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2 text-[11px] text-white/60 dark:border-slate-900/10 dark:text-slate-500">
             <span>{{ turn.mode === 'edit' ? '图生图' : '文生图' }} · {{ modelLabel(turn.model) }} · {{ turn.count }} 张 · {{ turn.size }}</span>
@@ -151,11 +221,15 @@ function copyPrompt(prompt: string) {
             </span>
           </div>
         </div>
+        <div class="mt-1 grid size-8 shrink-0 place-items-center overflow-hidden rounded-xl bg-slate-950 text-xs font-semibold text-white shadow-sm ring-1 ring-white/60 dark:bg-white dark:text-slate-950 dark:ring-white/10 sm:size-9" :title="displayUserName" aria-label="用户头像">
+          <img v-if="props.userAvatarUrl" :src="props.userAvatarUrl" alt="" class="h-full w-full object-cover" loading="lazy" decoding="async" />
+          <span v-else>{{ displayUserInitial }}</span>
+        </div>
       </article>
 
       <article class="flex items-start gap-3">
-        <div class="mt-1 hidden size-9 shrink-0 place-items-center rounded-xl bg-white text-[#315be8] shadow-sm dark:bg-white/[0.08] sm:grid">
-          <Sparkles class="size-4" />
+        <div class="mt-1 grid size-8 shrink-0 place-items-center overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-black/[0.06] dark:bg-white/[0.08] dark:ring-white/10 sm:size-9" aria-label="家可美头像">
+          <img src="/jiakemei-mark.svg" alt="" class="size-5 rounded-lg sm:size-6" loading="lazy" decoding="async" />
         </div>
         <div class="min-w-0 flex-1 rounded-2xl rounded-tl-md border border-black/[0.06] bg-white p-3 shadow-sm dark:border-white/10 dark:bg-[#171a21] sm:p-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
@@ -173,8 +247,8 @@ function copyPrompt(prompt: string) {
           </div>
 
           <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            <div v-for="(image, index) in turn.images" :key="image.id" class="group relative aspect-square overflow-hidden rounded-2xl border border-black/[0.06] bg-[#F8FAFC] dark:border-white/10 dark:bg-white/[0.04]">
-              <img v-if="image.status === 'success' && imageSrc(image)" :src="imageSrc(image)" :alt="image.sourceName || '生成图片'" class="h-full w-full cursor-zoom-in object-cover transition duration-300 group-hover:scale-[1.02]" @click="emit('openLightbox', imageItems(turn), imageItems(turn).findIndex((item) => item.id === image.id))" />
+            <div v-for="(image, index) in turn.images" :key="image.id" class="group relative aspect-square overflow-hidden rounded-2xl border border-black/[0.06] bg-[#F8FAFC] dark:border-white/10 dark:bg-white/[0.04]" data-testid="generated-image-card">
+              <img v-if="image.status === 'success' && imageSrc(image)" :src="imageSrc(image)" :alt="image.sourceName || '生成图片'" class="h-full w-full cursor-zoom-in object-cover transition duration-300 group-hover:scale-[1.02]" loading="lazy" decoding="async" data-testid="generated-image" @click="emit('openLightbox', imageItems(turn), imageItems(turn).findIndex((item) => item.id === image.id))" />
               <div v-else-if="image.status === 'loading'" class="flex h-full flex-col items-center justify-center gap-3 p-4 text-center">
                 <div class="studio-skeleton absolute inset-0 opacity-60" />
                 <LoaderCircle class="relative size-6 animate-spin text-[#4F7CFF]" />
@@ -243,6 +317,7 @@ function copyPrompt(prompt: string) {
           </div>
         </div>
       </article>
+      </template>
     </template>
   </div>
 </template>

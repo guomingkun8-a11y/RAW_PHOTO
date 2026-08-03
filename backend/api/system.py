@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from pathlib import Path
+
+from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from api.support import extract_bearer_token, require_admin, require_identity
 from services.captcha_service import captcha_service
 from services.business_service import business_service
 from services.config import config
 from services.image_service import get_image_response, get_thumbnail_response
-from services.user_service import user_service
+from services.user_service import AVATAR_DIR, AVATAR_EXTENSIONS, user_service
 
 
 class LoginRequest(BaseModel):
@@ -24,6 +26,11 @@ class RegisterRequest(BaseModel):
     name: str = Field(default="", max_length=191)
     captcha_id: str = Field(..., min_length=1)
     captcha_code: str = Field(..., min_length=1, max_length=12)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=6, max_length=128)
 
 
 class UserCreateRequest(BaseModel):
@@ -65,6 +72,19 @@ def _user_label(user: dict[str, object] | None, fallback_id: str = "") -> str:
     user_id = str(user.get("id") or fallback_id).strip()
     label = name or username or user_id
     return f"{label} / {username or user_id}"
+
+
+def _login_payload(identity: dict[str, object], token: str, app_version: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "version": app_version,
+        "role": identity.get("role"),
+        "subject_id": identity.get("id"),
+        "username": identity.get("username"),
+        "name": identity.get("name"),
+        "avatar_url": identity.get("avatar_url"),
+        "token": token,
+    }
 
 
 def _record_user_audit(identity: dict[str, object], action: str, target_id: object, detail: str) -> None:
@@ -115,15 +135,7 @@ def create_router(app_version: str) -> APIRouter:
         if result is None:
             raise HTTPException(status_code=401, detail={"error": "用户名或密码错误"})
         identity, token = result
-        return {
-            "ok": True,
-            "version": app_version,
-            "role": identity.get("role"),
-            "subject_id": identity.get("id"),
-            "username": identity.get("username"),
-            "name": identity.get("name"),
-            "token": token,
-        }
+        return _login_payload(identity, token, app_version)
 
     @router.get("/auth/captcha")
     async def captcha():
@@ -143,15 +155,7 @@ def create_router(app_version: str) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {
-            "ok": True,
-            "version": app_version,
-            "role": identity.get("role"),
-            "subject_id": identity.get("id"),
-            "username": identity.get("username"),
-            "name": identity.get("name"),
-            "token": token,
-        }
+        return _login_payload(identity, token, app_version)
 
     @router.get("/api/auth/me")
     async def current_user(authorization: str | None = Header(default=None)):
@@ -162,6 +166,30 @@ def create_router(app_version: str) -> APIRouter:
             "subject_id": identity.get("id"),
             "username": identity.get("username"),
             "name": identity.get("name"),
+            "avatar_url": identity.get("avatar_url"),
+        }
+
+    @router.post("/api/auth/avatar")
+    async def upload_avatar(avatar: UploadFile = File(...), authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        payload = await avatar.read()
+        try:
+            updated = await run_in_threadpool(
+                user_service.set_avatar,
+                str(identity.get("id") or ""),
+                filename=avatar.filename or "",
+                content_type=avatar.content_type or "",
+                payload=payload,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        return {
+            "ok": True,
+            "role": updated.get("role"),
+            "subject_id": updated.get("id"),
+            "username": updated.get("username"),
+            "name": updated.get("name"),
+            "avatar_url": updated.get("avatar_url"),
         }
 
     @router.post("/api/auth/logout")
@@ -169,6 +197,22 @@ def create_router(app_version: str) -> APIRouter:
         token = extract_bearer_token(authorization)
         if token:
             await run_in_threadpool(user_service.revoke_token, token)
+        return {"ok": True}
+
+    @router.post("/api/auth/change-password")
+    async def change_password(body: ChangePasswordRequest, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        token = extract_bearer_token(authorization)
+        try:
+            await run_in_threadpool(
+                user_service.change_password,
+                user_id=str(identity.get("id") or ""),
+                current_password=body.current_password,
+                new_password=body.new_password,
+                revoke_token=token,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {"ok": True}
 
     @router.get("/api/users")
@@ -258,6 +302,21 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
+
+    @router.get("/avatars/{avatar_path:path}", include_in_schema=False)
+    async def get_avatar(avatar_path: str):
+        filename = Path(avatar_path).name
+        if filename != avatar_path or Path(filename).suffix.lower() not in AVATAR_EXTENSIONS:
+            raise HTTPException(status_code=404, detail={"error": "avatar not found"})
+        target = (AVATAR_DIR / filename).resolve()
+        base = AVATAR_DIR.resolve()
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"error": "avatar not found"}) from exc
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail={"error": "avatar not found"})
+        return FileResponse(target)
 
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):

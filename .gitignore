@@ -17,6 +17,9 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
 
 legacy/react-web/node_modules/
 legacy/react-web/.next/

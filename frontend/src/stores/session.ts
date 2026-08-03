@@ -36,6 +36,7 @@ export async function validateSession(force = false) {
           subjectId: current.subject_id,
           username: current.username || stored.username,
           name: current.name,
+          avatarUrl: current.avatar_url || stored.avatarUrl || "",
         };
         await setStoredAuthSession(session);
         sessionState.session = session;

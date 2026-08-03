@@ -6,23 +6,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
-import hmac
 from io import BytesIO
-import json
 from pathlib import PurePosixPath
 import threading
 import time
-from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
-from curl_cffi import CurlMime, requests
+from minio import Minio
+from minio.error import S3Error
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from services.config import config
 from services.enterprise_schema import ReferenceImageAssetModel
-from services.proxy_service import proxy_settings
 
 
 class ReferenceImageUploadError(RuntimeError):
@@ -56,10 +53,6 @@ _UPLOAD_CACHE_MAX_ITEMS = 512
 _UPLOAD_MAX_CONCURRENCY = 2
 _UPLOAD_LARGE_FILE_THRESHOLD = 3 * 1024 * 1024
 _UPLOAD_SERIAL_COOLDOWN_SECONDS = 3 * 60
-_QINIU_RESUMABLE_THRESHOLD = 512 * 1024
-_QINIU_PART_SIZE = 1 * 1024 * 1024
-_QINIU_ENDPOINT_CIRCUIT_SECONDS = 120
-_QINIU_PRIMARY_RESUME_ATTEMPTS = 2
 _UPLOAD_INFLIGHT_WAIT_SLICE_SECONDS = 30
 _UPLOAD_INFLIGHT_MAX_WAIT_SECONDS = 5 * 60
 _upload_cache_lock = threading.RLock()
@@ -69,9 +62,6 @@ _upload_url_cache: dict[str, tuple[float, str]] = {}
 _upload_inflight: dict[str, threading.Event] = {}
 _upload_parallelism_lock = threading.RLock()
 _upload_serial_until = 0.0
-
-_qiniu_endpoint_circuit_lock = threading.RLock()
-_qiniu_endpoint_open_until: dict[str, float] = {}
 
 _asset_cache_lock = threading.RLock()
 _asset_cache_database_url = ""
@@ -103,8 +93,6 @@ def _upload_capacity(file_size: int):
     permits = _UPLOAD_MAX_CONCURRENCY if file_size >= _UPLOAD_LARGE_FILE_THRESHOLD or _upload_serial_mode_active() else 1
     acquired = 0
     try:
-        # Acquire weighted permits as one operation so two large uploads cannot
-        # each hold one permit while waiting forever for the other.
         with _upload_acquire_lock:
             for _index in range(permits):
                 _upload_semaphore.acquire()
@@ -119,19 +107,33 @@ def settings() -> dict[str, object]:
     return config.get_image_reference_upload_settings()
 
 
+def _clean(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return default
+    if value is None:
+        return default
+    return bool(value)
+
+
 def is_enabled() -> bool:
     item = settings()
     return bool(
         item.get("enabled")
-        and str(item.get("qiniu_access_key") or "").strip()
-        and str(item.get("qiniu_secret_key") or "").strip()
-        and str(item.get("qiniu_bucket") or "").strip()
-        and str(item.get("qiniu_domain") or "").strip()
+        and _clean(item.get("oss_endpoint"))
+        and _clean(item.get("oss_access_key"))
+        and _clean(item.get("oss_secret_key"))
+        and _clean(item.get("oss_bucket"))
+        and _public_base_url(item)
     )
-
-
-def _clean(value: object) -> str:
-    return str(value or "").strip()
 
 
 def _safe_filename(filename: str) -> str:
@@ -159,10 +161,11 @@ def _upload_scope() -> str:
     item = settings()
     return "|".join(
         [
-            "qiniu",
-            _clean(item.get("qiniu_bucket")),
-            _clean(item.get("qiniu_domain")),
-            _clean(item.get("qiniu_prefix")),
+            "oss",
+            _clean(item.get("oss_endpoint")).rstrip("/"),
+            _clean(item.get("oss_bucket")),
+            _public_base_url(item),
+            _clean(item.get("oss_prefix")).strip("/"),
         ]
     )
 
@@ -231,8 +234,8 @@ def _remember_persistent_upload(
             session.add(row)
         item = settings()
         row.sha256 = digest
-        row.storage_provider = "qiniu"
-        row.bucket = _clean(item.get("qiniu_bucket"))
+        row.storage_provider = "oss"
+        row.bucket = _clean(item.get("oss_bucket"))
         row.object_key = object_key
         row.url = url
         row.mime_type = _clean(mime_type) or "image/png"
@@ -314,349 +317,91 @@ def _image_bytes_to_data_url(image_data: bytes, mime_type: str = "image/png") ->
     return f"data:{_clean(mime_type) or 'image/png'};base64,{base64.b64encode(image_data).decode('ascii')}"
 
 
-def _urlsafe_base64(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).decode("ascii")
-
-
-def _qiniu_key(filename: str, digest: str | None = None, mime_type: str = "image/png") -> str:
+def _object_key(filename: str, digest: str | None = None, mime_type: str = "image/png") -> str:
     item = settings()
-    prefix = _clean(item.get("qiniu_prefix")).strip("/")
+    prefix = _clean(item.get("oss_prefix")).strip("/")
     content_digest = digest or hashlib.sha256(_safe_filename(filename).encode("utf-8")).hexdigest()
     suffix = _safe_extension(filename, mime_type)
     key = f"sha256/{content_digest[:2]}/{content_digest}{suffix}"
     return f"{prefix}/{key}" if prefix else key
 
 
-def _qiniu_token(bucket: str, key: str, access_key: str, secret_key: str) -> str:
-    put_policy = {
-        "scope": f"{bucket}:{key}",
-        "deadline": int(time.time()) + 3600,
-    }
-    encoded_policy = _urlsafe_base64(json.dumps(put_policy, separators=(",", ":")).encode("utf-8"))
-    sign = hmac.new(secret_key.encode("utf-8"), encoded_policy.encode("utf-8"), hashlib.sha1).digest()
-    encoded_sign = _urlsafe_base64(sign)
-    return f"{access_key}:{encoded_sign}:{encoded_policy}"
+def _public_base_url(item: dict[str, object] | None = None) -> str:
+    settings_item = item or settings()
+    explicit = _clean(settings_item.get("public_base_url")).rstrip("/")
+    if explicit:
+        return explicit
+    endpoint = _clean(settings_item.get("oss_endpoint")).rstrip("/")
+    bucket = _clean(settings_item.get("oss_bucket"))
+    if not endpoint or not bucket:
+        return ""
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{bucket}.{parsed.netloc}".rstrip("/")
+    return ""
 
 
-def _qiniu_public_url(domain: str, key: str) -> str:
-    clean_domain = _clean(domain).rstrip("/")
-    if not clean_domain:
-        raise ReferenceImageUploadError("Qiniu public domain is empty")
-    if not clean_domain.startswith(("http://", "https://")):
-        clean_domain = f"https://{clean_domain}"
-    return f"{clean_domain}/{key.lstrip('/')}"
+def _public_url(item: dict[str, object], object_key: str) -> str:
+    public_base_url = _public_base_url(item)
+    if not public_base_url:
+        raise ReferenceImageUploadError("OSS public base URL is empty")
+    return f"{public_base_url}/{quote(object_key.lstrip('/'), safe='/')}"
 
 
-def _qiniu_response_error(info: object) -> str:
-    for name in ("text_body", "error", "exception"):
-        value = getattr(info, name, None)
-        if value:
-            return _clean(value)[:300]
-    return f"HTTP {int(getattr(info, 'status_code', 0) or 0)}"
-
-
-def _configure_qiniu_direct_session() -> None:
-    from qiniu.http.default_client import qn_http_client
-
-    qn_http_client.session.trust_env = False
-
-
-def _qiniu_upload_zone(upload_url: str):
-    from qiniu import Region
-
-    parsed = urlparse(_clean(upload_url))
-    host = parsed.netloc or parsed.path.strip("/")
-    if not host:
-        return None
-    scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
-    backup_host = ""
-    if host.startswith("upload-"):
-        backup_host = "up-" + host.removeprefix("upload-")
-    elif host.startswith("upload."):
-        backup_host = "up." + host.removeprefix("upload.")
-    return Region(
-        up_host=f"{scheme}://{host}",
-        up_host_backup=f"{scheme}://{backup_host}" if backup_host else None,
-        scheme=scheme,
-    )
-
-
-def _qiniu_single_endpoint_zone(endpoint: str):
-    from qiniu import Region
-
-    parsed = urlparse(_clean(endpoint))
-    host = parsed.netloc or parsed.path.strip("/")
-    if not host:
-        return None
-    scheme = parsed.scheme if parsed.scheme in {"http", "https"} else "https"
-    return Region(up_host=f"{scheme}://{host}", scheme=scheme)
-
-
-def _qiniu_upload_endpoints(upload_url: str) -> list[str]:
-    zone = _qiniu_upload_zone(upload_url)
-    if zone is None:
-        return []
-    return [endpoint for endpoint in (zone.up_host, zone.up_host_backup) if endpoint]
-
-
-def _resolve_qiniu_upload_endpoints(access_key: str, bucket: str, configured_upload_url: str) -> list[str]:
-    try:
-        from qiniu import Zone
-
-        discovered = Zone(scheme="https").get_up_host(access_key, bucket, None)
-        endpoints = [str(endpoint).strip().rstrip("/") for endpoint in discovered if str(endpoint).strip()]
-        if endpoints:
-            return list(dict.fromkeys(endpoints))
-    except Exception:
-        pass
-    return _qiniu_upload_endpoints(configured_upload_url)
-
-
-def _healthy_qiniu_endpoint_candidates(endpoints: list[str]) -> list[str]:
-    if not endpoints:
-        return []
-    now = time.monotonic()
-    with _qiniu_endpoint_circuit_lock:
-        healthy = [endpoint for endpoint in endpoints if _qiniu_endpoint_open_until.get(endpoint, 0) <= now]
-        if healthy:
-            return healthy
-        return [min(endpoints, key=lambda endpoint: _qiniu_endpoint_open_until.get(endpoint, 0))]
-def _open_qiniu_endpoint_circuit(endpoint: str) -> None:
+def _oss_client(item: dict[str, object]) -> Minio:
+    endpoint = _clean(item.get("oss_endpoint")).rstrip("/")
+    access_key = _clean(item.get("oss_access_key"))
+    secret_key = _clean(item.get("oss_secret_key"))
+    region = _clean(item.get("oss_region")) or None
+    if not endpoint or not access_key or not secret_key:
+        raise ReferenceImageUploadError("OSS reference image upload is not configured")
+    parsed = urlparse(endpoint)
+    if parsed.scheme in {"http", "https"}:
+        endpoint = parsed.netloc
+        secure = parsed.scheme == "https"
+    else:
+        secure = _bool(item.get("oss_secure"), True)
     if not endpoint:
-        return
-    with _qiniu_endpoint_circuit_lock:
-        _qiniu_endpoint_open_until[endpoint] = time.monotonic() + _QINIU_ENDPOINT_CIRCUIT_SECONDS
+        raise ReferenceImageUploadError("invalid OSS endpoint")
+    return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure, region=region)
 
 
-def _close_qiniu_endpoint_circuit(endpoint: str) -> None:
-    with _qiniu_endpoint_circuit_lock:
-        _qiniu_endpoint_open_until.pop(endpoint, None)
-
-
-def _is_retryable_qiniu_failure(info: object) -> bool:
-    status_code = int(getattr(info, "status_code", 0) or 0)
-    return bool(getattr(info, "exception", None)) or status_code <= 0 or status_code in {408, 429} or status_code >= 500
-
-
-def _put_qiniu_resumable_data(
-    token: str,
-    key: str,
-    image_data: bytes,
-    filename: str,
-    mime_type: str,
-    bucket: str,
-    upload_zone: object,
-):
-    from qiniu.services.storage.upload_progress_recorder import UploadProgressRecorder
-    from qiniu.services.storage.uploaders import ResumeUploaderV2
-
-    recorder = UploadProgressRecorder()
-    uploader = ResumeUploaderV2(
-        bucket,
-        upload_progress_recorder=recorder,
-        part_size=_QINIU_PART_SIZE,
-        regions=[upload_zone] if upload_zone is not None else None,
-        preferred_scheme=getattr(upload_zone, "scheme", "https"),
-        concurrent_executor=None,
-    )
-    return uploader.upload(
-        key=key,
-        data=BytesIO(image_data),
-        data_size=len(image_data),
-        file_name=filename,
-        mime_type=mime_type,
-        up_token=token,
-        part_size=_QINIU_PART_SIZE,
-    )
-
-
-def _clear_qiniu_upload_progress(filename: str, key: str) -> None:
-    try:
-        from qiniu.services.storage.upload_progress_recorder import UploadProgressRecorder
-
-        UploadProgressRecorder().delete_upload_record(filename, key)
-    except Exception:
-        pass
-
-
-def _upload_to_qiniu_sdk(
-    image_data: bytes,
-    filename: str,
-    mime_type: str,
-    *,
-    key: str,
-    timeout: int,
-    upload_settings: dict[str, object] | None = None,
-) -> str:
-    from qiniu import Auth, BucketManager, config as qiniu_config, put_data
-
-    _configure_qiniu_direct_session()
-    item = upload_settings or settings()
-    access_key = _clean(item.get("qiniu_access_key"))
-    secret_key = _clean(item.get("qiniu_secret_key"))
-    bucket = _clean(item.get("qiniu_bucket"))
-    domain = _clean(item.get("qiniu_domain"))
-    upload_url = _clean(item.get("qiniu_upload_url"))
-    upload_zone = _qiniu_upload_zone(upload_url)
-    request_timeout = max(20, min(30, int(timeout or 30)))
-    qiniu_config.set_default(
-        default_zone=upload_zone,
-        connection_timeout=request_timeout,
-        connection_retries=1,
-        connection_pool=max(3, _UPLOAD_MAX_CONCURRENCY),
-        default_rs_host="https://rs.qiniuapi.com",
-    )
-    auth = Auth(access_key, secret_key)
-    try:
-        _ret, stat_info = BucketManager(auth).stat(bucket, key)
-        if int(getattr(stat_info, "status_code", 0) or 0) == 200:
-            return _qiniu_public_url(domain, key)
-    except Exception:
-        pass
-
-    token = auth.upload_token(bucket, key, 3600)
-    safe_filename = _safe_filename(filename)
-    safe_mime = _clean(mime_type) or "image/png"
-    endpoints = _healthy_qiniu_endpoint_candidates(_resolve_qiniu_upload_endpoints(access_key, bucket, upload_url))
-    attempts = endpoints or [""]
-    last_error = "no upload endpoint available"
-    resumable = len(image_data) >= _QINIU_RESUMABLE_THRESHOLD
-    for endpoint_index, endpoint in enumerate(attempts):
-        endpoint_zone = _qiniu_single_endpoint_zone(endpoint) if endpoint else upload_zone
-        qiniu_config.set_default(default_zone=endpoint_zone)
-        endpoint_attempts = _QINIU_PRIMARY_RESUME_ATTEMPTS if resumable and endpoint_index == 0 else 1
-        for endpoint_attempt in range(endpoint_attempts):
-            try:
-                if resumable:
-                    ret, info = _put_qiniu_resumable_data(
-                        token, key, image_data, safe_filename, safe_mime, bucket, endpoint_zone,
-                    )
-                else:
-                    ret, info = put_data(
-                        token,
-                        key,
-                        image_data,
-                        mime_type=safe_mime,
-                        check_crc=True,
-                        fname=safe_filename,
-                        regions=[endpoint_zone] if endpoint_zone is not None else None,
-                    )
-            except Exception as exc:
-                last_error = str(exc)[:300]
-                _degrade_upload_parallelism()
-                if endpoint_attempt + 1 < endpoint_attempts:
-                    time.sleep(1.0)
-                    continue
-                break
-            status_code = int(getattr(info, "status_code", 0) or 0)
-            if status_code == 200 and isinstance(ret, dict):
-                _close_qiniu_endpoint_circuit(endpoint)
-                return _qiniu_public_url(domain, key)
-            last_error = _qiniu_response_error(info)
-            if not _is_retryable_qiniu_failure(info):
-                _clear_qiniu_upload_progress(safe_filename, key)
-                raise ReferenceImageUploadError(f"Qiniu SDK upload failed: {last_error}")
-            _degrade_upload_parallelism()
-            if endpoint_attempt + 1 < endpoint_attempts:
-                time.sleep(1.0)
-                continue
-            break
-        _open_qiniu_endpoint_circuit(endpoint)
-        if resumable:
-            _clear_qiniu_upload_progress(safe_filename, key)
-
-    if not resumable and attempts:
-        endpoint = attempts[0]
-        endpoint_zone = _qiniu_single_endpoint_zone(endpoint) if endpoint else upload_zone
-        qiniu_config.set_default(default_zone=endpoint_zone)
-        try:
-            ret, info = _put_qiniu_resumable_data(
-                token, key, image_data, safe_filename, safe_mime, bucket, endpoint_zone,
-            )
-        except Exception as exc:
-            last_error = str(exc)[:300]
-            _degrade_upload_parallelism()
-        else:
-            status_code = int(getattr(info, "status_code", 0) or 0)
-            if status_code == 200 and isinstance(ret, dict):
-                _close_qiniu_endpoint_circuit(endpoint)
-                return _qiniu_public_url(domain, key)
-            last_error = _qiniu_response_error(info)
-        _clear_qiniu_upload_progress(safe_filename, key)
-    raise ReferenceImageUploadError(f"Qiniu SDK upload failed after endpoint failover: {last_error}")
-
-
-def _upload_to_qiniu_legacy(
-    image_data: bytes,
-    filename: str,
-    mime_type: str,
-    *,
-    key: str,
-    timeout: int,
-) -> str:
-    item = settings()
-    access_key = _clean(item.get("qiniu_access_key"))
-    secret_key = _clean(item.get("qiniu_secret_key"))
-    bucket = _clean(item.get("qiniu_bucket"))
-    domain = _clean(item.get("qiniu_domain"))
-    upload_url = _clean(item.get("qiniu_upload_url")).rstrip("/")
-    if not upload_url:
-        raise ReferenceImageUploadError("Qiniu upload URL is empty")
-    token = _qiniu_token(bucket, key, access_key, secret_key)
-    last_error = ""
-    for attempt in range(1, 4):
-        multipart = CurlMime()
-        try:
-            multipart.addpart(name="token", data=token)
-            multipart.addpart(name="key", data=key)
-            multipart.addpart(
-                name="file",
-                filename=_safe_filename(filename),
-                content_type=_clean(mime_type) or "image/png",
-                data=image_data,
-            )
-            response = requests.post(
-                upload_url,
-                multipart=multipart,
-                timeout=timeout,
-                **proxy_settings.build_session_kwargs(),
-            )
-        except Exception as exc:
-            last_error = str(exc)
-            _degrade_upload_parallelism()
-            if attempt >= 3:
-                raise ReferenceImageUploadError(f"Qiniu upload failed after {attempt} attempts: {exc}") from exc
-            time.sleep(0.8 * attempt)
-            continue
-        finally:
-            multipart.close()
-        if 200 <= response.status_code < 300:
-            return _qiniu_public_url(domain, key)
-        last_error = f"HTTP {response.status_code}: {_clean(response.text)[:300]}"
-        if response.status_code in {500, 502, 503, 504} and attempt < 3:
-            time.sleep(0.8 * attempt)
-            continue
-        raise ReferenceImageUploadError(f"Qiniu upload failed: {last_error}")
-    raise ReferenceImageUploadError(f"Qiniu upload failed: {last_error or 'no response'}")
-
-
-def upload_to_qiniu(
+def upload_to_oss(
     image_data: bytes,
     filename: str = "reference.png",
     mime_type: str = "image/png",
 ) -> str:
     item = settings()
     if not is_enabled():
-        raise ReferenceImageUploadError("Qiniu reference image upload is not configured")
+        raise ReferenceImageUploadError("OSS reference image upload is not configured")
     if not image_data:
         raise ReferenceImageUploadError("reference image is empty")
+    bucket = _clean(item.get("oss_bucket"))
     timeout = max(5, int(item.get("timeout_sec") or 20))
     digest = hashlib.sha256(image_data).hexdigest()
-    key = _qiniu_key(filename, digest, mime_type)
+    key = _object_key(filename, digest, mime_type)
+    client = _oss_client(item)
     try:
-        return _upload_to_qiniu_sdk(image_data, filename, mime_type, key=key, timeout=timeout)
-    except ImportError:
-        return _upload_to_qiniu_legacy(image_data, filename, mime_type, key=key, timeout=timeout)
+        try:
+            client.stat_object(bucket, key)
+            return _public_url(item, key)
+        except S3Error as exc:
+            if exc.code not in {"NoSuchKey", "NoSuchBucket", "NoSuchObject", "NotFound"}:
+                raise
+        client.put_object(
+            bucket,
+            key,
+            BytesIO(image_data),
+            length=len(image_data),
+            content_type=_clean(mime_type) or "image/png",
+            part_size=10 * 1024 * 1024,
+            num_parallel_uploads=1,
+        )
+        return _public_url(item, key)
+    except Exception as exc:
+        _degrade_upload_parallelism()
+        message = str(exc)[:300] or exc.__class__.__name__
+        raise ReferenceImageUploadError(f"OSS upload failed within {timeout}s budget: {message}") from exc
 
 
 def _upload_one_detailed(image_data: bytes, filename: str, mime_type: str) -> ReferenceUploadResult:
@@ -699,8 +444,8 @@ def _upload_one_detailed(image_data: bytes, filename: str, mime_type: str) -> Re
                 result = ReferenceUploadResult(cached, digest, safe_filename, safe_mime, len(image_data), True, duration_ms)
                 _record_metric(cached=True, duration_ms=duration_ms)
                 return result
-            url = upload_to_qiniu(image_data, safe_filename, safe_mime)
-        object_key = _qiniu_key(safe_filename, digest, safe_mime)
+            url = upload_to_oss(image_data, safe_filename, safe_mime)
+        object_key = _object_key(safe_filename, digest, safe_mime)
         _remember_upload_url(cache_key, url)
         _remember_persistent_upload(cache_key, digest, url, object_key, safe_mime, len(image_data))
         duration_ms = int((time.perf_counter() - started) * 1000)

@@ -154,7 +154,7 @@ class ReferenceImageAssetModel(EnterpriseBase):
 
     cache_key = Column(String(64), primary_key=True)
     sha256 = Column(String(64), nullable=False)
-    storage_provider = Column(String(64), nullable=False, default="qiniu")
+    storage_provider = Column(String(64), nullable=False, default="oss")
     bucket = Column(String(191), nullable=False)
     object_key = Column(String(1024), nullable=False)
     url = Column(Text, nullable=False)

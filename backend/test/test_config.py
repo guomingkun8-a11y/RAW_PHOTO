@@ -59,23 +59,52 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["GMKRAW_AUTH_KEY"] = old_env_auth_key
 
-    def test_qiniu_prefixes_are_separate_for_tasks_and_references(self) -> None:
+    def test_read_json_object_accepts_utf8_bom(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text('\ufeff{"auth-key": "bom-auth"}', encoding="utf-8")
+
+            data = module._read_json_object(path, name="config.json")
+
+        self.assertEqual(data["auth-key"], "bom-auth")
+
+    def test_legacy_auth_key_admin_switch_defaults_off(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+            with mock.patch.dict(module.os.environ, {}, clear=True):
+                store = module.ConfigStore(path)
+
+        self.assertFalse(store.legacy_auth_key_admin_enabled)
+
+    def test_legacy_auth_key_admin_switch_reads_env(self) -> None:
+        module = self.config_module
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
+            with mock.patch.dict(module.os.environ, {"GMKRAW_LEGACY_AUTH_KEY_ADMIN_ENABLED": "true"}, clear=True):
+                store = module.ConfigStore(path)
+                self.assertTrue(store.legacy_auth_key_admin_enabled)
+
+    def test_oss_reference_prefix_is_separate_from_task_asset_root(self) -> None:
         module = self.config_module
         with mock.patch.dict(
             module.os.environ,
             {
-                "GMKRAW_QINIU_PREFIX": "gmkraw/reference",
-                "GMKRAW_QINIU_TASK_PREFIX": "gmkraw/task-assets",
+                "GMKRAW_OSS_REFERENCE_PREFIX": "raw-photo/reference",
+                "GMKRAW_MINIO_ROOT_PATH": "raw-photo/task-assets",
             },
-            clear=False,
+            clear=True,
         ):
-            storage = module._normalize_image_storage_settings({})
+            storage = module._normalize_image_storage_settings({"enabled": True, "mode": "minio"})
             reference = module._normalize_image_reference_upload_settings({})
 
-        self.assertEqual(storage["qiniu_prefix"], "gmkraw/task-assets")
-        self.assertEqual(reference["qiniu_prefix"], "gmkraw/reference")
+        self.assertEqual(storage["minio_root_path"], "raw-photo/task-assets")
+        self.assertEqual(reference["oss_prefix"], "raw-photo/reference")
 
-    def test_reference_upload_normalizes_legacy_provider_config_to_qiniu_only(self) -> None:
+    def test_reference_upload_normalizes_legacy_provider_config_to_oss_only(self) -> None:
         module = self.config_module
         legacy = {
             "enabled": True,
@@ -86,6 +115,7 @@ class ConfigLoadingTests(unittest.TestCase):
             "qiniu_secret_key": "sk",
             "qiniu_bucket": "bucket",
             "qiniu_domain": "https://cdn.example.test",
+            "qiniu_prefix": "legacy-reference",
             "categories": "legacy",
             "compress": "1",
             "webp": "1",
@@ -94,14 +124,39 @@ class ConfigLoadingTests(unittest.TestCase):
         with mock.patch.dict(module.os.environ, {}, clear=True):
             reference = module._normalize_image_reference_upload_settings(legacy)
 
-        self.assertEqual(reference["provider"], "qiniu")
-        self.assertEqual(reference["qiniu_access_key"], "ak")
-        self.assertEqual(reference["qiniu_secret_key"], "sk")
+        self.assertEqual(reference["provider"], "oss")
+        self.assertEqual(reference["oss_access_key"], "")
+        self.assertEqual(reference["oss_secret_key"], "")
+        self.assertEqual(reference["oss_bucket"], "")
+        self.assertEqual(reference["oss_prefix"], "raw-photo/reference")
+        self.assertNotIn("qiniu_access_key", reference)
+        self.assertNotIn("qiniu_secret_key", reference)
+        self.assertNotIn("qiniu_bucket", reference)
+        self.assertNotIn("qiniu_domain", reference)
+        self.assertNotIn("qiniu_prefix", reference)
         self.assertNotIn("legacy_token", reference)
         self.assertNotIn("legacy_upload_url", reference)
         self.assertNotIn("categories", reference)
         self.assertNotIn("compress", reference)
         self.assertNotIn("webp", reference)
+
+    def test_image_storage_ignores_removed_qiniu_provider(self) -> None:
+        module = self.config_module
+        with mock.patch.dict(module.os.environ, {}, clear=True):
+            storage = module._normalize_image_storage_settings({
+                "enabled": True,
+                "mode": "qiniu",
+                "provider": "qiniu",
+                "qiniu_access_key": "ak",
+                "qiniu_secret_key": "sk",
+                "qiniu_bucket": "bucket",
+                "qiniu_domain": "https://cdn.example.test",
+            })
+
+        self.assertEqual(storage["mode"], "local")
+        self.assertEqual(storage["provider"], "webdav")
+        self.assertNotIn("qiniu_access_key", storage)
+        self.assertNotIn("qiniu_secret_key", storage)
 
     def test_openai_relay_accepts_environment_api_key_pool(self) -> None:
         module = self.config_module

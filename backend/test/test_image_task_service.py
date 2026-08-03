@@ -70,7 +70,7 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.monitoring_patcher.stop()
 
     def make_service(self, path: Path, handler=None, **kwargs) -> ImageTaskService:
-        return ImageTaskService(
+        service = ImageTaskService(
             path,
             generation_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/image.png"}]}),
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
@@ -78,6 +78,8 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
             **kwargs,
         )
+        service._dynamic_owner_concurrency_enabled = False
+        return service
 
     def test_duplicate_submit_uses_existing_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -232,6 +234,40 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(second["data"][0]["url"], "http://example.test/retry.png")
             self.assertEqual(calls, 2)
 
+    def test_queue_mode_does_not_retry_content_policy_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("502: {'error': {'message': '您的提示已被内容安全策略阻止。请调整提示并再试一次。'}}")
+
+            queue = MemoryTaskQueue()
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 3,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="policy-task",
+                prompt="unsafe marketing prompt",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            result = service.work_once()
+
+            self.assertEqual(result["status"], "error")
+            self.assertIn("内容安全策略", result["error"])
+            self.assertEqual(result.get("attempts"), 0)
+            self.assertEqual(calls, 1)
+            self.assertEqual(queue.items, [])
+
     def test_preuploaded_edit_tracks_stage_timings_without_forwarding_internal_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             received = []
@@ -349,6 +385,74 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(snapshot["owner_activity"][0]["owner_id"], OWNER["id"])
             self.assertEqual(snapshot["owner_activity"][0]["queued_tasks"], 1)
             self.assertEqual(snapshot["owner_activity"][0]["running_tasks"], 1)
+
+    def test_dynamic_owner_concurrency_borrows_idle_slots_until_cap(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            queue = MemoryTaskQueue()
+            queue.max_concurrency = 4
+            both_started = threading.Event()
+            release = threading.Event()
+            lock = threading.Lock()
+            active = 0
+            peak_active = 0
+
+            def handler(_payload):
+                nonlocal active, peak_active
+                with lock:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                    if active >= 2:
+                        both_started.set()
+                release.wait(1)
+                with lock:
+                    active -= 1
+                return {"data": [{"url": "http://example.test/dynamic.png"}]}
+
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 0,
+            )
+            service._owner_concurrency = 1
+            service._dynamic_owner_concurrency_enabled = True
+            service._dynamic_owner_concurrency_threshold = 10
+            service._dynamic_owner_concurrency_max = 2
+            service._owner_pending_limit = 10
+
+            for index in range(2):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id=f"dynamic-task-{index + 1}",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(service.work_once) for _ in range(2)]
+                self.assertTrue(both_started.wait(1))
+                release.set()
+                results = [future.result(timeout=2) for future in futures]
+
+            self.assertEqual([item["status"] for item in results], ["success", "success"])
+            self.assertEqual(peak_active, 2)
+
+    def test_dynamic_owner_concurrency_falls_back_after_active_owner_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            service._owner_concurrency = 3
+            service._total_concurrency = 100
+            service._dynamic_owner_concurrency_enabled = True
+            service._dynamic_owner_concurrency_threshold = 10
+            service._dynamic_owner_concurrency_max = 20
+
+            self.assertEqual(service._effective_owner_concurrency(1), 20)
+            self.assertEqual(service._effective_owner_concurrency(2), 20)
+            self.assertEqual(service._effective_owner_concurrency(10), 10)
+            self.assertEqual(service._effective_owner_concurrency(11), 3)
 
     def test_queue_mode_worker_can_process_task_from_shared_database(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
