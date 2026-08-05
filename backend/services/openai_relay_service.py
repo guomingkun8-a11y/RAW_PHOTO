@@ -17,7 +17,18 @@ from services import reference_image_uploader
 
 STREAM_TIMEOUT_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 300
-MEDIA_IMAGE_MODELS = {"gemini-3.1-flash-image-preview"}
+MEDIA_IMAGE_MODELS = {
+    "gemini-3.1-flash-image-preview",
+    "mj_imagine",
+    "qwen-image",
+    "wan2.6-image",
+    "wan2.7-image",
+}
+MEDIA_IMAGE_MODEL_PREFIXES = (
+    "doubao-seedream-",
+    "kling-",
+    "vidu-image-",
+)
 MEDIA_IMAGE_ASPECT_RATIOS = {
     "1:1": 1,
     "2:3": 2 / 3,
@@ -189,7 +200,8 @@ def _image_bytes_to_data_url(image_data: bytes, mime_type: str | None) -> str:
 
 
 def _is_media_image_model(model: str) -> bool:
-    return model.strip() in MEDIA_IMAGE_MODELS
+    normalized = model.strip().lower()
+    return normalized in MEDIA_IMAGE_MODELS or normalized.startswith(MEDIA_IMAGE_MODEL_PREFIXES)
 
 
 def _reference_image_urls(body: dict[str, Any]) -> list[str]:

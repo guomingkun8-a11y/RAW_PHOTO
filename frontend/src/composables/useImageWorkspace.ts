@@ -7,14 +7,12 @@ import {
   createImageGenerationTask,
   fetchImageTasks,
   fetchModels,
-  fetchPromptTemplates,
   fetchSettingsConfig,
   preuploadImageReferences,
   reportImageFailure,
   resumeImagePoll,
   type ImageModel,
   type ImageTask,
-  type PromptTemplate,
   type ReferenceUploadItem,
   type SettingsConfig,
 } from "@/lib/api";
@@ -35,6 +33,7 @@ import {
   type StoredImage,
   type StoredReferenceImage,
 } from "@/stores/image-conversations";
+import { sessionState } from "@/stores/session";
 
 const ACTIVE_CONVERSATION_STORAGE_KEY = "gmkraw:image_single_active_conversation_id";
 const IMAGE_RATIO_STORAGE_KEY = "gmkraw:image_last_ratio";
@@ -90,6 +89,7 @@ type DeleteConfirm =
 
 type VisibleFailureReport = {
   taskId: string;
+  failureReportId?: string;
   error?: string;
   mode?: ImageConversationMode;
   model?: ImageModel;
@@ -405,11 +405,12 @@ function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> 
 async function reportFailures(reports: VisibleFailureReport[]) {
   const unique = reports.filter((report) => {
     if (isCanceledFailureReport(report)) return false;
-    if (!report.taskId || reportedFailureTaskIds.has(report.taskId)) return false;
-    reportedFailureTaskIds.add(report.taskId);
+    const reportId = report.failureReportId || report.taskId;
+    if (!report.taskId || !reportId || reportedFailureTaskIds.has(reportId)) return false;
+    reportedFailureTaskIds.add(reportId);
     return true;
   });
-  await Promise.allSettled(unique.map((report) => reportImageFailure({ taskId: report.taskId, error: report.error, imageCount: 1, mode: report.mode, model: report.model, productId: report.productId, templateId: report.templateId })));
+  await Promise.allSettled(unique.map((report) => reportImageFailure({ taskId: report.taskId, failureReportId: report.failureReportId || report.taskId, error: report.error, imageCount: 1, mode: report.mode, model: report.model, productId: report.productId, templateId: report.templateId })));
 }
 
 async function syncConversationTasks(items: ImageConversation[]) {
@@ -429,7 +430,7 @@ async function syncConversationTasks(items: ImageConversation[]) {
           const task = taskMap.get(image.taskId);
           if (!task) return image;
           const next = taskDataToStoredImage(image, task);
-          if (image.status !== "error" && next.status === "error") failures.push({ taskId: task.id, error: next.error, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
+          if (image.status !== "error" && next.status === "error") failures.push({ taskId: task.id, failureReportId: image.failureReportId || image.id, error: next.error, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
           turnChanged = true;
           return next;
         });
@@ -496,8 +497,6 @@ export function useImageWorkspace(isAdmin: boolean) {
   const imageQuality = ref("auto");
   const imageModel = ref<ImageModel>("gpt-image-2");
   const imageModels = ref<ImageModel[]>([...BUILTIN_IMAGE_MODELS]);
-  const promptTemplates = ref<PromptTemplate[]>([]);
-  const selectedTemplateId = ref<number | null>(null);
   const referenceImages = ref<StoredReferenceImage[]>([]);
   const batchProductImage = ref<StoredReferenceImage | null>(null);
   const batchFolderImages = ref<StoredReferenceImage[]>([]);
@@ -599,18 +598,36 @@ export function useImageWorkspace(isAdmin: boolean) {
     } finally { isLoadingHistory.value = false; }
   }
 
-  async function loadInitialData() {
-    const [settings, templateData, models] = await Promise.allSettled([
-      fetchSettingsConfig(),
-      fetchPromptTemplates(),
-      fetchModels(),
-    ]);
-    settingsConfig.value = settings.status === "fulfilled" ? settings.value.config : null;
-    if (templateData.status === "fulfilled") promptTemplates.value = templateData.value.items;
-    if (models.status === "fulfilled") imageModels.value = filterImageModels(Array.isArray(models.value.data) ? models.value.data : []);
+  function syncStoredImageModel() {
     const storedModel = localStorage.getItem(IMAGE_MODEL_STORAGE_KEY);
     imageModel.value = storedModel && imageModels.value.includes(storedModel) ? storedModel : imageModels.value[0] || "gpt-image-2";
-    await loadQuota();
+  }
+
+  async function loadSettings() {
+    try {
+      settingsConfig.value = (await fetchSettingsConfig()).config;
+    } catch {
+      settingsConfig.value = null;
+    } finally {
+      await loadQuota();
+    }
+  }
+
+  async function loadModels() {
+    try {
+      const models = await fetchModels();
+      if (unmounted) return;
+      imageModels.value = filterImageModels(Array.isArray(models.data) ? models.data : []);
+    } catch {
+      imageModels.value = [...BUILTIN_IMAGE_MODELS];
+    } finally {
+      syncStoredImageModel();
+    }
+  }
+
+  async function loadInitialData() {
+    syncStoredImageModel();
+    await Promise.allSettled([loadSettings(), loadModels()]);
   }
 
   async function appendReferenceFiles(files: File[]) {
@@ -649,10 +666,16 @@ export function useImageWorkspace(isAdmin: boolean) {
   function clearBatch() { batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量素材"); }
 
   function createLoadingImages(turnId: string, count: number): StoredImage[] {
-    return Array.from({ length: count }, (_, index) => ({ id: `${turnId}-${index}`, taskId: `${turnId}-${index}`, status: "loading", startTime: Date.now() }));
+    return Array.from({ length: count }, (_, index) => {
+      const id = `${turnId}-${index}`;
+      return { id, taskId: id, failureReportId: id, status: "loading", startTime: Date.now() };
+    });
   }
   function createBatchLoadingImages(turnId: string, images: StoredReferenceImage[]): StoredImage[] {
-    return images.map((image, index) => ({ id: `${turnId}-${index}`, taskId: `${turnId}-${index}`, status: "loading", startTime: Date.now(), sourceImageIndex: index, sourceName: image.name }));
+    return images.map((image, index) => {
+      const id = `${turnId}-${index}`;
+      return { id, taskId: id, failureReportId: id, status: "loading", startTime: Date.now(), sourceImageIndex: index, sourceName: image.name };
+    });
   }
 
   async function runConversationQueue(conversationId: string, preferredTurnId?: string) {
@@ -686,7 +709,7 @@ export function useImageWorkspace(isAdmin: boolean) {
             const task = taskMap.get(taskId);
             if (!task) return image;
             const next = taskDataToStoredImage({ ...image, taskId }, task);
-            if (image.status !== "error" && next.status === "error") failures.push({ taskId: task.id, error: next.error, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
+            if (image.status !== "error" && next.status === "error") failures.push({ taskId: task.id, failureReportId: image.failureReportId || image.id, error: next.error, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
             return next;
           });
           return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
@@ -758,7 +781,7 @@ export function useImageWorkspace(isAdmin: boolean) {
             if (isCanceledFailureReport({ taskId, error: message })) {
               return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
             }
-            reports.push({ taskId, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
+            reports.push({ taskId, failureReportId: image.failureReportId || image.id, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
             return { ...image, status: "error" as const, taskStatus: undefined, progress: undefined, error: message };
           });
           return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
@@ -1044,7 +1067,7 @@ export function useImageWorkspace(isAdmin: boolean) {
               if (isCanceledFailureReport({ taskId, error: message })) {
                 return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
               }
-              failures.push({ taskId, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
+              failures.push({ taskId, failureReportId: image.failureReportId || image.id, error: message, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
               return { ...image, status: "error" as const, taskStatus: undefined, progress: undefined, error: message };
             });
             return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
@@ -1105,7 +1128,6 @@ export function useImageWorkspace(isAdmin: boolean) {
         ratio: imageRatio.value,
         tier: imageTier.value,
         quality: imageQuality.value,
-        templateId: selectedTemplateId.value || undefined,
         images: batchReplace ? createBatchLoadingImages(turnId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(turnId, batchFolder.folderImages) : createLoadingImages(turnId, count),
         createdAt: now,
         status: "queued",
@@ -1150,7 +1172,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     const turn = conversation.turns.find((item) => item.id === turnId);
     if (!turn) return;
     const retryId = `${turnId}-${createId()}`;
-    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, status: "loading" as const, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
+    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, failureReportId: image.failureReportId || image.id || image.taskId || retryId, status: "loading" as const, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
     await persistConversation(next);
     void runConversationQueue(conversation.id, turnId);
   }
@@ -1234,7 +1256,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   async function reuseTurnConfig(turnId: string) {
     const turn = selectedConversation.value?.turns.find((item) => item.id === turnId);
     if (!turn || !turn.prompt.trim()) return;
-    imagePrompt.value = turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); selectedTemplateId.value = turn.templateId || null; preserveSubject.value = turn.preserveSubject === true; referenceImages.value = turn.referenceImages; toast.success("已复用这条提示词配置"); await nextTick();
+    imagePrompt.value = turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; referenceImages.value = turn.referenceImages; toast.success("已复用这条提示词配置"); await nextTick();
   }
   async function continueEdit(image: StoredImage | StoredReferenceImage) {
     try {
@@ -1264,8 +1286,9 @@ export function useImageWorkspace(isAdmin: boolean) {
 
   onMounted(async () => {
     unmounted = false;
-    await Promise.all([loadInitialData(), loadHistory()]);
-    scanQueues();
+    void loadInitialData();
+    await loadHistory();
+    if (!unmounted) scanQueues();
   });
   onBeforeUnmount(() => { unmounted = true; activeImageTurnQueueIds.clear(); submittedImageTaskIds.clear(); });
   watch([imageRatio, imageTier, imageQuality, imageModel, imageCount, preserveSubject], persistPreferences);
@@ -1276,7 +1299,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
-    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, promptTemplates, selectedTemplateId, referenceImages, batchProductImage, batchFolderImages, preserveSubject, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, appendReferenceFiles, removeReference, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
+    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, batchProductImage, batchFolderImages, preserveSubject, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, appendReferenceFiles, removeReference, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
   };
 }
 

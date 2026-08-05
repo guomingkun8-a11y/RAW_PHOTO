@@ -12,6 +12,7 @@ from services.captcha_service import captcha_service
 from services.business_service import business_service
 from services.config import config
 from services.image_service import get_image_response, get_thumbnail_response
+from services.system_announcement_service import system_announcement_service
 from services.user_service import AVATAR_DIR, AVATAR_EXTENSIONS, user_service
 
 
@@ -45,6 +46,20 @@ class UserUpdateRequest(BaseModel):
     name: str | None = Field(default=None, max_length=191)
     password: str | None = Field(default=None, min_length=6, max_length=128)
     role: str | None = None
+    enabled: bool | None = None
+
+
+class SystemAnnouncementCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=191)
+    content: str = Field(..., min_length=1)
+    type: str = Field(default="info", max_length=32)
+    enabled: bool = True
+
+
+class SystemAnnouncementUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=191)
+    content: str | None = Field(default=None, min_length=1)
+    type: str | None = Field(default=None, max_length=32)
     enabled: bool | None = None
 
 
@@ -93,6 +108,19 @@ def _record_user_audit(identity: dict[str, object], action: str, target_id: obje
             identity=identity,
             action=action,
             target_type="user",
+            target_id=target_id,
+            detail=detail,
+        )
+    except Exception:
+        pass
+
+
+def _record_system_audit(identity: dict[str, object], action: str, target_id: object, detail: str) -> None:
+    try:
+        business_service.record_audit_log(
+            identity=identity,
+            action=action,
+            target_type="system_announcement",
             target_id=target_id,
             detail=detail,
         )
@@ -294,6 +322,77 @@ def create_router(app_version: str) -> APIRouter:
     async def get_settings(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"config": config.get()}
+
+    @router.get("/api/system/announcements")
+    async def list_system_announcements(
+        limit: int = Query(default=5, ge=1, le=50),
+        include_disabled: bool = Query(default=False),
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        is_admin = identity.get("role") == "admin"
+        return await run_in_threadpool(
+            system_announcement_service.list_announcements,
+            include_disabled=include_disabled and is_admin,
+            limit=limit,
+        )
+
+    @router.post("/api/system/announcements")
+    async def create_system_announcement(body: SystemAnnouncementCreateRequest, authorization: str | None = Header(default=None)):
+        identity = require_admin(authorization)
+        try:
+            item = await run_in_threadpool(
+                system_announcement_service.create_announcement,
+                title=body.title,
+                content=body.content,
+                announcement_type=body.type,
+                enabled=body.enabled,
+                created_by=str(identity.get("id") or "system"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        await run_in_threadpool(
+            _record_system_audit,
+            identity,
+            "create_announcement",
+            item.get("id"),
+            f"创建公告：{item.get('title')}",
+        )
+        return item
+
+    @router.patch("/api/system/announcements/{announcement_id}")
+    async def update_system_announcement(announcement_id: int, body: SystemAnnouncementUpdateRequest, authorization: str | None = Header(default=None)):
+        identity = require_admin(authorization)
+        updates = body.model_dump(exclude_unset=True)
+        try:
+            item = await run_in_threadpool(system_announcement_service.update_announcement, announcement_id, updates)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "announcement not found"})
+        await run_in_threadpool(
+            _record_system_audit,
+            identity,
+            "update_announcement",
+            item.get("id"),
+            f"更新公告：{item.get('title')}",
+        )
+        return item
+
+    @router.delete("/api/system/announcements/{announcement_id}")
+    async def disable_system_announcement(announcement_id: int, authorization: str | None = Header(default=None)):
+        identity = require_admin(authorization)
+        item = await run_in_threadpool(system_announcement_service.disable_announcement, announcement_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "announcement not found"})
+        await run_in_threadpool(
+            _record_system_audit,
+            identity,
+            "disable_announcement",
+            item.get("id"),
+            f"停用公告：{item.get('title')}",
+        )
+        return item
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):

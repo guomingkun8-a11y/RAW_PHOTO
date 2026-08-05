@@ -25,7 +25,7 @@ import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
-import { changePassword, logout as logoutApi, resolveApiAssetUrl, uploadAvatar } from "@/lib/api";
+import { changePassword, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, uploadAvatar, type SystemAnnouncement } from "@/lib/api";
 import { clearStoredAuthSession, setStoredAuthSession } from "@/stores/auth";
 import { listImageConversations } from "@/stores/image-conversations";
 import { sessionState, setSession } from "@/stores/session";
@@ -36,6 +36,9 @@ const mobileOpen = ref(false);
 const searchValue = ref("");
 const taskCount = ref(0);
 const showNotifications = ref(false);
+const announcements = ref<SystemAnnouncement[]>([]);
+const announcementsLoading = ref(false);
+const announcementsLoadedAt = ref(0);
 const showUserMenu = ref(false);
 const isDark = ref(document.documentElement.classList.contains("dark"));
 const passwordOpen = ref(false);
@@ -54,6 +57,7 @@ let taskCountLoadedAt = 0;
 let taskCountPromise: Promise<void> | null = null;
 let passwordClearTimers: number[] = [];
 const TASK_COUNT_CACHE_MS = 30_000;
+const ANNOUNCEMENT_CACHE_MS = 60_000;
 
 const navItems = [
   { href: "/image", label: "图片生成", detail: "AI 创作台", icon: WandSparkles },
@@ -98,6 +102,36 @@ async function refreshTaskCountSoon() {
   } catch {
     // Count refresh is only a nav hint; page navigation should stay immediate.
   }
+}
+
+async function loadAnnouncements(force = false) {
+  const now = Date.now();
+  if (!force && announcementsLoadedAt.value && now - announcementsLoadedAt.value < ANNOUNCEMENT_CACHE_MS) return;
+  announcementsLoading.value = true;
+  try {
+    const response = await fetchSystemAnnouncements({ limit: 5 });
+    announcements.value = response.items;
+    announcementsLoadedAt.value = Date.now();
+  } catch {
+    announcements.value = [];
+    announcementsLoadedAt.value = Date.now();
+  } finally {
+    announcementsLoading.value = false;
+  }
+}
+
+function toggleNotifications() {
+  showNotifications.value = !showNotifications.value;
+  showUserMenu.value = false;
+  if (showNotifications.value) void loadAnnouncements();
+}
+
+function announcementDotClass(type: string) {
+  const normalized = String(type || "").toLowerCase();
+  if (normalized === "success") return "bg-[#16C784]";
+  if (normalized === "warning") return "bg-amber-500";
+  if (normalized === "error") return "bg-rose-500";
+  return "bg-[#4F7CFF]";
 }
 
 function toggleTheme() {
@@ -259,6 +293,7 @@ watch(() => route.fullPath, () => {
 
 onMounted(() => {
   void loadTaskCount(true);
+  void loadAnnouncements(true);
   taskTimer = window.setInterval(() => void loadTaskCount(true), 30000);
 });
 
@@ -298,13 +333,31 @@ onBeforeUnmount(() => {
           <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300 md:hidden" aria-label="全局搜索" @click="submitSearch">
             <Search class="size-4" />
           </button>
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" @click="showNotifications = !showNotifications; showUserMenu = false">
+          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" @click="toggleNotifications">
             <Bell class="size-4" />
           </button>
-          <div v-if="showNotifications" class="absolute right-24 top-12 z-50 w-[300px] rounded-2xl border border-black/[0.06] bg-white p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] dark:border-white/10 dark:bg-[#171a21]">
-            <div class="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-white/[0.06]">
-              <div class="flex items-center gap-2 text-sm font-semibold text-slate-950 dark:text-stone-50"><span class="size-2 rounded-full bg-[#16C784]" />GPU 与 API 正常</div>
-              <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">图片任务会自动同步到历史图库，可随时收藏、下载或重新生成。</p>
+          <div v-if="showNotifications" class="absolute right-24 top-12 z-50 w-[320px] rounded-2xl border border-black/[0.06] bg-white p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] dark:border-white/10 dark:bg-[#171a21]">
+            <div class="px-2 pb-2 pt-1 text-xs font-semibold text-slate-500 dark:text-stone-400">更新公告</div>
+            <div v-if="announcementsLoading" class="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-white/[0.06]">
+              <div class="flex items-center gap-2 text-sm font-semibold text-slate-950 dark:text-stone-50">
+                <LoaderCircle class="size-4 animate-spin text-[#4F7CFF]" />
+                正在加载
+              </div>
+              <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">正在同步最新公告内容。</p>
+            </div>
+            <div v-else-if="announcements.length" class="max-h-[360px] space-y-2 overflow-y-auto pr-1">
+              <div v-for="item in announcements" :key="item.id" class="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-white/[0.06]">
+                <div class="flex items-start gap-2 text-sm font-semibold text-slate-950 dark:text-stone-50">
+                  <span class="mt-1.5 size-2 shrink-0 rounded-full" :class="announcementDotClass(item.type)" />
+                  <span class="min-w-0 flex-1">{{ item.title }}</span>
+                </div>
+                <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">{{ item.content }}</p>
+                <div class="mt-2 text-[11px] font-medium text-slate-400 dark:text-stone-500">{{ item.created_at }}</div>
+              </div>
+            </div>
+            <div v-else class="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-white/[0.06]">
+              <div class="flex items-center gap-2 text-sm font-semibold text-slate-950 dark:text-stone-50"><span class="size-2 rounded-full bg-[#16C784]" />系统运行正常</div>
+              <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">暂无新的更新公告。</p>
             </div>
           </div>
           <RouterLink to="/image-library" class="studio-button hidden h-10 items-center gap-2 rounded-2xl bg-slate-950 px-3 text-[13px] text-white shadow-[0_14px_32px_rgba(17,24,39,0.14)] dark:bg-white dark:text-slate-950 sm:inline-flex">

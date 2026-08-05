@@ -307,6 +307,7 @@ class GenerationMonitoringService:
         *,
         identity: dict[str, object],
         task_id: str,
+        failure_report_id: str = "",
         error: str = "",
         image_count: int = 1,
         mode: str = "generate",
@@ -315,8 +316,9 @@ class GenerationMonitoringService:
         template_id: int = 0,
     ) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "anonymous"
-        normalized_task_id = _clean(task_id)
-        if not normalized_task_id:
+        actual_task_id = _clean(task_id)
+        normalized_task_id = _clean(failure_report_id) or actual_task_id
+        if not actual_task_id:
             raise ValueError("task_id is required")
         is_cancellation_report = _is_cancellation_text(error)
 
@@ -449,8 +451,21 @@ class GenerationMonitoringService:
                 dict(row)
                 for row in session.execute(
                     text(
-                        "SELECT owner_id, COUNT(*) AS success_count "
-                        "FROM generated_images WHERE deleted_at IS NULL GROUP BY owner_id"
+                        "SELECT owner_id, SUM(success_count) AS success_count "
+                        "FROM ("
+                        "  SELECT owner_id, COUNT(*) AS success_count "
+                        "  FROM generated_images WHERE deleted_at IS NULL GROUP BY owner_id "
+                        "  UNION ALL "
+                        "  SELECT e.owner_id, SUM(COALESCE(NULLIF(e.image_count, 0), 1)) AS success_count "
+                        "  FROM generation_task_events e "
+                        "  WHERE e.status = 'success' "
+                        "    AND NOT EXISTS ("
+                        "      SELECT 1 FROM generated_images g "
+                        "      WHERE g.owner_id = e.owner_id AND g.task_id = e.task_id"
+                        "    ) "
+                        "  GROUP BY e.owner_id"
+                        ") AS success_sources "
+                        "GROUP BY owner_id"
                     )
                 ).mappings()
             ]

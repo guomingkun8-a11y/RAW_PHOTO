@@ -729,6 +729,66 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(task["data"][0]["url"], "http://relay.test/image.png")
                 relay_handler.assert_called_once()
 
+    def test_success_task_records_library_and_monitoring(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            service.submit_generation(
+                OWNER,
+                client_task_id="recorded-success-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            task = wait_for_task(service, OWNER, "recorded-success-task", "success")
+
+            self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
+            service._record_monitoring_event("owner-1:recorded-success-task")
+            from services import image_task_service as module
+
+            module.image_library_service.record_task_result.assert_called()
+            module.generation_monitoring_service.record_task_event.assert_called()
+
+    def test_sync_successful_library_results_only_records_missing_visible_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            service.submit_generation(
+                OWNER,
+                client_task_id="sync-missing-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            service.submit_generation(
+                OTHER_OWNER,
+                client_task_id="sync-other-task",
+                prompt="dog",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            wait_for_task(service, OWNER, "sync-missing-task", "success")
+            wait_for_task(service, OTHER_OWNER, "sync-other-task", "success")
+
+            from services import image_task_service as module
+
+            module.image_library_service.record_task_result.reset_mock()
+            module.image_library_service.has_task_result.side_effect = lambda task_id: task_id == "sync-missing-task"
+
+            synced = service.sync_successful_library_results({**OWNER, "role": "user"}, "http://local.test")
+
+            self.assertEqual(synced, 0)
+            module.image_library_service.record_task_result.assert_not_called()
+
+            module.image_library_service.has_task_result.side_effect = lambda task_id: False
+            synced = service.sync_successful_library_results({**OWNER, "role": "user"}, "http://local.test")
+
+            self.assertEqual(synced, 1)
+            synced_task = module.image_library_service.record_task_result.call_args.kwargs["task"]
+            self.assertEqual(synced_task["id"], "sync-missing-task")
+
     def test_resume_poll_rejected_in_relay_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

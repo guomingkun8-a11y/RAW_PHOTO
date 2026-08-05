@@ -544,6 +544,56 @@ class ImageTaskService:
                 if task.get("status") in TERMINAL_STATUSES
             ]
 
+    def sync_successful_library_results(self, identity: dict[str, object], base_url: str = "") -> int:
+        requester_id = _owner_id(identity)
+        include_all_owners = _clean(identity.get("role")) == "admin"
+        with self._lock:
+            self._refresh_locked()
+            if self._row_level_store:
+                tasks = self.task_store.list_terminal()
+            else:
+                tasks = list(self._tasks.values())
+        synced = 0
+        for task in tasks:
+            if task.get("status") != TASK_STATUS_SUCCESS:
+                continue
+            task_id = _clean(task.get("id"))
+            if not task_id:
+                continue
+            if not include_all_owners and _clean(task.get("owner_id")) != requester_id:
+                continue
+            task_identity = task.get("identity") if isinstance(task.get("identity"), dict) else {}
+            task_owner_id = _clean(task.get("owner_id")) or _clean(task_identity.get("id")) or requester_id
+            sync_identity = _identity_snapshot({**task_identity, "id": task_owner_id})
+            prompt = request_text(task.get("prompt"))
+            payload = task.get("payload")
+            if not prompt and isinstance(payload, dict):
+                prompt = request_text(payload.get("prompt"))
+            try:
+                if image_library_service.has_task_result(task_id):
+                    continue
+                image_library_service.record_task_result(
+                    identity=sync_identity,
+                    task=task,
+                    prompt=prompt,
+                    base_url=base_url or config.base_url,
+                )
+                synced += 1
+            except Exception as exc:
+                try:
+                    log_service.add(
+                        LOG_TYPE_CALL,
+                        "历史图库同步失败",
+                        {
+                            "task_key": _task_key(task_owner_id, task_id),
+                            "owner_id": task_owner_id,
+                            "error": str(exc) or exc.__class__.__name__,
+                        },
+                    )
+                except Exception:
+                    pass
+        return synced
+
     def requeue_unfinished(self) -> int:
         if self.task_queue is None:
             return 0
@@ -559,6 +609,16 @@ class ImageTaskService:
                 self.task_queue.enqueue(key)
                 queued += 1
         return queued
+
+    def requeue_orphaned_queued_tasks(self) -> int:
+        if self.task_queue is None or self.run_inline:
+            return 0
+        try:
+            if int(getattr(self.task_queue, "queue_depth", lambda: 0)() or 0) > 0:
+                return 0
+        except Exception:
+            return 0
+        return self.requeue_unfinished()
 
     def recover_stale_unfinished(self) -> int:
         stale_cutoff = time.time() - self._stale_running_timeout_secs
@@ -701,6 +761,16 @@ class ImageTaskService:
                             )
                         except Exception:
                             pass
+                    requeued = self.requeue_orphaned_queued_tasks()
+                    if requeued:
+                        try:
+                            log_service.add(
+                                LOG_TYPE_CALL,
+                                "image worker requeued orphaned queued tasks",
+                                {"requeued": requeued},
+                            )
+                        except Exception:
+                            pass
                 except Exception as exc:
                     try:
                         log_service.add(LOG_TYPE_CALL, "image worker maintenance failed", {"error": str(exc)})
@@ -746,6 +816,10 @@ class ImageTaskService:
     def monitoring_snapshot(self) -> dict[str, Any]:
         try:
             self.recover_stale_unfinished()
+        except Exception:
+            pass
+        try:
+            self.requeue_orphaned_queued_tasks()
         except Exception:
             pass
         with self._lock:
@@ -947,7 +1021,7 @@ class ImageTaskService:
                 with self._lock:
                     pending = self._get_task_locked(key)
                 if pending is not None and pending.get("status") == TASK_STATUS_QUEUED:
-                    time.sleep(1)
+                    time.sleep(0.05)
                     self.task_queue.enqueue(key)
             return
         with self._lock:
@@ -1221,8 +1295,18 @@ class ImageTaskService:
                 self._refresh_locked()
                 task = dict(self._get_task_locked(key) or {})
             generation_monitoring_service.record_task_event(_monitoring_event_task(task))
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                log_service.add(
+                    LOG_TYPE_CALL,
+                    "监控事件记录失败",
+                    {
+                        "task_key": key,
+                        "error": str(exc) or exc.__class__.__name__,
+                    },
+                )
+            except Exception:
+                pass
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         try:
@@ -1305,8 +1389,21 @@ class ImageTaskService:
                 prompt=prompt,
                 base_url=base_url or config.base_url,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                log_service.add(
+                    LOG_TYPE_CALL,
+                    "历史图库记录失败",
+                    {
+                        "key_id": identity.get("id"),
+                        "key_name": identity.get("name"),
+                        "role": identity.get("role"),
+                        "task_key": key,
+                        "error": str(exc) or exc.__class__.__name__,
+                    },
+                )
+            except Exception:
+                pass
 
     def _retry_task(
         self,
@@ -1546,6 +1643,7 @@ class ImageTaskService:
             if not self._update_task_unless_canceled(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000)):
                 return
             self._record_monitoring_event(key)
+            self._record_library_result(key, identity, "", config.base_url)
             self._log_call(
                 identity,
                 mode,

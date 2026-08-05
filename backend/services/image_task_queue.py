@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import socket
 import time
 import uuid
 
@@ -69,7 +70,14 @@ class RedisImageTaskQueue(ImageTaskQueue):
 
     def dequeue(self, timeout_secs: int = 5) -> str | None:
         timeout = max(1, int(timeout_secs or 5))
-        item = self._client.blpop(self.queue_name, timeout=timeout)
+        try:
+            item = self._client.blpop(self.queue_name, timeout=timeout)
+        except (TimeoutError, socket.timeout):
+            return None
+        except Exception as exc:
+            if "timeout reading from socket" in str(exc).lower():
+                return None
+            raise
         if not item:
             return None
         _, task_key = item

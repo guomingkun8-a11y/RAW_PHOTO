@@ -373,10 +373,10 @@ class ImageStorageService:
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
+    def _public_url(self, rel: str, base_url: str | None = None, *, prefer_remote: bool = True) -> str:
         settings = self.settings()
         public_base_url = _clean(settings.get("public_base_url"))
-        if public_base_url:
+        if prefer_remote and public_base_url:
             return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
         return f"{(base_url or config.base_url).rstrip('/')}/images/{_safe_relative_path(rel)}"
 
@@ -416,8 +416,12 @@ class ImageStorageService:
             stored_local = True
 
         if _remote_enabled(mode):
-            remote_url = self._remote_client(remote_provider, settings).put(rel, image_data)
-            stored_remote = True
+            try:
+                remote_url = self._remote_client(remote_provider, settings).put(rel, image_data)
+                stored_remote = True
+            except Exception:
+                if not stored_local:
+                    raise
 
         dimensions = _image_dimensions(image_data)
         item = {
@@ -442,7 +446,7 @@ class ImageStorageService:
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
-        return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+        return StoredImage(rel=rel, url=self._public_url(rel, base_url, prefer_remote=stored_remote), storage=str(item["storage"]), size=len(image_data))
 
     def save_task_asset(
         self,

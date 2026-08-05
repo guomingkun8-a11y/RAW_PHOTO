@@ -48,6 +48,7 @@ class ResumePollRequest(BaseModel):
 
 class ImageFailureReportRequest(BaseModel):
     task_id: str = Field(..., min_length=1)
+    failure_report_id: str = ""
     error: str = ""
     image_count: int = Field(default=1, ge=1, le=100)
     mode: str = "generate"
@@ -383,6 +384,7 @@ def create_router() -> APIRouter:
                 generation_monitoring_service.report_frontend_failure,
                 identity=identity,
                 task_id=body.task_id,
+                failure_report_id=body.failure_report_id,
                 error=body.error,
                 image_count=body.image_count,
                 mode=body.mode,

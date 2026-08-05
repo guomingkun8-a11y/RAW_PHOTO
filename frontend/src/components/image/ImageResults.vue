@@ -20,6 +20,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   openLightbox: [images: Array<{ id: string; src: string; name?: string }>, index: number];
   continueEdit: [image: StoredImage | StoredReferenceImage];
+  applyPromptSuggestion: [prompt: string];
+  focusPromptInput: [];
   deletePrompt: [turnId: string];
   deleteResults: [turnId: string];
   reuseTurnConfig: [turnId: string];
@@ -34,6 +36,32 @@ const emit = defineEmits<{
 const now = ref(Date.now());
 const downloadingTurnId = ref<string | null>(null);
 const expandedTurnIds = ref<Set<string>>(new Set());
+const promptSuggestions = [
+  {
+    label: "电商白底主图",
+    prompt: "生成一张 1:1 电商平台白底商品主图。商品主体放在画面中央，占画面 75%-85%，边缘轮廓清晰完整，不裁切、不变形。背景为纯净白色或极浅灰白色，无杂物、无阴影脏边。保留商品包装结构、Logo、颜色、材质和可见文字，不新增夸张促销文案、徽章、排行榜、认证标识或百分比承诺。整体光线柔和均匀，质感真实，适合淘宝、京东、拼多多等平台主图使用。",
+  },
+  {
+    label: "真实家居场景",
+    prompt: "生成一张真实家居使用场景商品图。画面为自然生活空间，干净、温暖、有真实居家氛围；使用柔和自然光，避免强烈滤镜和过度磨皮。商品放在合理使用位置，主体清晰，和环境比例协调，不要悬浮、变形或遮挡关键结构。背景可以有桌面、柜体、绿植、布艺或日常道具，但不能喧宾夺主。整体风格高级、真实、可信，适合电商详情页和社媒种草展示。",
+  },
+  {
+    label: "商品细节特写",
+    prompt: "生成一张商品细节特写图，重点突出商品材质、纹理、边缘工艺、包装质感和关键结构。使用近景构图，主体局部清晰锐利，背景干净虚化但不要过度失真。光线要能体现表面反光、凹凸、透明度或织物纹理等真实细节。不要新增无关文字、夸张功效承诺、认证徽章或百分比标识。画面要像专业商业摄影棚拍摄，可用于详情页卖点展示。",
+  },
+  {
+    label: "竖版商品海报",
+    prompt: "生成一张 9:16 竖版商品视觉海报。商品主体位于画面中下部或视觉中心，顶部预留干净标题空间，背景有层次但不要杂乱。画面需要适合手机端首屏展示，构图稳定，主体突出，光线高级，色彩有品牌感。可以加入少量生活场景或质感背景来烘托商品，但不要生成九宫格、拼图、分屏或多面板。不要添加夸张促销文字、虚假榜单、认证章或百分比承诺。",
+  },
+  {
+    label: "四张不同场景",
+    prompt: "生成 4 张不同场景的商品图。每张都必须是独立完整的一张成品图，不要拼图、不要分屏、不要九宫格、不要把 4 个场景放在同一张画布里。四张图要保持同一商品主体一致，风格统一但场景不同，可以分别表现白底主图、生活场景、细节特写、氛围海报。每张都要主体清晰、构图完整、光线自然、质感高级，不新增夸张功效文字、认证标识或无关元素。",
+  },
+  {
+    label: "参考图主体保真",
+    prompt: "根据我上传的商品参考图生成一张新的商品场景图。必须严格保持参考图中商品的外观、轮廓、颜色、Logo、包装文字、材质、比例和关键结构一致，不要改品牌、不换包装、不改变瓶身/盒型/配件关系。只允许优化背景、光线、构图和场景氛围。商品主体要清晰真实，与环境透视和阴影一致。不要生成拼图、九宫格、分屏，也不要新增夸张功效文案、认证徽章或百分比承诺。",
+  },
+];
 const displayUserName = computed(() => props.userName.trim() || "用户");
 const displayUserInitial = computed(() => {
   const source = props.userInitial.trim() || displayUserName.value;
@@ -79,6 +107,16 @@ function referenceSrc(image: StoredReferenceImage) {
 }
 function imageItems(turn: ImageTurn) {
   return turn.images.filter((image) => image.status === "success" && imageSrc(image)).map((image) => ({ id: image.id, src: imageSrc(image), name: image.sourceName || `${image.id}.png` }));
+}
+function referenceItems(turn: ImageTurn) {
+  return turn.referenceImages
+    .map((image, index) => ({ id: `reference-${turn.id}-${index}`, src: referenceSrc(image), name: image.name || `reference-${index + 1}.png` }))
+    .filter((item) => item.src);
+}
+function openReferenceLightbox(turn: ImageTurn, index: number) {
+  const items = referenceItems(turn);
+  if (!items.length) return;
+  emit("openLightbox", items, Math.max(0, Math.min(index, items.length - 1)));
 }
 function successImages(turn: ImageTurn) {
   return turn.images.filter((image) => image.status === "success" && imageSrc(image));
@@ -169,11 +207,28 @@ function copyPrompt(prompt: string) {
 <template>
   <div v-if="!conversation" class="flex min-h-[430px] items-center justify-center px-6 text-center">
     <div>
-      <div class="mx-auto grid size-12 place-items-center rounded-2xl bg-slate-950 text-white dark:bg-white dark:text-slate-950">
-        <Edit3 class="size-5" />
+      <button
+        type="button"
+        class="group mx-auto block rounded-2xl px-4 py-2 text-center outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35"
+        aria-label="跳转到输入要求"
+        @click="emit('focusPromptInput')"
+      >
+        <span class="mx-auto grid size-12 place-items-center rounded-2xl bg-slate-950 text-white transition group-hover:bg-[#315be8] dark:bg-white dark:text-slate-950 dark:group-hover:bg-stone-100">
+          <Edit3 class="size-5" />
+        </span>
+        <span class="mt-4 block text-lg font-semibold text-slate-950 transition group-hover:text-[#315be8] dark:text-stone-50">输入需求后开始生成</span>
+      </button>
+      <div class="mx-auto mt-5 flex max-w-[760px] flex-wrap justify-center gap-2">
+        <button
+          v-for="item in promptSuggestions"
+          :key="item.label"
+          type="button"
+          class="studio-button rounded-xl bg-white px-3 py-2 text-[13px] font-medium text-slate-700 shadow-sm ring-1 ring-black/[0.06] transition hover:bg-[#4F7CFF]/[0.08] hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/30 dark:bg-white/[0.06] dark:text-stone-200 dark:ring-white/10 dark:hover:bg-white/[0.1]"
+          @click="emit('applyPromptSuggestion', item.prompt)"
+        >
+          {{ item.label }}
+        </button>
       </div>
-      <h2 class="mt-4 text-lg font-semibold text-slate-950 dark:text-stone-50">输入需求后开始生成</h2>
-      <p class="mx-auto mt-2 max-w-[520px] text-sm leading-6 text-slate-500 dark:text-stone-400">Prompt、参考图和生成结果会像对话一样按轮次保存在这里。</p>
     </div>
   </div>
 
@@ -204,7 +259,16 @@ function copyPrompt(prompt: string) {
           <p v-if="turn.prompt" class="whitespace-pre-wrap text-sm leading-6">{{ turn.prompt }}</p>
           <div v-else class="text-sm text-white/60 dark:text-slate-500">提示词已删除</div>
           <div v-if="turn.referenceImages.length" class="mt-3 flex gap-2 overflow-x-auto">
-            <img v-for="(image, index) in turn.referenceImages" :key="`${image.name}-${referenceSrc(image).slice(-12)}-${index}`" :src="referenceSrc(image)" alt="参考图" class="size-14 shrink-0 rounded-xl border border-white/15 object-cover" loading="lazy" decoding="async" />
+            <button
+              v-for="(image, index) in turn.referenceImages"
+              :key="`${image.name}-${referenceSrc(image).slice(-12)}-${index}`"
+              type="button"
+              class="group/reference relative size-14 shrink-0 overflow-hidden rounded-xl border border-white/15 bg-white/5 outline-none transition hover:border-white/35 focus-visible:ring-2 focus-visible:ring-white/45"
+              :aria-label="`放大查看参考图 ${index + 1}`"
+              @click="openReferenceLightbox(turn, index)"
+            >
+              <img :src="referenceSrc(image)" alt="参考图" class="h-full w-full cursor-zoom-in object-cover transition duration-200 group-hover/reference:scale-[1.04]" loading="lazy" decoding="async" />
+            </button>
           </div>
           <div class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2 text-[11px] text-white/60 dark:border-slate-900/10 dark:text-slate-500">
             <span>{{ turn.mode === 'edit' ? '图生图' : '文生图' }} · {{ modelLabel(turn.model) }} · {{ turn.count }} 张 · {{ turn.size }}</span>

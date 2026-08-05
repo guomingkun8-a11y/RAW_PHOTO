@@ -88,6 +88,46 @@ class ImageLibraryServiceTests(unittest.TestCase):
         self.assertEqual((width, height), (2, 2))
         self.assertEqual(file_size, len(payload))
 
+    def test_store_result_image_keeps_remote_url_when_download_fails(self):
+        with mock.patch.object(image_library_service.image_storage_service, "exists", return_value=False), mock.patch.object(
+            image_library_service,
+            "_download_image",
+            side_effect=RuntimeError("download failed"),
+        ):
+            image_rel, image_url, storage, width, height, file_size = image_library_service._store_result_image(
+                {"url": "https://relay.example/image.png"},
+                "http://app.test",
+            )
+
+        self.assertEqual(image_rel, "")
+        self.assertEqual(image_url, "https://relay.example/image.png")
+        self.assertEqual(storage, "remote")
+        self.assertIsNone(width)
+        self.assertIsNone(height)
+        self.assertIsNone(file_size)
+
+    def test_public_item_uses_remote_image_as_thumbnail_fallback(self):
+        row = self.row()
+        row.image_rel = ""
+        row.image_url = "https://relay.example/image.png"
+        row.thumbnail_url = ""
+
+        item = image_library_service.ImageLibraryService._public_item(row, "http://app.test")
+
+        self.assertEqual(item["image_url"], "https://relay.example/image.png")
+        self.assertEqual(item["thumbnail_url"], "https://relay.example/image.png")
+
+    def test_has_task_result_detects_existing_library_row(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="task-1")
+
+                self.assertTrue(service.has_task_result("task-1"))
+                self.assertFalse(service.has_task_result("missing-task"))
+            finally:
+                service.engine.dispose()
+
     def test_list_images_caches_total_count(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
@@ -123,6 +163,44 @@ class ImageLibraryServiceTests(unittest.TestCase):
                 self.assertEqual(result["total"], 2)
                 self.assertEqual({item["task_id"] for item in result["items"]}, {"admin-task", "user-task"})
                 self.assertIn("owner_id", result["items"][0])
+            finally:
+                service.engine.dispose()
+
+    def test_admin_list_images_can_filter_by_owner_id(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="admin-task", owner_id="admin-1")
+                self.insert_image(service, image_id=2, task_id="user-task", owner_id="user-1")
+                self.insert_image(service, image_id=3, task_id="other-task", owner_id="user-2")
+
+                result = service.list_images(
+                    identity={"id": "admin-1", "role": "admin"},
+                    base_url="http://app.test",
+                    owner_id_filter="user-1",
+                )
+
+                self.assertEqual(result["total"], 1)
+                self.assertEqual([item["task_id"] for item in result["items"]], ["user-task"])
+            finally:
+                service.engine.dispose()
+
+    def test_user_list_images_ignores_owner_id_filter(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="own-task", owner_id="user-1")
+                self.insert_image(service, image_id=2, task_id="other-task", owner_id="user-2")
+
+                result = service.list_images(
+                    identity={"id": "user-1", "role": "user"},
+                    base_url="http://app.test",
+                    include_all_owners=True,
+                    owner_id_filter="user-2",
+                )
+
+                self.assertEqual(result["total"], 1)
+                self.assertEqual([item["task_id"] for item in result["items"]], ["own-task"])
             finally:
                 service.engine.dispose()
 

@@ -47,6 +47,7 @@ export type StoredImage = {
   qualityCheck?: StoredImageQualityCheck;
   sourceImageIndex?: number;
   sourceName?: string;
+  failureReportId?: string;
 };
 
 export type ImageTurnStatus = "queued" | "generating" | "success" | "error" | "canceled";
@@ -156,6 +157,7 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
         ? image.sourceImageIndex
         : undefined,
     sourceName: typeof image.sourceName === "string" && image.sourceName ? image.sourceName : undefined,
+    failureReportId: typeof image.failureReportId === "string" && image.failureReportId ? image.failureReportId : undefined,
     qualityCheck,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success" || image.status === "canceled") {

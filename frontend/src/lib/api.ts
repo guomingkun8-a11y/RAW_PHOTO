@@ -219,6 +219,17 @@ export type AuditLogItem = {
   created_at: string;
 };
 
+export type SystemAnnouncement = {
+  id: number;
+  title: string;
+  content: string;
+  type: "info" | "success" | "warning" | "error" | string;
+  enabled: boolean;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+};
+
 type ImageTaskListResponse = {
   items: ImageTask[];
   missing_ids: string[];
@@ -688,6 +699,19 @@ async function downloadErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "";
 }
 
+function filenameFromContentDisposition(value: unknown) {
+  const header = String(value || "");
+  const encoded = header.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  }
+  return header.match(/filename="([^"]+)"/i)?.[1] || header.match(/filename=([^;]+)/i)?.[1]?.trim() || "";
+}
+
 export async function downloadImageTaskZip(body: {
   folderName: string;
   items: Array<{ taskId: string; imageIndex?: number; filename: string }>;
@@ -727,6 +751,7 @@ export async function cancelImageTask(taskId: string) {
 
 export async function reportImageFailure(body: {
   taskId: string;
+  failureReportId?: string;
   error?: string;
   imageCount?: number;
   mode?: "generate" | "edit";
@@ -738,6 +763,7 @@ export async function reportImageFailure(body: {
     method: "POST",
     body: {
       task_id: body.taskId,
+      failure_report_id: body.failureReportId || body.taskId,
       error: body.error || "",
       image_count: body.imageCount || 1,
       mode: body.mode || "generate",
@@ -750,6 +776,35 @@ export async function reportImageFailure(body: {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchSystemAnnouncements(options: { includeDisabled?: boolean; limit?: number } = {}) {
+  const params = new URLSearchParams({
+    limit: String(options.limit || 5),
+    _t: String(Date.now()),
+  });
+  if (options.includeDisabled) params.set("include_disabled", "true");
+  return httpRequest<{ items: SystemAnnouncement[]; total: number }>(`/api/system/announcements?${params.toString()}`);
+}
+
+export async function createSystemAnnouncement(body: Pick<SystemAnnouncement, "title" | "content"> & { type?: string; enabled?: boolean }) {
+  return httpRequest<SystemAnnouncement>("/api/system/announcements", {
+    method: "POST",
+    body,
+  });
+}
+
+export async function updateSystemAnnouncement(id: number, body: Partial<Pick<SystemAnnouncement, "title" | "content" | "type" | "enabled">>) {
+  return httpRequest<SystemAnnouncement>(`/api/system/announcements/${id}`, {
+    method: "PATCH",
+    body,
+  });
+}
+
+export async function disableSystemAnnouncement(id: number) {
+  return httpRequest<SystemAnnouncement>(`/api/system/announcements/${id}`, {
+    method: "DELETE",
+  });
 }
 
 export async function fetchImageLibrary(options: {
@@ -832,6 +887,20 @@ export async function downloadImageLibraryZip(body: { ids: number[]; folderName?
     return response.data;
   } catch (error) {
     throw new Error((await downloadErrorMessage(error)) || "打包下载失败");
+  }
+}
+
+export async function downloadImageLibraryItem(id: number) {
+  try {
+    const response = await request.request<Blob>({
+      url: `/api/image-library/${encodeURIComponent(String(id))}/download`,
+      method: "GET",
+      responseType: "blob",
+    });
+    const filename = filenameFromContentDisposition(response.headers["content-disposition"]) || `image-${id}.png`;
+    return { blob: response.data, filename };
+  } catch (error) {
+    throw new Error((await downloadErrorMessage(error)) || "下载图片失败");
   }
 }
 

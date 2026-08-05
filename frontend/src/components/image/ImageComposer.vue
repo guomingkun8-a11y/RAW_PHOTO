@@ -5,6 +5,7 @@ import {
   ImagePlus,
   LoaderCircle,
   MessageSquarePlus,
+  MoreHorizontal,
   PackageCheck,
   RectangleHorizontal,
   RectangleVertical,
@@ -18,13 +19,12 @@ import {
 } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { analyzeImagePrompt, type ImageModel, type PromptTemplate } from "@/lib/api";
-import { formatImageModel, imageModelFeatures, isImageModel } from "@/lib/image-models";
+import { analyzeImagePrompt, type ImageModel } from "@/lib/api";
+import { formatImageModel, imageModelFeatures } from "@/lib/image-models";
 import type { StoredReferenceImage } from "@/stores/image-conversations";
 
 const props = defineProps<{
   imageModels: ImageModel[];
-  promptTemplates: PromptTemplate[];
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: StoredReferenceImage[];
@@ -41,6 +41,7 @@ const emit = defineEmits<{
   pickBatchProduct: [];
   pickBatchFolder: [];
   clearBatch: [];
+  openLightbox: [images: Array<{ id: string; src: string; name?: string }>, index: number];
 }>();
 
 const prompt = defineModel<string>("prompt", { required: true });
@@ -51,17 +52,24 @@ const imageWidth = defineModel<string>("imageWidth", { required: true });
 const imageHeight = defineModel<string>("imageHeight", { required: true });
 const imageQuality = defineModel<string>("imageQuality", { required: true });
 const imageModel = defineModel<ImageModel>("imageModel", { required: true });
-const selectedTemplateId = defineModel<number | null>("selectedTemplateId", { required: true });
 const preserveSubject = defineModel<boolean>("preserveSubject", { required: true });
 
 const fileInput = ref<HTMLInputElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
+const settingCards = ref<HTMLElement | null>(null);
 const isDragging = ref(false);
 const isFocused = ref(false);
-const settingsOpen = ref(false);
-const promptAssistAction = ref<"suggest" | "optimize" | "enhance" | null>(null);
+type SettingCard = "model" | "canvas" | "count" | "more";
+type PromptAssistAction = "suggest" | "optimize" | "enhance";
+const openSettingCard = ref<SettingCard | null>(null);
+const promptAssistAction = ref<PromptAssistAction | null>(null);
 const promptAssistNote = ref("");
 
+const assistOptions: { action: PromptAssistAction; label: string; description: string }[] = [
+  { action: "suggest", label: "建议", description: "根据参考图生成方向" },
+  { action: "optimize", label: "优化", description: "整理现有提示词" },
+  { action: "enhance", label: "润色", description: "强化细节和质感" },
+];
 const qualityOptions = [
   { value: "auto", label: "自动" },
   { value: "low", label: "低" },
@@ -80,12 +88,14 @@ const aspectOptions = [
 const countOptions = ["1", "2", "3", "4", "6", "8"];
 const previewWidth = 280;
 const previewMaxHeight = 340;
-const promptMinHeight = 76;
+const promptMinHeight = 108;
 const promptMaxHeight = 240;
 
 const modelLabel = computed(() => formatImageModel(imageModel.value));
 const modelFeatures = computed(() => imageModelFeatures(imageModel.value));
 const qualityLabel = computed(() => qualityOptions.find((item) => item.value === imageQuality.value)?.label || "自动");
+const canvasLabel = computed(() => imageRatio.value === "auto" ? "自动" : imageRatio.value);
+const countLabel = computed(() => `${imageCount.value || 1} 张`);
 const hasReferences = computed(() => props.referenceImages.length > 0);
 const hasBatch = computed(() => Boolean(props.batchProductImage || props.batchFolderImages.length));
 const isBatchReplaceMode = computed(() => Boolean(props.batchProductImage && props.batchFolderImages.length));
@@ -99,7 +109,6 @@ const promptShellState = computed(() => ({
   "is-focused": isFocused.value,
   "is-submitting": props.isSubmitting,
 }));
-const visiblePromptTemplates = computed(() => props.promptTemplates.filter((item) => item.enabled !== false));
 const referencePreview = ref<{
   src: string;
   name: string;
@@ -110,15 +119,6 @@ const referencePreview = ref<{
 
 function formatModel(value: string) {
   return formatImageModel(value);
-}
-function templateCategoryLabel(value: string) {
-  const labels: Record<string, string> = {
-    main: "主图",
-    white: "白底",
-    scene: "场景",
-    detail: "详情",
-  };
-  return labels[value] || value || "通用";
 }
 function clampCount(value: string) {
   imageCount.value = value === "" ? "" : String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
@@ -163,36 +163,35 @@ function showReferencePreview(image: StoredReferenceImage, index: number, event:
 function referenceSource(image: StoredReferenceImage) {
   return image.dataUrl || image.url || "";
 }
+function referenceItems(images = props.referenceImages) {
+  return images
+    .map((image, index) => ({ id: `composer-reference-${index}`, src: referenceSource(image), name: image.name || `reference-${index + 1}.png` }))
+    .filter((item) => item.src);
+}
+function openReferenceLightbox(index: number) {
+  const items = referenceItems();
+  if (!items.length) return;
+  hideReferencePreview();
+  emit("openLightbox", items, Math.max(0, Math.min(index, items.length - 1)));
+}
 function hideReferencePreview() {
   referencePreview.value = null;
 }
-async function selectTemplate(templateId: string) {
-  const parsed = Number(templateId);
-  const value = templateId === "none" || !Number.isFinite(parsed) ? null : parsed;
-  selectedTemplateId.value = value;
-  const template = props.promptTemplates.find((item) => item.id === value);
-  if (!template) {
-    await nextTick();
-    resizePromptTextarea();
-    textarea.value?.focus();
-    return;
-  }
-  prompt.value = template.content;
-  if (template.model && props.imageModels.includes(template.model) && isImageModel(template.model)) imageModel.value = template.model;
-  if (template.quality) imageQuality.value = template.quality;
-  if (template.size) {
-    const matched = template.size.match(/^(\d+)x(\d+)$/);
-    if (matched) {
-      imageWidth.value = matched[1];
-      imageHeight.value = matched[2];
-      imageRatio.value = "auto";
-      imageTier.value = "auto";
-    }
-  }
-  preserveSubject.value = template.preserve_subject;
-  await nextTick();
-  resizePromptTextarea();
-  textarea.value?.focus();
+function toggleSettingCard(card: SettingCard) {
+  openSettingCard.value = openSettingCard.value === card ? null : card;
+}
+function closeSettingCards() {
+  openSettingCard.value = null;
+}
+function onDocumentPointerDown(event: PointerEvent) {
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (settingCards.value?.contains(target)) return;
+  openSettingCard.value = null;
+}
+function runPromptAssist(action: PromptAssistAction) {
+  openSettingCard.value = null;
+  void assist(action);
 }
 function pickReferences() {
   fileInput.value?.click();
@@ -215,7 +214,7 @@ function onDrop(event: DragEvent) {
   const files = Array.from(event.dataTransfer?.files || []).filter((file) => file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(file.name));
   if (files.length) emit("referenceFiles", files);
 }
-async function assist(action: "suggest" | "optimize" | "enhance") {
+async function assist(action: PromptAssistAction) {
   if (!hasReferences.value || promptAssistAction.value) {
     promptAssistNote.value = "请先上传商品参考图，再让 AI 分析图片并生成 Prompt。";
     return;
@@ -260,10 +259,12 @@ watch(prompt, () => {
 onMounted(() => {
   void nextTick(resizePromptTextarea);
   window.addEventListener("resize", resizePromptTextarea);
+  document.addEventListener("pointerdown", onDocumentPointerDown);
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener("resize", resizePromptTextarea);
+  document.removeEventListener("pointerdown", onDocumentPointerDown);
 });
 </script>
 
@@ -273,18 +274,23 @@ onBeforeUnmount(() => {
         <div
           v-for="(image, index) in referenceImages"
           :key="`${image.name}-${index}`"
-          class="group relative size-16 shrink-0 rounded-xl border border-black/[0.06] outline-none ring-[#4F7CFF]/30 transition focus-visible:ring-[3px] dark:border-white/10"
-          tabindex="0"
-          :aria-label="image.name || `reference image ${index + 1}`"
+          class="group relative size-16 shrink-0 rounded-xl border border-black/[0.06] outline-none ring-[#4F7CFF]/30 transition dark:border-white/10"
           data-reference-thumb
           @mouseenter="showReferencePreview(image, index, $event)"
           @mouseleave="hideReferencePreview"
-          @focusin="showReferencePreview(image, index, $event)"
-          @focusout="hideReferencePreview"
-          @keydown.escape.stop="hideReferencePreview"
         >
-          <img :src="referenceSource(image)" alt="参考图" class="h-full w-full rounded-xl object-cover" />
-          <button type="button" class="absolute right-1 top-1 inline-flex size-6 items-center justify-center rounded-lg bg-slate-950/75 text-white opacity-100 sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100" aria-label="移除参考图" @click="hideReferencePreview(); emit('removeReference', index)">
+          <button
+            type="button"
+            class="block h-full w-full rounded-xl outline-none focus-visible:ring-[3px] focus-visible:ring-[#4F7CFF]/30"
+            :aria-label="`放大查看参考图 ${index + 1}`"
+            @click="openReferenceLightbox(index)"
+            @focusin="showReferencePreview(image, index, $event)"
+            @focusout="hideReferencePreview"
+            @keydown.escape.stop="hideReferencePreview"
+          >
+            <img :src="referenceSource(image)" alt="参考图" class="h-full w-full cursor-zoom-in rounded-xl object-cover transition duration-200 group-hover:scale-[1.03]" />
+          </button>
+          <button type="button" class="absolute right-1 top-1 inline-flex size-6 items-center justify-center rounded-lg bg-slate-950/75 text-white opacity-100 sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100" aria-label="移除参考图" @click.stop="hideReferencePreview(); emit('removeReference', index)">
             <X class="size-3" />
           </button>
         </div>
@@ -304,114 +310,33 @@ onBeforeUnmount(() => {
         <button type="button" class="rounded-xl px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50" @click="emit('clearBatch')">清空</button>
       </div>
 
-      <div v-if="visiblePromptTemplates.length" class="mb-3 rounded-xl border border-black/[0.06] bg-[#F8FAFC] px-3 py-2 dark:border-white/10 dark:bg-white/[0.04]">
+      <div class="composer-input-panel rounded-2xl border border-black/[0.08] bg-[#F8FAFC] px-3 py-3 transition dark:border-white/10 dark:bg-white/[0.04]" :class="{ 'is-focused': isFocused }">
         <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-          <span class="text-xs font-semibold text-slate-500 dark:text-stone-400">提示词模板</span>
-          <button type="button" class="studio-button rounded-lg px-2 py-1 text-[12px] font-semibold" :class="selectedTemplateId == null ? 'bg-[#4F7CFF]/10 text-[#315be8]' : 'text-slate-500 hover:bg-white dark:text-stone-400 dark:hover:bg-white/[0.06]'" @click="selectTemplate('none')">
-            自定义输入
-          </button>
+          <label for="image-prompt-input" class="inline-flex items-center gap-2 text-[14px] font-semibold text-slate-900 dark:text-stone-50">
+            <Sparkles class="size-4 text-[#315be8]" />
+            输入要求
+          </label>
+          <span class="text-[12px] font-medium text-slate-500 dark:text-stone-400">Prompt</span>
         </div>
-        <div class="composer-template-list grid max-h-[118px] gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
-          <button
-            v-for="item in visiblePromptTemplates"
-            :key="item.id"
-            type="button"
-            class="composer-template-card studio-button flex min-h-11 min-w-0 items-center gap-2 rounded-xl border px-3 py-2 text-left text-[13px] font-semibold transition"
-            :class="item.id === selectedTemplateId ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200'"
-            :aria-pressed="item.id === selectedTemplateId"
-            :title="item.name"
-            @click="selectTemplate(String(item.id))"
-          >
-            <span class="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-500 dark:bg-white/[0.08] dark:text-stone-400">{{ templateCategoryLabel(item.category) }}</span>
-            <span class="min-w-0 truncate">{{ item.name }}</span>
-          </button>
-        </div>
+        <textarea
+          id="image-prompt-input"
+          ref="textarea"
+          v-model="prompt"
+          :placeholder="promptPlaceholder"
+          class="w-full resize-none overflow-y-hidden rounded-xl border border-black/[0.06] bg-white px-3 py-3 text-[16px] leading-7 text-slate-950 outline-none placeholder:text-slate-500 dark:border-white/10 dark:bg-[#111317] dark:text-stone-50 dark:placeholder:text-stone-400"
+          :style="{ minHeight: `${promptMinHeight}px`, maxHeight: `${promptMaxHeight}px` }"
+          data-testid="image-prompt-input"
+          @paste="onPaste"
+          @input="resizePromptTextarea"
+          @focus="isFocused = true"
+          @blur="isFocused = false"
+        />
       </div>
-
-      <textarea
-        ref="textarea"
-        v-model="prompt"
-        :placeholder="promptPlaceholder"
-        class="w-full resize-none overflow-y-hidden bg-transparent px-1 py-1 text-[16px] leading-7 text-slate-950 outline-none placeholder:text-slate-400 dark:text-stone-50"
-        :style="{ minHeight: `${promptMinHeight}px`, maxHeight: `${promptMaxHeight}px` }"
-        data-testid="image-prompt-input"
-        @paste="onPaste"
-        @input="resizePromptTextarea"
-        @focus="isFocused = true"
-        @blur="isFocused = false"
-      />
       <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" data-testid="reference-file-input" @change="onFiles" />
 
-      <section class="composer-settings mt-2 rounded-xl border border-black/[0.06] bg-[#F8FAFC] dark:border-white/10 dark:bg-white/[0.04]" :class="{ 'is-open': settingsOpen }">
-        <button
-          type="button"
-          class="composer-settings-trigger flex w-full cursor-pointer flex-wrap items-center justify-between gap-2 px-3 py-2 text-left text-sm font-semibold text-slate-700 dark:text-stone-200"
-          :aria-expanded="settingsOpen"
-          aria-controls="composer-settings-panel"
-          data-testid="image-settings-toggle"
-          @click="settingsOpen = !settingsOpen"
-        >
-          <span class="inline-flex items-center gap-2"><SlidersHorizontal class="size-4" />模型与画布</span>
-          <span class="flex flex-wrap gap-1.5 text-[11px] font-medium text-slate-500">
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ modelLabel }}</span>
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ imageWidth }} x {{ imageHeight }}</span>
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ qualityLabel }} / {{ imageCount || 1 }} 张</span>
-          </span>
-        </button>
-        <Transition name="composer-settings-panel">
-          <div v-show="settingsOpen" id="composer-settings-panel" class="composer-settings-panel overflow-hidden border-t border-black/[0.06] dark:border-white/10">
-            <div class="grid gap-4 p-3 xl:grid-cols-[260px_minmax(0,1fr)_220px]">
-              <div>
-                <label class="mb-2 block text-xs font-semibold text-slate-500">模型</label>
-                <select v-model="imageModel" class="studio-input h-10 px-3 text-sm">
-                  <option v-for="model in imageModels" :key="model" :value="model">{{ formatModel(model) }} - {{ model }}</option>
-                </select>
-                <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 dark:text-stone-400">
-                  <span class="max-w-full truncate rounded-full bg-slate-100 px-2 py-1 font-mono dark:bg-white/[0.08]">{{ imageModel }}</span>
-                  <span v-for="feature in modelFeatures" :key="feature" class="rounded-full bg-[#4F7CFF]/10 px-2 py-1 font-medium text-[#315be8]">{{ feature }}</span>
-                </div>
-                <div class="mt-2 grid grid-cols-4 gap-2">
-                  <button v-for="option in qualityOptions" :key="option.value" type="button" class="studio-button h-9 rounded-xl border text-[13px] font-medium" :class="option.value === imageQuality ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" @click="imageQuality = option.value">{{ option.label }}</button>
-                </div>
-                <label class="mt-3 inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] px-3 text-[13px] font-medium text-slate-700 dark:border-white/10 dark:text-stone-200" :class="canPreserve ? 'cursor-pointer' : 'cursor-not-allowed opacity-55'">
-                  <input v-model="preserveSubject" type="checkbox" class="size-4 accent-[#4F7CFF]" :disabled="!canPreserve" />
-                  <ShieldCheck class="size-4" />
-                  主体保真
-                </label>
-              </div>
-
-              <div>
-                <label class="mb-2 block text-xs font-semibold text-slate-500">画布尺寸</label>
-                <div class="grid grid-cols-3 gap-2 sm:grid-cols-5">
-                  <button v-for="option in aspectOptions" :key="`${option.ratio}-${option.tier}-${option.label}`" type="button" class="studio-button flex h-[58px] flex-col items-center justify-center gap-1 rounded-xl border text-[13px] font-medium" :class="option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" @click="setAspect(option)">
-                    <component :is="option.icon" class="size-4" />
-                    <span>{{ option.label }}</span>
-                  </button>
-                </div>
-                <div class="mt-2 grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-                  <input v-model="imageWidth" type="number" min="1" class="studio-input h-10 px-3 text-center" />
-                  <span class="text-sm text-slate-400">x</span>
-                  <input v-model="imageHeight" type="number" min="1" class="studio-input h-10 px-3 text-center" />
-                </div>
-              </div>
-
-              <div>
-                <label class="mb-2 block text-xs font-semibold text-slate-500">生成数量</label>
-                <div class="grid grid-cols-3 gap-2">
-                  <button v-for="value in countOptions" :key="value" type="button" class="studio-button h-9 rounded-xl border text-[13px] font-medium" :class="imageCount === value ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" @click="imageCount = value">{{ value }} 张</button>
-                </div>
-                <div class="mt-2 flex items-center gap-2">
-                  <input :value="imageCount" type="number" min="1" max="100" aria-label="自定义张数" class="studio-input h-10 px-3 text-center" @input="clampCount(($event.target as HTMLInputElement).value)" />
-                  <span class="text-xs text-slate-400">张</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </Transition>
-      </section>
-
-      <div class="mt-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div class="flex flex-wrap items-center gap-2">
+      <div class="mt-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div ref="settingCards" class="min-w-0 flex-1" @keydown.escape="closeSettingCards">
+          <div class="flex flex-wrap items-center gap-2">
           <button type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" @click="emit('createDraft')">
             <MessageSquarePlus class="size-4" />
             新建任务
@@ -428,10 +353,140 @@ onBeforeUnmount(() => {
             <PackageCheck class="size-4" />
             换商品主图
           </button>
-          <button v-for="item in [{ action: 'suggest', label: '建议' }, { action: 'optimize', label: '优化' }, { action: 'enhance', label: '润色' }]" :key="item.action" type="button" class="studio-button inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 hover:bg-[#4F7CFF]/[0.08] disabled:cursor-not-allowed disabled:opacity-45 dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" :disabled="!hasReferences || Boolean(promptAssistAction)" @click="assist(item.action as 'suggest' | 'optimize' | 'enhance')">
-            <Sparkles class="size-4" :class="promptAssistAction === item.action ? 'ai-orbit' : ''" />
-            {{ item.label }}
-          </button>
+            <button
+              type="button"
+              class="composer-setting-card"
+              :class="{ 'is-selected': openSettingCard === 'model' }"
+              :aria-expanded="openSettingCard === 'model'"
+              aria-controls="composer-model-card-panel"
+              data-testid="image-model-card-toggle"
+              @click="toggleSettingCard('model')"
+            >
+              <SlidersHorizontal class="size-4" />
+              <span class="composer-setting-card-text">
+                <span>模型</span>
+                <strong>{{ modelLabel }}</strong>
+              </span>
+            </button>
+            <button
+              type="button"
+              class="composer-setting-card"
+              :class="{ 'is-selected': openSettingCard === 'canvas' }"
+              :aria-expanded="openSettingCard === 'canvas'"
+              aria-controls="composer-canvas-card-panel"
+              data-testid="image-canvas-card-toggle"
+              @click="toggleSettingCard('canvas')"
+            >
+              <Square class="size-4" />
+              <span class="composer-setting-card-text">
+                <span>画布</span>
+                <strong>{{ canvasLabel }}</strong>
+              </span>
+            </button>
+            <button
+              type="button"
+              class="composer-setting-card"
+              :class="{ 'is-selected': openSettingCard === 'count' }"
+              :aria-expanded="openSettingCard === 'count'"
+              aria-controls="composer-count-card-panel"
+              data-testid="image-count-card-toggle"
+              @click="toggleSettingCard('count')"
+            >
+              <Zap class="size-4" />
+              <span class="composer-setting-card-text">
+                <span>数量</span>
+                <strong>{{ countLabel }}</strong>
+              </span>
+            </button>
+            <button
+              type="button"
+              class="composer-more-button"
+              :class="{ 'is-selected': openSettingCard === 'more' }"
+              :aria-expanded="openSettingCard === 'more'"
+              aria-controls="composer-more-card-panel"
+              data-testid="image-more-card-toggle"
+              @click="toggleSettingCard('more')"
+            >
+              <MoreHorizontal class="size-4" />
+              更多
+            </button>
+          </div>
+
+          <Transition name="composer-setting-card-panel">
+            <div v-if="openSettingCard" class="composer-setting-card-panel mt-2 rounded-xl border border-black/[0.06] bg-[#F8FAFC] p-3 dark:border-white/10 dark:bg-white/[0.04]">
+              <div v-if="openSettingCard === 'model'" id="composer-model-card-panel" class="grid gap-3 sm:grid-cols-[minmax(220px,1fr)_auto]">
+                <div class="min-w-0">
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">模型</label>
+                  <select v-model="imageModel" class="studio-input h-10 px-3 text-sm">
+                    <option v-for="model in imageModels" :key="model" :value="model">{{ formatModel(model) }} - {{ model }}</option>
+                  </select>
+                  <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 dark:text-stone-400">
+                    <span class="max-w-full truncate rounded-full bg-white px-2 py-1 font-mono dark:bg-white/[0.08]">{{ imageModel }}</span>
+                    <span v-for="feature in modelFeatures" :key="feature" class="rounded-full bg-[#4F7CFF]/10 px-2 py-1 font-medium text-[#315be8]">{{ feature }}</span>
+                  </div>
+                </div>
+                <div class="min-w-[190px]">
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">质量</label>
+                  <div class="grid grid-cols-4 gap-2">
+                    <button v-for="option in qualityOptions" :key="option.value" type="button" class="studio-button h-9 rounded-xl border text-[13px] font-medium" :class="option.value === imageQuality ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300'" @click="imageQuality = option.value">{{ option.label }}</button>
+                  </div>
+                  <label class="mt-2 inline-flex h-10 items-center gap-2 rounded-xl border border-black/[0.06] bg-white px-3 text-[13px] font-medium text-slate-700 dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200" :class="canPreserve ? 'cursor-pointer' : 'cursor-not-allowed opacity-55'">
+                    <input v-model="preserveSubject" type="checkbox" class="size-4 accent-[#4F7CFF]" :disabled="!canPreserve" />
+                    <ShieldCheck class="size-4" />
+                    主体保真
+                  </label>
+                </div>
+              </div>
+
+              <div v-else-if="openSettingCard === 'canvas'" id="composer-canvas-card-panel" class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+                <div>
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">画布比例</label>
+                  <div class="grid grid-cols-3 gap-2 sm:grid-cols-7">
+                    <button v-for="option in aspectOptions" :key="`${option.ratio}-${option.tier}-${option.label}`" type="button" class="studio-button flex h-[58px] flex-col items-center justify-center gap-1 rounded-xl border text-[13px] font-medium" :class="option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300'" @click="setAspect(option)">
+                      <component :is="option.icon" class="size-4" />
+                      <span>{{ option.label }}</span>
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">自定义尺寸</label>
+                  <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                    <input v-model="imageWidth" type="number" min="1" class="studio-input h-10 px-3 text-center" />
+                    <span class="text-sm text-slate-400">x</span>
+                    <input v-model="imageHeight" type="number" min="1" class="studio-input h-10 px-3 text-center" />
+                  </div>
+                </div>
+              </div>
+
+              <div v-else-if="openSettingCard === 'count'" id="composer-count-card-panel" class="max-w-[360px]">
+                <label class="mb-2 block text-xs font-semibold text-slate-500">生成数量</label>
+                <div class="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                  <button v-for="value in countOptions" :key="value" type="button" class="studio-button h-9 rounded-xl border text-[13px] font-medium" :class="imageCount === value ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300'" @click="imageCount = value">{{ value }} 张</button>
+                </div>
+                <div class="mt-2 flex items-center gap-2">
+                  <input :value="imageCount" type="number" min="1" max="100" aria-label="自定义张数" class="studio-input h-10 max-w-[140px] px-3 text-center" @input="clampCount(($event.target as HTMLInputElement).value)" />
+                  <span class="text-xs text-slate-400">张</span>
+                </div>
+              </div>
+
+              <div v-else-if="openSettingCard === 'more'" id="composer-more-card-panel" class="grid gap-2 sm:grid-cols-3">
+                <button
+                  v-for="item in assistOptions"
+                  :key="item.action"
+                  type="button"
+                  class="composer-more-action"
+                  :disabled="!hasReferences || Boolean(promptAssistAction)"
+                  @click="runPromptAssist(item.action)"
+                >
+                  <Sparkles class="size-4" :class="promptAssistAction === item.action ? 'ai-orbit' : ''" />
+                  <span>
+                    <strong>{{ item.label }}</strong>
+                    <small>{{ item.description }}</small>
+                  </span>
+                </button>
+              </div>
+            </div>
+          </Transition>
         </div>
         <button type="button" class="studio-button inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl bg-slate-950 px-5 text-[15px] font-semibold text-white shadow-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none dark:bg-white dark:text-slate-950 dark:hover:bg-stone-100 dark:disabled:bg-stone-700 dark:disabled:text-stone-400" :disabled="!canSubmit" data-testid="generate-submit-button" @click="emit('submit')">
           <LoaderCircle v-if="isSubmitting" class="size-4 animate-spin" />
@@ -523,49 +578,208 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 0 3px rgb(79 124 255 / 0.14), 0 16px 34px rgb(0 0 0 / 0.24);
 }
 
-.composer-settings {
-  overflow: hidden;
-  transition: border-color 220ms ease, background-color 220ms ease, box-shadow 220ms ease;
+.composer-input-panel {
+  position: relative;
+  z-index: 2;
 }
 
-.composer-settings.is-open {
-  border-color: rgb(79 124 255 / 0.18);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.68);
+.composer-input-panel.is-focused {
+  border-color: rgb(79 124 255 / 0.26);
+  background: rgb(79 124 255 / 0.035);
 }
 
-.composer-settings-trigger {
-  transition: background-color 180ms ease, color 180ms ease;
+.composer-input-panel textarea {
+  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
 }
 
-.composer-settings-trigger:hover,
-.composer-settings-trigger:focus-visible {
-  background: rgb(79 124 255 / 0.055);
-  color: rgb(49 91 232);
-  outline: none;
-}
-
-.composer-settings-panel-enter-active,
-.composer-settings-panel-leave-active {
-  max-height: 720px;
-  opacity: 1;
-  transform: translateY(0);
-  transition:
-    max-height 520ms cubic-bezier(0.16, 1, 0.3, 1),
-    opacity 360ms ease,
-    transform 520ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.composer-settings-panel-enter-from,
-.composer-settings-panel-leave-to {
-  max-height: 0;
-  opacity: 0;
-  transform: translateY(-10px);
+.composer-input-panel.is-focused textarea {
+  border-color: rgb(79 124 255 / 0.36);
+  box-shadow: 0 0 0 3px rgb(79 124 255 / 0.1);
 }
 
 @property --prompt-border-angle {
   syntax: "<angle>";
   inherits: false;
   initial-value: 0deg;
+}
+
+.composer-setting-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  max-width: min(100%, 12.5rem);
+  padding: 0.4rem 0.65rem;
+  border: 1px solid rgb(15 23 42 / 0.06);
+  border-radius: 0.75rem;
+  background: rgb(248 250 252);
+  color: rgb(51 65 85);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: left;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.composer-setting-card:hover,
+.composer-setting-card:focus-visible,
+.composer-setting-card.is-selected,
+.composer-more-button:hover,
+.composer-more-button:focus-visible,
+.composer-more-button.is-selected {
+  border-color: rgb(79 124 255 / 0.32);
+  background: rgb(79 124 255 / 0.08);
+  color: rgb(49 91 232);
+  outline: none;
+}
+
+.composer-setting-card:focus-visible,
+.composer-more-button:focus-visible {
+  box-shadow: 0 0 0 3px rgb(79 124 255 / 0.14);
+}
+
+.composer-setting-card-text {
+  display: grid;
+  min-width: 0;
+  line-height: 1.1;
+}
+
+.composer-setting-card-text span {
+  color: rgb(100 116 139);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.composer-setting-card-text strong {
+  overflow: hidden;
+  max-width: 8.5rem;
+  color: inherit;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-setting-card-panel {
+  position: relative;
+  z-index: 2;
+  overflow: hidden;
+}
+
+.composer-more-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.5rem;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid rgb(15 23 42 / 0.06);
+  border-radius: 0.75rem;
+  background: rgb(255 255 255);
+  color: rgb(71 85 105);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.composer-more-action {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.7rem 0.75rem;
+  border: 1px solid rgb(15 23 42 / 0.06);
+  border-radius: 0.75rem;
+  background: rgb(255 255 255);
+  color: rgb(51 65 85);
+  text-align: left;
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease;
+}
+
+.composer-more-action:hover,
+.composer-more-action:focus-visible {
+  border-color: rgb(79 124 255 / 0.28);
+  background: rgb(79 124 255 / 0.08);
+  color: rgb(49 91 232);
+  outline: none;
+}
+
+.composer-more-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.composer-more-action span {
+  display: grid;
+  min-width: 0;
+  gap: 0.15rem;
+}
+
+.composer-more-action strong {
+  font-size: 0.82rem;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.composer-more-action small {
+  overflow: hidden;
+  color: rgb(100 116 139);
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-setting-card-panel-enter-active,
+.composer-setting-card-panel-leave-active {
+  max-height: 320px;
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    max-height 260ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 180ms ease,
+    transform 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.composer-setting-card-panel-enter-from,
+.composer-setting-card-panel-leave-to {
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-6px);
+}
+
+.dark .composer-setting-card {
+  border-color: rgb(255 255 255 / 0.1);
+  background: rgb(255 255 255 / 0.06);
+  color: rgb(231 229 228);
+}
+
+.dark .composer-setting-card:hover,
+.dark .composer-setting-card:focus-visible,
+.dark .composer-setting-card.is-selected,
+.dark .composer-more-button:hover,
+.dark .composer-more-button:focus-visible,
+.dark .composer-more-button.is-selected {
+  border-color: rgb(79 124 255 / 0.36);
+  background: rgb(79 124 255 / 0.16);
+  color: rgb(191 219 254);
+}
+
+.dark .composer-more-button,
+.dark .composer-more-action {
+  border-color: rgb(255 255 255 / 0.1);
+  background: rgb(255 255 255 / 0.06);
+  color: rgb(231 229 228);
+}
+
+.dark .composer-more-action:hover,
+.dark .composer-more-action:focus-visible {
+  border-color: rgb(79 124 255 / 0.36);
+  background: rgb(79 124 255 / 0.16);
+  color: rgb(191 219 254);
+}
+
+.dark .composer-more-action small {
+  color: rgb(168 162 158);
 }
 
 @keyframes prompt-border-orbit {
@@ -595,13 +809,13 @@ onBeforeUnmount(() => {
     animation: none;
   }
 
-  .composer-settings-panel-enter-active,
-  .composer-settings-panel-leave-active {
+  .composer-setting-card-panel-enter-active,
+  .composer-setting-card-panel-leave-active {
     transition: opacity 120ms ease;
   }
 
-  .composer-settings-panel-enter-from,
-  .composer-settings-panel-leave-to {
+  .composer-setting-card-panel-enter-from,
+  .composer-setting-card-panel-leave-to {
     transform: none;
   }
 }

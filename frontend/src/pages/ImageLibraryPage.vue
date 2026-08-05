@@ -20,6 +20,7 @@ import { toast } from "vue-sonner";
 import BaseModal from "@/components/BaseModal.vue";
 import {
   bulkDeleteImageLibraryItems,
+  downloadImageLibraryItem,
   downloadImageLibraryZip,
   fetchImageLibrary,
   fetchPromptTemplates,
@@ -43,7 +44,7 @@ const loading = ref(true);
 const query = ref("");
 const selectedTemplateId = ref<number | null>(null);
 const favoriteOnly = ref(false);
-const viewScope = ref<"mine" | "all" | "owner">("mine");
+const viewScope = ref<"mine" | "all" | "owner">(sessionState.session?.role === "admin" ? "all" : "mine");
 const selectedOwnerId = ref("");
 const selectedItemId = ref<number | null>(null);
 const deleteTarget = ref<ImageLibraryItem | null>(null);
@@ -116,7 +117,7 @@ async function load(page = currentPage.value) {
       productId: 0,
       templateId: selectedTemplateId.value || 0,
       favorite: favoriteOnly.value,
-      allOwners: isAdmin.value && viewScope.value === "all",
+      allOwners: isAdmin.value && (viewScope.value === "all" || viewScope.value === "owner"),
       ownerId: isAdmin.value && viewScope.value === "owner" ? selectedOwnerId.value : "",
     });
     if (currentId !== requestId) return;
@@ -190,10 +191,8 @@ function clearSelection() {
 
 async function download(item: ImageLibraryItem) {
   try {
-    const response = await fetch(item.image_url);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const blob = await response.blob();
-    saveBlob(blob, `image-${item.id}.png`);
+    const { blob, filename } = await downloadImageLibraryItem(item.id);
+    saveBlob(blob, filename || `image-${item.id}.png`);
   } catch (error) {
     toast.error(error instanceof Error ? error.message : "下载图片失败");
   }
@@ -290,7 +289,13 @@ watch([viewScope, selectedOwnerId], () => {
   void load(1);
 });
 watch(isAdmin, (value) => {
-  if (value) void loadUsers();
+  if (value) {
+    viewScope.value = "all";
+    void loadUsers();
+    void load(1);
+  } else {
+    viewScope.value = "mine";
+  }
 });
 
 onMounted(async () => {
@@ -301,6 +306,7 @@ onMounted(async () => {
     templates.value = [];
   }
   if (isAdmin.value) {
+    viewScope.value = "all";
     await loadUsers();
   }
   await load(1);

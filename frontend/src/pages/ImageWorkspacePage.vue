@@ -23,8 +23,6 @@ const {
   imageQuality,
   imageModel,
   imageModels,
-  promptTemplates,
-  selectedTemplateId,
   referenceImages,
   batchProductImage,
   batchFolderImages,
@@ -69,6 +67,16 @@ function scrollLatest(behavior: ScrollBehavior = "smooth") {
   if (!element) return;
   element.scrollTo({ top: element.scrollHeight, behavior });
   showScrollLatest.value = false;
+}
+async function focusPromptInput() {
+  await nextTick();
+  const input = document.querySelector<HTMLTextAreaElement>('[data-testid="image-prompt-input"]');
+  input?.scrollIntoView({ behavior: "smooth", block: "center" });
+  input?.focus({ preventScroll: true });
+}
+async function applyPromptSuggestion(prompt: string) {
+  imagePrompt.value = prompt;
+  await focusPromptInput();
 }
 
 watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.value?.turns.length], async () => {
@@ -129,6 +137,8 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
               :format-conversation-time="workspace.formatConversationTime"
               @open-lightbox="workspace.openLightbox"
               @continue-edit="workspace.continueEdit"
+              @apply-prompt-suggestion="applyPromptSuggestion"
+              @focus-prompt-input="focusPromptInput"
               @delete-prompt="workspace.requestDeletePrompt"
               @delete-results="workspace.requestDeleteResults"
               @reuse-turn-config="workspace.reuseTurnConfig"
@@ -155,10 +165,8 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
             v-model:image-height="imageHeight"
             v-model:image-quality="imageQuality"
             v-model:image-model="imageModel"
-            v-model:selected-template-id="selectedTemplateId"
             v-model:preserve-subject="preserveSubject"
             :image-models="imageModels"
-            :prompt-templates="promptTemplates"
             :available-quota="availableQuota"
             :active-task-count="activeTaskCount"
             :reference-images="referenceImages"
@@ -172,6 +180,7 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
             @pick-batch-product="workspace.pickBatchProduct"
             @pick-batch-folder="workspace.pickBatchFolder"
             @clear-batch="workspace.clearBatch"
+            @open-lightbox="workspace.openLightbox"
           />
         </div>
       </div>

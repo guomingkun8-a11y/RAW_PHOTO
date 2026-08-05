@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, create_engine, inspect, text
+from sqlalchemy import BigInteger, Column, DateTime, Integer, MetaData, String, Table, Text, create_engine, inspect, text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
@@ -216,6 +216,33 @@ def _apply_image_conversation_schema(engine: Engine) -> None:
                 pass
 
 
+def _apply_system_announcement_schema(engine: Engine) -> None:
+    metadata = MetaData()
+    Table(
+        "system_announcements",
+        metadata,
+        Column("id", BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True),
+        Column("title", String(191), nullable=False),
+        Column("content", Text().with_variant(LONGTEXT, "mysql"), nullable=False),
+        Column("announcement_type", String(32), nullable=False),
+        Column("enabled", Integer, nullable=False),
+        Column("created_by", String(191), nullable=False),
+        Column("created_at", DateTime, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
+    )
+    metadata.create_all(engine)
+    statements = [
+        "CREATE INDEX idx_system_announcements_enabled_created ON system_announcements (enabled, created_at)",
+        "CREATE INDEX idx_system_announcements_created_id ON system_announcements (created_at, id)",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
 MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("001_base_schema", _apply_base_schema),
     ("002_image_task_batch_columns", _apply_image_task_columns),
@@ -225,6 +252,7 @@ MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("006_operational_indexes", _apply_operational_indexes),
     ("007_relational_constraints", _apply_relational_constraints),
     ("008_image_conversation_schema", _apply_image_conversation_schema),
+    ("009_system_announcement_schema", _apply_system_announcement_schema),
 )
 
 

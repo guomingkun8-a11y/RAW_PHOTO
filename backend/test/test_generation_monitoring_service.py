@@ -97,6 +97,46 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
             finally:
                 service.engine.dispose()
 
+    def test_retry_failures_share_one_failure_report(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = GenerationMonitoringService(f"sqlite:///{Path(tmp_dir) / 'monitoring.db'}")
+            try:
+                service.report_frontend_failure(
+                    identity={"id": "user-1"},
+                    task_id="task-original",
+                    failure_report_id="image-slot-1",
+                    error="upstream failed",
+                    image_count=1,
+                    mode="generate",
+                    model="gpt-image-2",
+                )
+                service.report_frontend_failure(
+                    identity={"id": "user-1"},
+                    task_id="task-retry",
+                    failure_report_id="image-slot-1",
+                    error="upstream failed again",
+                    image_count=1,
+                    mode="generate",
+                    model="gpt-image-2",
+                )
+
+                with service.engine.begin() as connection:
+                    failed_count = connection.execute(
+                        text(
+                            "SELECT SUM(image_count) FROM generation_task_events "
+                            "WHERE status = 'error' AND failure_reported_at IS NOT NULL"
+                        )
+                    ).scalar_one()
+                    rows = connection.execute(
+                        text("SELECT task_id FROM generation_task_events WHERE owner_id = :owner_id"),
+                        {"owner_id": "user-1"},
+                    ).mappings().all()
+
+                self.assertEqual(failed_count, 1)
+                self.assertEqual([row["task_id"] for row in rows], ["image-slot-1"])
+            finally:
+                service.engine.dispose()
+
     def test_summary_merges_queue_activity_and_failure_stats(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = GenerationMonitoringService(f"sqlite:///{Path(tmp_dir) / 'monitoring.db'}")
@@ -133,6 +173,7 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
                         text(
                             "CREATE TABLE generated_images ("
                             "owner_id TEXT NOT NULL, "
+                            "task_id TEXT NOT NULL, "
                             "deleted_at TEXT NULL)"
                         )
                     )
@@ -165,8 +206,11 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
                         },
                     )
                     connection.execute(
-                        text("INSERT INTO generated_images (owner_id, deleted_at) VALUES (:owner_id, :deleted_at)"),
-                        {"owner_id": "user-1", "deleted_at": None},
+                        text(
+                            "INSERT INTO generated_images (owner_id, task_id, deleted_at) "
+                            "VALUES (:owner_id, :task_id, :deleted_at)"
+                        ),
+                        {"owner_id": "user-1", "task_id": "task-success-1", "deleted_at": None},
                     )
 
                 service.record_task_event(
@@ -236,7 +280,7 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
 
                 self.assertEqual(summary["online_users"], 1)
                 self.assertEqual(summary["active_sessions"], 1)
-                self.assertEqual(summary["total_success"], 1)
+                self.assertEqual(summary["total_success"], 2)
                 self.assertEqual(summary["total_failed"], 2)
                 self.assertEqual(summary["task_queue"]["queue_depth"], 5)
                 self.assertEqual(summary["task_queue"]["total_concurrency"], 4)

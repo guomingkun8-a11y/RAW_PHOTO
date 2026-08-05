@@ -176,6 +176,22 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(stored.url, f"https://cdn.example.test/images/{stored.rel}")
 
+    def test_both_mode_keeps_local_copy_when_remote_is_incomplete(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "both",
+            "provider": "minio",
+            "minio_endpoint": "https://oss-cn-beijing.aliyuncs.com",
+            "minio_bucket": "raw-photo",
+            "public_base_url": "https://cdn.example.test/images",
+        })
+
+        stored = self.service().save(png_bytes(), "http://app.test")
+
+        self.assertEqual(stored.storage, "local")
+        self.assertTrue((self.images_dir / stored.rel).is_file())
+        self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+
     def test_task_asset_is_stored_under_private_namespace_and_hidden_from_library(self):
         stored = self.service().save_task_asset(
             png_bytes(),

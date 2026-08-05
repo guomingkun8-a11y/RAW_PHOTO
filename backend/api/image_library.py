@@ -14,6 +14,7 @@ from api.image_inputs import _download_image_url
 from api.support import require_identity, resolve_image_base_url
 from services.image_library_service import image_library_service
 from services.image_storage_service import image_storage_service
+from services.image_task_service import image_task_service
 
 ZIP_MAX_ITEM_BYTES = 50 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024
@@ -48,6 +49,15 @@ def _zip_content_disposition(filename: str) -> str:
     if ascii_name != filename:
         ascii_name = "GMKRAW-Image-Library.zip"
     fallback = _zip_safe_name(ascii_name, "GMKRAW-Image-Library.zip")
+    encoded = quote(filename, safe="")
+    return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
+
+
+def _image_content_disposition(filename: str) -> str:
+    ascii_name = filename.encode("ascii", errors="ignore").decode("ascii")
+    if ascii_name != filename:
+        ascii_name = "GMKRAW-Image.png"
+    fallback = _zip_safe_name(ascii_name, "GMKRAW-Image.png")
     encoded = quote(filename, safe="")
     return f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
@@ -137,6 +147,27 @@ def _download_library_zip_payload(identity: dict[str, object], base_url: str, bo
         raise
 
 
+def _download_library_item_payload(identity: dict[str, object], base_url: str, image_id: int):
+    items = image_library_service.list_images_by_ids(
+        identity=identity,
+        base_url=base_url,
+        image_ids=[image_id],
+    )
+    if not items:
+        raise ValueError("image not found")
+    item = items[0]
+    image_bytes, content_type, source_name = _library_image_payload(item)
+    if not image_bytes:
+        raise ValueError("image is empty")
+    if len(image_bytes) > ZIP_MAX_ITEM_BYTES:
+        raise ValueError("image exceeds download limit")
+    prompt = str(item.get("prompt") or item.get("revised_prompt") or "").strip()
+    raw_name = _zip_safe_name(prompt[:40], f"image-{item.get('id') or image_id}")
+    stem = raw_name.rsplit(".", 1)[0] if "." in raw_name else raw_name
+    ext = _image_ext_from_content_type(content_type, source_name)
+    return image_bytes, content_type or "application/octet-stream", f"{stem}-{item.get('id') or image_id}.{ext}"
+
+
 def _stream_zip_payload(payload):
     try:
         while True:
@@ -146,6 +177,39 @@ def _stream_zip_payload(payload):
             yield chunk
     finally:
         payload.close()
+
+
+def _list_image_library(
+    identity: dict[str, object],
+    base_url: str,
+    limit: int,
+    offset: int,
+    cursor_created_at: str,
+    cursor_id: int,
+    query_text: str,
+    product_id: int,
+    template_id: int,
+    favorite: bool,
+    include_deleted: bool,
+    all_owners: bool,
+    owner_id: str,
+):
+    image_task_service.sync_successful_library_results(identity, base_url)
+    return image_library_service.list_images(
+        identity=identity,
+        base_url=base_url,
+        limit=limit,
+        offset=offset,
+        cursor_created_at=cursor_created_at,
+        cursor_id=cursor_id,
+        query_text=query_text,
+        product_id=product_id,
+        template_id=template_id,
+        favorite_only=favorite,
+        include_deleted=include_deleted,
+        include_all_owners=all_owners,
+        owner_id_filter=owner_id,
+    )
 
 
 def create_router() -> APIRouter:
@@ -168,21 +232,22 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        base_url = resolve_image_base_url(request)
         return await run_in_threadpool(
-            image_library_service.list_images,
-            identity=identity,
-            base_url=resolve_image_base_url(request),
-            limit=limit,
-            offset=offset,
-            cursor_created_at=cursor_created_at,
-            cursor_id=cursor_id,
-            query_text=q,
-            product_id=product_id,
-            template_id=template_id,
-            favorite_only=favorite,
-            include_deleted=include_deleted,
-            include_all_owners=all_owners,
-            owner_id_filter=owner_id,
+            _list_image_library,
+            identity,
+            base_url,
+            limit,
+            offset,
+            cursor_created_at,
+            cursor_id,
+            q,
+            product_id,
+            template_id,
+            favorite,
+            include_deleted,
+            all_owners,
+            owner_id,
         )
 
     @router.patch("/api/image-library/{image_id}")
@@ -237,6 +302,29 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         headers = {"Content-Disposition": _zip_content_disposition(filename)}
         return StreamingResponse(_stream_zip_payload(payload), media_type="application/zip", headers=headers)
+
+    @router.get("/api/image-library/{image_id}/download")
+    async def download_image_library_item(
+        image_id: int,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            image_bytes, content_type, filename = await run_in_threadpool(
+                _download_library_item_payload,
+                identity,
+                resolve_image_base_url(request),
+                image_id,
+            )
+        except ValueError as exc:
+            status_code = 404 if "not found" in str(exc).lower() else 400
+            raise HTTPException(status_code=status_code, detail={"error": str(exc)}) from exc
+        headers = {
+            "Content-Disposition": _image_content_disposition(filename),
+            "Content-Length": str(len(image_bytes)),
+        }
+        return StreamingResponse(iter([image_bytes]), media_type=content_type, headers=headers)
 
     @router.get("/api/image-library/health")
     async def image_library_health(authorization: str | None = Header(default=None)):

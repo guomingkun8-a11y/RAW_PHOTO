@@ -27,6 +27,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "006_operational_indexes",
                 "007_relational_constraints",
                 "008_image_conversation_schema",
+                "009_system_announcement_schema",
             ])
             self.assertEqual(second["applied_now"], [])
             self.assertEqual(status["pending"], [])
@@ -42,6 +43,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertIn("image_task_batches", tables)
                 self.assertIn("image_conversations", tables)
                 self.assertIn("reference_image_assets", tables)
+                self.assertIn("system_announcements", tables)
                 image_task_indexes = {
                     item["name"]
                     for item in inspect(engine).get_indexes("image_tasks")

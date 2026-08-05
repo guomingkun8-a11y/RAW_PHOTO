@@ -319,6 +319,67 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs["params"], {"task_id": "12345"})
         self.assertEqual(progress_steps, ["image_stream_resolve_start"])
 
+    def test_seedream_image_model_uses_media_task_api(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "seedream-task"}}),
+            ) as post,
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                return_value=FakeResponse(payload={"data": {"is_final": True, "status": "success", "result_url": "https://cdn.example.test/seedream.png"}}),
+            ),
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "doubao-seedream-5-0-pro-260628",
+                "prompt": "cat",
+                "size": "1024x1536",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/seedream.png")
+        self.assertEqual(post.call_args.args[0], "https://relay.example/v1/media/generate")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "doubao-seedream-5-0-pro-260628")
+        self.assertEqual(post.call_args.kwargs["json"]["params"]["aspectRatio"], "2:3")
+
+    def test_relay_media_image_models_use_media_task_api(self):
+        models = [
+            "vidu-image-2",
+            "mj_imagine",
+            "wan2.7-image",
+            "kling-v3-omni",
+            "qwen-image",
+            "kling-v3",
+            "wan2.6-image",
+            "kling-image-o1",
+        ]
+        for model in models:
+            with self.subTest(model=model):
+                with (
+                    mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+                    mock.patch.object(
+                        openai_relay_service.requests,
+                        "post",
+                        return_value=FakeResponse(payload={"code": 200, "data": {"task_id": f"{model}-task"}}),
+                    ) as post,
+                    mock.patch.object(
+                        openai_relay_service.requests,
+                        "get",
+                        return_value=FakeResponse(payload={"data": {"is_final": True, "status": "success", "result_url": f"https://cdn.example.test/{model}.png"}}),
+                    ),
+                ):
+                    result = openai_relay_service.image_generations({
+                        "model": model,
+                        "prompt": "cat",
+                        "size": "1024x1024",
+                    })
+
+                self.assertEqual(result["data"][0]["url"], f"https://cdn.example.test/{model}.png")
+                self.assertEqual(post.call_args.args[0], "https://relay.example/v1/media/generate")
+                self.assertEqual(post.call_args.kwargs["json"]["model"], model)
+
     def test_media_image_edit_uses_reference_urls(self):
         with (
             mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),

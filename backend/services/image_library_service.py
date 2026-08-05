@@ -115,6 +115,13 @@ def _image_url(base_url: str, rel: str, existing_url: str = "") -> str:
     return f"{base_url.rstrip('/')}/images/{safe_rel}"
 
 
+def _thumbnail_url(base_url: str, rel: str, existing_url: str = "") -> str:
+    safe_rel = _clean(rel)
+    if safe_rel:
+        return thumbnail_url(base_url, safe_rel)
+    return _clean(existing_url)
+
+
 def _dimensions_from_path(rel: str) -> tuple[int | None, int | None]:
     if not rel:
         return None, None
@@ -178,10 +185,13 @@ def _store_result_image(item: dict[str, Any], base_url: str) -> tuple[str, str, 
                 file_size = None
         return rel, url, storage, width, height, file_size
 
-    payload = _download_image(url)
-    stored = image_storage_service.save(payload, base_url)
-    width, height = _dimensions_from_path(stored.rel)
-    return stored.rel, stored.url, stored.storage, width, height, stored.size
+    try:
+        payload = _download_image(url)
+        stored = image_storage_service.save(payload, base_url)
+        width, height = _dimensions_from_path(stored.rel)
+        return stored.rel, stored.url, stored.storage, width, height, stored.size
+    except Exception:
+        return "", url, "remote", None, None, None
 
 
 class ImageLibraryService:
@@ -353,7 +363,7 @@ class ImageLibraryService:
                 row.quality = _clean(task.get("quality")) or None
                 row.image_rel = image_rel
                 row.image_url = image_url
-                row.thumbnail_url = thumbnail_url(base_url, image_rel)
+                row.thumbnail_url = _thumbnail_url(base_url, image_rel, image_url)
                 row.width = width
                 row.height = height
                 row.file_size = file_size
@@ -365,6 +375,21 @@ class ImageLibraryService:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    def has_task_result(self, task_id: str) -> bool:
+        normalized_task_id = _clean(task_id)
+        if not normalized_task_id:
+            return False
+        session = self._session()
+        try:
+            return bool(
+                session.query(self.Model.id)
+                .filter(self.Model.task_id == normalized_task_id)
+                .limit(1)
+                .first()
+            )
         finally:
             session.close()
 
@@ -387,8 +412,8 @@ class ImageLibraryService:
     ) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "local-admin"
         is_admin = _clean(identity.get("role")) == "admin"
-        all_owners = is_admin and include_all_owners
         requested_owner_id = _clean(owner_id_filter)
+        all_owners = is_admin and (include_all_owners or bool(requested_owner_id))
         session = self._session()
         Model = self.Model
         try:
@@ -565,7 +590,7 @@ class ImageLibraryService:
     @staticmethod
     def _public_item(row: Any, base_url: str) -> dict[str, Any]:
         image_url = _image_url(base_url, row.image_rel, row.image_url)
-        thumbnail = thumbnail_url(base_url, row.image_rel) if row.image_rel else _clean(row.thumbnail_url)
+        thumbnail = _thumbnail_url(base_url, row.image_rel, row.thumbnail_url or image_url)
         return {
             "id": row.id,
             "task_id": row.task_id,
