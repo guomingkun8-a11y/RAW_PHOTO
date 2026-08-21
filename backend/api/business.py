@@ -5,7 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.support import require_identity, resolve_image_base_url
-from services.business_service import business_service
+from services.accounts.business_service import business_service
 
 
 class ProductPayload(BaseModel):
@@ -164,8 +164,7 @@ def create_router() -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
-    @router.patch("/api/prompt-templates/{template_id}")
-    async def update_prompt_template(
+    async def _update_prompt_template(
         template_id: int,
         body: PromptTemplateUpdatePayload,
         authorization: str | None = Header(default=None),
@@ -184,8 +183,26 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "template not found"})
         return item
 
-    @router.delete("/api/prompt-templates/{template_id}")
-    async def disable_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
+    @router.patch("/api/prompt-templates/{template_id}")
+    async def update_prompt_template(
+        template_id: int,
+        body: PromptTemplateUpdatePayload,
+        authorization: str | None = Header(default=None),
+    ):
+        return await _update_prompt_template(template_id, body, authorization)
+
+    # Keep compatibility with clients that sent a legacy parent/template ID pair.
+    @router.patch("/api/prompt-templates/{legacy_scope_id}/{template_id}")
+    async def update_prompt_template_legacy(
+        legacy_scope_id: int,
+        template_id: int,
+        body: PromptTemplateUpdatePayload,
+        authorization: str | None = Header(default=None),
+    ):
+        del legacy_scope_id
+        return await _update_prompt_template(template_id, body, authorization)
+
+    async def _disable_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         item = await run_in_threadpool(
             business_service.update_template,
@@ -196,6 +213,20 @@ def create_router() -> APIRouter:
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "template not found"})
         return item
+
+    @router.delete("/api/prompt-templates/{template_id}")
+    async def disable_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
+        return await _disable_prompt_template(template_id, authorization)
+
+    # Keep compatibility with clients that sent a legacy parent/template ID pair.
+    @router.delete("/api/prompt-templates/{legacy_scope_id}/{template_id}")
+    async def disable_prompt_template_legacy(
+        legacy_scope_id: int,
+        template_id: int,
+        authorization: str | None = Header(default=None),
+    ):
+        del legacy_scope_id
+        return await _disable_prompt_template(template_id, authorization)
 
     @router.get("/api/audit-logs")
     async def list_audit_logs(limit: int = Query(default=100, ge=1, le=500), authorization: str | None = Header(default=None)):

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from services.user_service import DEFAULT_ADMIN_ID, UserService, UserSessionModel
+from services.accounts.user_service import DEFAULT_ADMIN_ID, UserService, UserSessionModel
 
 
 class UserServiceTests(unittest.TestCase):
@@ -34,7 +34,7 @@ class UserServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             avatar_dir = Path(tmp_dir) / "avatars"
             database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
-            with mock.patch("services.user_service.AVATAR_DIR", avatar_dir):
+            with mock.patch("services.accounts.user_service.AVATAR_DIR", avatar_dir):
                 service = UserService(database_url)
                 identity, _token = service.register_user(
                     username="avatar-user",
@@ -69,7 +69,7 @@ class UserServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             avatar_dir = Path(tmp_dir) / "avatars"
             database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
-            with mock.patch("services.user_service.AVATAR_DIR", avatar_dir):
+            with mock.patch("services.accounts.user_service.AVATAR_DIR", avatar_dir):
                 service = UserService(database_url)
                 identity, _token = service.register_user(
                     username="bad-avatar-user",

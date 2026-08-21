@@ -11,10 +11,10 @@ from typing import Any, Iterable, Iterator
 
 import tiktoken
 
-from services.account_service import account_service
-from services.config import config
-from services.image_storage_service import image_storage_service
-from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+from services.accounts.account_service import account_service
+from services.platform.config import config
+from services.image.image_storage_service import image_storage_service
+from services.providers.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
     extract_image_from_message_content,

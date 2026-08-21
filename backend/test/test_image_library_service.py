@@ -10,7 +10,7 @@ from unittest import mock
 from PIL import Image
 from sqlalchemy import text
 
-import services.image_library_service as image_library_service
+import services.image.image_library_service as image_library_service
 
 
 class ImageLibraryServiceTests(unittest.TestCase):

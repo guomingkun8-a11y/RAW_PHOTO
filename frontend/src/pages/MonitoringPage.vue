@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowDownUp,
   ArrowUp,
+  Bot,
   CloudUpload,
   Gauge,
   RefreshCw,
@@ -20,6 +21,7 @@ import { toast } from "vue-sonner";
 import {
   fetchMonitoringSummary,
   type MonitoringLatencySummary,
+  type MonitoringAgentQueueSummary,
   type MonitoringQueueSummary,
   type MonitoringSummary,
   type MonitoringUserStat,
@@ -135,6 +137,7 @@ async function load(silent = false) {
 }
 
 const queue = computed<MonitoringQueueSummary | null>(() => summary.value?.task_queue || null);
+const agentQueue = computed<MonitoringAgentQueueSummary | null>(() => summary.value?.agent_queue || null);
 const latency = computed<MonitoringLatencySummary | null>(() => summary.value?.task_latency || null);
 const stageLatency = computed(() => summary.value?.stage_latency || null);
 
@@ -223,6 +226,27 @@ const compactQueueMetrics = computed(() =>
     : [],
 );
 
+const agentQueueState = computed(() => {
+  const data = agentQueue.value;
+  if (!data?.enabled) return { label: "未启用", tone: "text-slate-500 bg-slate-100 dark:bg-white/[0.06]" };
+  if (data.available === false) return { label: "不可用", tone: "text-rose-700 bg-rose-50 dark:bg-rose-400/10 dark:text-rose-300" };
+  if ((data.lag || 0) > 0 || (data.pending || 0) > 0) {
+    return { label: "处理中", tone: "text-amber-700 bg-amber-50 dark:bg-amber-400/10 dark:text-amber-300" };
+  }
+  return { label: "正常", tone: "text-emerald-700 bg-emerald-50 dark:bg-emerald-400/10 dark:text-emerald-300" };
+});
+
+const agentQueueMetrics = computed(() => {
+  const data = agentQueue.value;
+  if (!data) return [];
+  return [
+    { label: "等待", value: formatNumber(data.lag || 0) },
+    { label: "执行中", value: formatNumber(data.active || 0) },
+    { label: "Worker", value: formatNumber(data.activeWorkers || 0) },
+    { label: "并发", value: `${formatNumber(data.active || 0)}/${formatNumber(data.totalConcurrency || 0)}` },
+  ];
+});
+
 const stageMetrics = computed(() => {
   const stages = stageLatency.value;
   if (!stages) return [];
@@ -301,6 +325,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
               </div>
               <p class="mt-1 max-w-2xl text-[13px] leading-5 text-slate-500">
                 {{ queueState.detail }}。{{ queue?.executor || "inline" }} 模式，worker {{ formatNumber(queue?.active_workers || 0) }}，心跳 {{ formatNumber(queue?.worker_heartbeat_secs || 0) }}s。
+                <span v-if="queue?.queue_depths">标准 {{ formatNumber(queue.queue_depths.standard || 0) }} / 智能体 {{ formatNumber(queue.queue_depths.agent || 0) }} / 批量 {{ formatNumber(queue.queue_depths.batch || 0) }}。</span>
               </p>
             </div>
             <div class="text-right text-xs text-slate-500">
@@ -319,6 +344,33 @@ onBeforeUnmount(() => window.clearInterval(timer));
               <p class="text-[11px] font-medium opacity-80">{{ item.label }}</p>
               <p class="mt-1 text-xl font-semibold leading-none">{{ item.value }}</p>
             </div>
+          </div>
+
+          <div v-if="agentQueue" class="mt-4 border-t border-black/[0.06] pt-4 dark:border-white/10">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="flex min-w-0 items-start gap-2.5">
+                <Bot class="mt-0.5 size-4 shrink-0 text-[#4F7CFF]" />
+                <div class="min-w-0">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <h3 class="text-[14px] font-semibold text-slate-900 dark:text-stone-100">智能体队列</h3>
+                    <span class="rounded-md px-2 py-0.5 text-[11px] font-semibold" :class="agentQueueState.tone">
+                      {{ agentQueueState.label }}
+                    </span>
+                  </div>
+                  <p class="mt-1 text-[12px] leading-5 text-slate-500 dark:text-stone-400">
+                    <template v-if="agentQueue.available === false">{{ agentQueue.error || "Redis 队列不可用" }}</template>
+                    <template v-else>单用户并发 {{ formatNumber(agentQueue.ownerConcurrency || 0) }}，单用户最多等待 {{ formatNumber(agentQueue.ownerPendingLimit || 0) }} 个任务。</template>
+                  </p>
+                </div>
+              </div>
+              <span v-if="agentQueue.queue" class="max-w-full truncate font-mono text-[11px] text-slate-400">{{ agentQueue.queue }}</span>
+            </div>
+            <dl v-if="agentQueueMetrics.length" class="mt-3 grid grid-cols-2 border-y border-black/[0.06] dark:border-white/10 sm:grid-cols-4">
+              <div v-for="(item, index) in agentQueueMetrics" :key="item.label" class="px-3 py-2.5" :class="index ? 'border-l border-black/[0.06] dark:border-white/10' : ''">
+                <dt class="text-[11px] text-slate-500 dark:text-stone-400">{{ item.label }}</dt>
+                <dd class="mt-0.5 text-[17px] font-semibold tabular-nums text-slate-950 dark:text-stone-50">{{ item.value }}</dd>
+              </div>
+            </dl>
           </div>
 
           <div class="mt-4 border-t border-black/[0.06] pt-3 dark:border-white/10">

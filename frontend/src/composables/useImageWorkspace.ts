@@ -3,16 +3,27 @@ import { toast } from "vue-sonner";
 
 import {
   cancelImageTask,
+  cancelAgentRun,
   createImageEditTask,
   createImageGenerationTask,
+  fetchAgentRun,
   fetchImageTasks,
   fetchModels,
   fetchSettingsConfig,
   preuploadImageReferences,
+  retryAgentBatchItem as retryAgentBatchItemRemote,
   reportImageFailure,
   resumeImagePoll,
+  startImageAgentRun,
+  streamAgentRunEvents,
+  uploadAgentFolder,
+  type AgentEvent,
+  type AgentFolderAsset,
+  type AgentRun,
   type ImageModel,
   type ImageTask,
+  type ProfessionalSceneType,
+  type PromptEngineMode,
   type ReferenceUploadItem,
   type SettingsConfig,
 } from "@/lib/api";
@@ -20,6 +31,7 @@ import { BUILTIN_IMAGE_MODELS, filterImageModels, formatImageModel, isImageModel
 import {
   clearImageConversations,
   deleteImageConversation,
+  deleteImageConversations,
   getImageConversationStats,
   listImageConversations,
   renameImageConversation,
@@ -29,6 +41,7 @@ import {
   type ImageBatchReplacePlan,
   type ImageConversation,
   type ImageConversationMode,
+  type ImagePromptEngineMetadata,
   type ImageTurn,
   type StoredImage,
   type StoredReferenceImage,
@@ -41,6 +54,8 @@ const IMAGE_TIER_STORAGE_KEY = "gmkraw:image_last_tier";
 const IMAGE_QUALITY_STORAGE_KEY = "gmkraw:image_last_quality";
 const IMAGE_MODEL_STORAGE_KEY = "gmkraw:image_last_model";
 const PRESERVE_SUBJECT_STORAGE_KEY = "gmkraw:image_preserve_subject";
+const PROMPT_ENGINE_MODE_STORAGE_KEY = "gmkraw:prompt_engine_mode";
+const LONG_TERM_MEMORY_STORAGE_PREFIX = "gmkraw:agent_long_term_memory";
 const IMAGE_COUNT_STORAGE_KEY = "gmkraw:image_last_count";
 const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "gmkraw:image_count_default_one_applied";
 const DEFAULT_IMAGE_COUNT = "1";
@@ -61,6 +76,7 @@ const BATCH_REPLACE_BASE_PROMPT = [
 const HIGH_RISK_CLAIM_REPLACEMENTS: Array<[RegExp, string]> = [
   [/杀菌率\s*99(?:\.\d+)?\s*%?/gi, "清洁表现"],
   [/99(?:\.\d+)?\s*%?\s*杀菌率?/gi, "清洁表现"],
+  [/(?:百分之\s*(?:100|99(?:\.\d+)?|百|一百|九十九)|(?:100|99(?:\.\d+)?)\s*%|百分百)/gi, "高比例"],
   [/杀灭细菌|灭活病毒|抗病毒|医用级|医疗级|消毒|杀菌|医用/gi, "清洁护理"],
   [/使用前后(?:变化|对比|差异|效果)?/gi, "不同使用状态展示"],
   [/清洁前后/gi, "清洁场景展示"],
@@ -68,21 +84,27 @@ const HIGH_RISK_CLAIM_REPLACEMENTS: Array<[RegExp, string]> = [
   [/虚假(?:榜单|排名|测评结论|用户评价|销量)|虚构(?:榜单|排名|测评结论|用户评价|销量)/gi, "虚构商业背书"],
   [/医疗(?:承诺|背书|认证)?/gi, "医疗相关承诺"],
 ];
-const IMAGE_PROMPT_COMPLIANCE_GUARD = "合规约束：画面文字只保留中性产品信息；不要生成医疗、消杀、抗微生物、病毒相关或等级背书类宣传内容，不要新增承诺徽章、百分比承诺或认证标识。";
+const IMAGE_PROMPT_COMPLIANCE_GUARD = "合规约束：画面文字可以围绕商品信息、包装特征、卖点和用户痛点做中性电商表达；不要生成百分百、100%、99%、百分之九十九等绝对化或百分比承诺，不要生成医疗、消杀、抗微生物、病毒相关、等级背书、认证标识或虚假承诺徽章。";
 const IMAGE_PROMPT_COMPLIANCE_MARKER = "合规约束：";
 const IMAGE_LAYOUT_GUARD_PREFIX = "画面结构约束：";
 const IMAGE_SINGLE_LAYOUT_GUARD = `${IMAGE_LAYOUT_GUARD_PREFIX}只生成一张完整独立图片，只展示一个主场景，不要拼图、不要分屏、不要九宫格、不要多面板，不要把多个场景或多张成品图合在同一张画布里。`;
 const IMAGE_MULTI_COUNT_DEFAULT = 4;
 const IMAGE_MULTI_COUNT_MAX = 8;
+const AGENT_IMAGE_COUNT_MAX = 20;
+const AGENT_FOLDER_IMAGE_COUNT_MAX = 300;
 
 const activeImageTurnQueueIds = new Set<string>();
+const activeImageAgentIds = new Set<string>();
+const canceledImageAgentTurnIds = new Set<string>();
 const canceledImageTaskIds = new Set<string>();
 const reportedFailureTaskIds = new Set<string>();
 const submittedImageTaskIds = new Set<string>();
 const conversationTaskPersistedAt = new Map<string, number>();
+type AgentReferencePayloadItem = { name: string; type: string; dataUrl?: string; url?: string; role?: "working_canvas" | "product_anchor" | "reference" | string };
 
 type DeleteConfirm =
   | { type: "one"; id: string }
+  | { type: "many"; ids: string[] }
   | { type: "prompt"; conversationId: string; turnId: string }
   | { type: "results"; conversationId: string; turnId: string }
   | { type: "all" };
@@ -118,17 +140,148 @@ function isCanceledFailureReport(report: VisibleFailureReport) {
   ].some((marker) => text.includes(marker));
 }
 
-function clampImageCount(value: string) {
-  return String(Math.min(100, Math.max(1, Math.floor(Number(value) || 1))));
+function clampImageCount(value: string, max = 100) {
+  return String(Math.min(Math.max(1, max), Math.max(1, Math.floor(Number(value) || 1))));
 }
-function parseImageSize(size: string) {
-  const match = size.match(/^(\d+)x(\d+)$/);
+function parseImageSize(size: unknown) {
+  const text = typeof size === "string" ? size : "";
+  const match = text.match(/^(\d+)x(\d+)$/);
   return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
+}
+function inferImageRatio(size: string, fallback = "auto") {
+  const parsed = parseImageSize(size);
+  const width = Number(parsed.width);
+  const height = Number(parsed.height);
+  if (!width || !height) return fallback;
+  const candidates = [
+    { label: "1:1", value: 1 },
+    { label: "2:3", value: 2 / 3 },
+    { label: "3:2", value: 3 / 2 },
+    { label: "3:4", value: 3 / 4 },
+    { label: "4:3", value: 4 / 3 },
+    { label: "4:5", value: 4 / 5 },
+    { label: "5:4", value: 5 / 4 },
+    { label: "9:16", value: 9 / 16 },
+    { label: "16:9", value: 16 / 9 },
+  ];
+  const ratio = width / height;
+  const nearest = candidates.reduce((best, item) => Math.abs(item.value - ratio) < Math.abs(best.value - ratio) ? item : best);
+  return Math.abs(nearest.value - ratio) <= 0.025 ? nearest.label : fallback;
+}
+const IMAGE_SIZE_PRESETS: Record<string, string> = {
+  "1:1": "1024x1024",
+  "2:3": "1024x1536",
+  "3:2": "1536x1024",
+  "3:4": "1024x1365",
+  "4:3": "1365x1024",
+  "4:5": "1024x1280",
+  "5:4": "1280x1024",
+  "9:16": "1088x1920",
+  "16:9": "1920x1088",
+};
+function isNegatedSizeMatch(text: string, start: number) {
+  const prefix = text.slice(Math.max(0, start - 24), start);
+  const boundary = Math.max(...[",", "，", ".", "。", ";", "；", "!", "！", "?", "？"].map((marker) => prefix.lastIndexOf(marker)));
+  const clausePrefix = prefix.slice(boundary + 1);
+  return /(?:不要|不需要|不用|不是|排除|避免|非)\s*(?:使用|采用|选择|设置(?:为|成)?|做成|生成|输出|比例(?:为|是)?|尺寸(?:为|是)?)?\s*$/.test(clausePrefix);
+}
+function ratioToImageSize(widthRatio: number, heightRatio: number) {
+  const preset = IMAGE_SIZE_PRESETS[`${widthRatio}:${heightRatio}`];
+  if (preset) return preset;
+  if (widthRatio <= heightRatio) return `1024x${Math.round(1024 * heightRatio / Math.max(1, widthRatio))}`;
+  return `${Math.round(1024 * widthRatio / Math.max(1, heightRatio))}x1024`;
+}
+function resolveImageSizeFromPrompt(prompt: string, configuredSize: string) {
+  const text = prompt.toLowerCase().replace(/：/g, ":");
+  for (const match of text.matchAll(/(?<!\d)(\d{3,4})\s*[xX×]\s*(\d{3,4})(?!\d)/g)) {
+    if (!isNegatedSizeMatch(text, match.index)) return `${Number(match[1])}x${Number(match[2])}`;
+  }
+  for (const match of text.matchAll(/(?<!\d)(\d{1,2})\s*[:比]\s*(\d{1,2})(?!\d)/g)) {
+    if (!isNegatedSizeMatch(text, match.index)) return ratioToImageSize(Number(match[1]), Number(match[2]));
+  }
+  if (/(?:横版|横图|横向构图|宽图|landscape)/.test(text)) return IMAGE_SIZE_PRESETS["3:2"];
+  if (/(?:竖版|竖图|竖向构图|长图|portrait)/.test(text)) return IMAGE_SIZE_PRESETS["2:3"];
+  const compact = text.replace(/\s+/g, "");
+  const requestsDifferentRatio = [
+    "不要1:1", "不需要1:1", "不用1:1", "不是1:1", "非1:1",
+    "不要一比一", "不要方图", "不是方图", "非正方形",
+    "其他比例", "其它比例", "换个比例", "换一种比例",
+  ].some((marker) => compact.includes(marker));
+  if (!requestsDifferentRatio) return configuredSize;
+  const configured = parseImageSize(configuredSize);
+  return configured.width === configured.height ? IMAGE_SIZE_PRESETS["2:3"] : configuredSize;
 }
 function createId() { return `${Date.now()}-${Math.random().toString(16).slice(2)}`; }
 function imageTurnQueueKey(conversationId: string, turnId: string) { return `${conversationId}:${turnId}`; }
+function mergeAgentEvents(...groups: Array<AgentEvent[] | undefined>) {
+  const bySequence = new Map<number, AgentEvent>();
+  for (const event of groups.flatMap((items) => items || [])) bySequence.set(event.sequence, event);
+  return Array.from(bySequence.values()).sort((left, right) => left.sequence - right.sequence).slice(-160);
+}
+function compactAgentRun(run: AgentRun): AgentRun {
+  const { result, ...runWithoutResult } = run;
+  if (!result?.modelUsage && !result?.optimizationRoute && !result?.turnIntent && !result?.agentExecutionProfile && !result?.promptPlan) return runWithoutResult;
+  const promptPlan = result?.promptPlan || {};
+  return {
+    ...runWithoutResult,
+    result: {
+      promptPlan: {
+        model: promptPlan.model,
+        sceneType: promptPlan.sceneType,
+        sceneName: promptPlan.sceneName,
+        resolvedSize: promptPlan.resolvedSize,
+      },
+      images: [],
+      qualityChecks: [],
+      revisionCount: Number(result.revisionCount || 0),
+      modelUsage: result.modelUsage ? { ...result.modelUsage } : undefined,
+      optimizationRoute: result.optimizationRoute,
+      agentExecutionProfile: result.agentExecutionProfile,
+      turnIntent: result.turnIntent ? { ...result.turnIntent } : undefined,
+    },
+  };
+}
+function hasAgentProposalPages(turn: ImageTurn) {
+  return Boolean(turn.agentProposal?.pages?.length);
+}
+function isAgentImageTurn(turn?: ImageTurn) {
+  return Boolean(turn && (turn.agentRequested || turn.promptEngine?.mode === "professional" || turn.agentRun));
+}
+
+function buildAgentConversationContext(conversation: ImageConversation | null) {
+  if (!conversation) return [];
+  return conversation.turns
+    .filter((turn) => Boolean(turn.sourcePrompt || turn.prompt))
+    .slice(-6)
+    .map((turn) => ({
+      userRequest: (turn.sourcePrompt || turn.prompt).slice(0, 1600),
+      sceneName: turn.promptEngine?.sceneName || String(turn.agentRun?.result?.promptPlan?.sceneName || ""),
+      proposalSummary: (turn.agentProposal?.summary || "").slice(0, 700),
+      visualDirection: String(turn.agentRun?.result?.promptPlan?.visualDirection || "").slice(0, 500),
+      resultStatus: turn.status,
+      assistantMessage: (turn.agentAdvisor?.assistantMessage || turn.agentProposal?.assistantMessage || "").slice(0, 800),
+      suggestions: (turn.agentAdvisor?.suggestions || turn.agentProposal?.suggestions || []).slice(0, 4),
+      creativeBrief: turn.agentAdvisor?.creativeBrief || turn.agentProposal?.creativeBrief,
+    }));
+}
+function latestConversationReferences(conversation: ImageConversation | null) {
+  if (!conversation) return [];
+  for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
+    const references = conversation.turns[index].referenceImages.filter(hasUsableReference);
+    if (references.length) return references.slice(-4);
+  }
+  return [];
+}
+function hasConversationReferenceAnchor(conversation: ImageConversation | null) {
+  return Boolean(conversation?.turns.some((turn) => (
+    isAgentImageTurn(turn)
+    && !turn.resultsDeleted
+    && !turn.folderId
+    && (turn.mode === "edit" || turn.images.some((image) => image.status === "success" && (image.b64_json || image.url)))
+  )));
+}
 function shouldRunImageTurn(turn: ImageTurn) {
-  return !turn.resultsDeleted && (turn.status === "queued" || turn.status === "generating") && turn.images.some((image) => image.status === "loading");
+  return !turn.agentRequested && !turn.agentRun && !turn.resultsDeleted && (turn.status === "queued" || turn.status === "generating") && turn.images.some((image) => image.status === "loading");
 }
 function buildConversationTitle(prompt: string) {
   const trimmed = prompt.trim();
@@ -302,15 +455,133 @@ async function fetchImageAsFile(url: string, fileName: string) {
   const blob = await response.blob();
   return new File([blob], fileName, { type: blob.type || "image/png" });
 }
-async function storedImageToReference(image: StoredImage, fileName: string) {
+function storedImageToReference(image: StoredImage, fileName: string) {
   if (image.b64_json) {
-    const reference = { name: fileName, type: "image/png", dataUrl: `data:image/png;base64,${image.b64_json}` };
-    return { referenceImage: reference, file: dataUrlToFile(reference.dataUrl, reference.name, reference.type) };
+    return {
+      referenceImage: {
+        name: fileName,
+        type: "image/png",
+        dataUrl: `data:image/png;base64,${image.b64_json}`,
+      },
+    };
   }
   if (!image.url) return null;
-  const file = await fetchImageAsFile(image.url, fileName);
-  return { referenceImage: { name: file.name, type: file.type || "image/png", dataUrl: await readFileAsDataUrl(file), url: image.url }, file };
+  const pathname = image.url.split("?", 1)[0].toLowerCase();
+  const type = pathname.endsWith(".jpg") || pathname.endsWith(".jpeg")
+    ? "image/jpeg"
+    : pathname.endsWith(".webp")
+      ? "image/webp"
+      : "image/png";
+  return { referenceImage: { name: fileName, type, url: image.url } };
 }
+
+function referenceRole(image: StoredReferenceImage) {
+  if (image.role) return image.role;
+  const name = String(image.name || "").toLowerCase();
+  if (name.includes("working-canvas")) return "working_canvas";
+  if (name.includes("product-anchor")) return "product_anchor";
+  return "reference";
+}
+
+function markReferenceRole(image: StoredReferenceImage, role: "working_canvas" | "product_anchor" | "reference", namePrefix: string) {
+  const extension = image.name?.match(/\.[a-z0-9]+$/i)?.[0] || (image.type === "image/jpeg" ? ".jpg" : image.type === "image/webp" ? ".webp" : ".png");
+  const baseName = image.name && image.name.includes(namePrefix) ? image.name : `${namePrefix}${extension}`;
+  return { ...image, name: baseName, role };
+}
+
+function shouldUseOriginalProductAnchor(prompt: string) {
+  return /从原图|基于原图|回到原图|不要上一版|不用上一版|重新做|重新生成一个方向|从最初|原始产品图|original/i.test(prompt);
+}
+
+function latestWorkingCanvasReference(conversation: ImageConversation | null) {
+  if (!conversation) return null;
+  for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
+    const turn = conversation.turns[index];
+    if (turn.resultsDeleted) continue;
+    const successful = turn.images.filter((image) => image.status === "success" && (image.b64_json || image.url));
+    if (!successful.length) continue;
+    const source = successful[successful.length - 1];
+    const converted = storedImageToReference(source, `working-canvas-${turn.id}.png`);
+    if (converted?.referenceImage) return markReferenceRole(converted.referenceImage, "working_canvas", `working-canvas-${turn.id}`);
+  }
+  return null;
+}
+
+function productAnchorReferences(conversation: ImageConversation | null) {
+  if (!conversation) return [];
+  for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
+    const anchors = conversation.turns[index].referenceImages
+      .filter((image) => hasUsableReference(image) && referenceRole(image) === "product_anchor")
+      .map((image, anchorIndex) => markReferenceRole(image, "product_anchor", `product-anchor-${anchorIndex + 1}`));
+    if (anchors.length) return anchors.slice(0, 3);
+  }
+  for (const turn of conversation.turns) {
+    const references = turn.referenceImages
+      .filter((image) => hasUsableReference(image) && referenceRole(image) !== "working_canvas")
+      .map((image, anchorIndex) => markReferenceRole(image, "product_anchor", `product-anchor-${anchorIndex + 1}`));
+    if (references.length) return references.slice(0, 3);
+  }
+  return [];
+}
+
+function continuationAgentReferences(conversation: ImageConversation | null, prompt: string) {
+  if (shouldUseOriginalProductAnchor(prompt)) return productAnchorReferences(conversation);
+  const workingCanvas = latestWorkingCanvasReference(conversation);
+  const anchors = productAnchorReferences(conversation);
+  if (workingCanvas) return [workingCanvas, ...anchors].slice(0, 4);
+  return anchors.length ? anchors : latestConversationReferences(conversation);
+}
+
+function shouldUseUploadedReferencesOnly(prompt: string) {
+  const text = prompt.toLowerCase().replace(/\s+/g, "");
+  const markers = [
+    "\u6362\u6210\u8fd9\u5f20",
+    "\u66ff\u6362\u6210\u8fd9\u5f20",
+    "\u7528\u8fd9\u5f20\u5546\u54c1",
+    "\u8fd9\u5f20\u662f\u65b0\u4ea7\u54c1",
+    "\u4ee5\u8fd9\u5f20\u4ea7\u54c1",
+    "\u8fd9\u5f20\u4f5c\u4e3a\u4e3b\u4f53",
+    "\u4ece\u8fd9\u5f20\u56fe\u5f00\u59cb",
+    "\u53ea\u7528\u8fd9\u5f20",
+    "\u4e0d\u8981\u4e0a\u4e00\u7248",
+  ];
+  return markers.some((marker) => text.includes(marker)) || /(?:replace|newproduct|onlythis|startfromthis)/i.test(text);
+}
+
+function normalizeUploadedAgentReference(image: StoredReferenceImage): StoredReferenceImage {
+  const role = referenceRole(image);
+  if (role === "working_canvas" || role === "product_anchor") return image;
+  return { ...image, role: "reference" as const };
+}
+
+function pushUniqueReference(target: StoredReferenceImage[], image: StoredReferenceImage, max = 4) {
+  if (!hasUsableReference(image) || target.length >= max) return;
+  const duplicateIndex = target.findIndex((current) =>
+    Boolean((image.url && image.url === current.url) || (image.dataUrl && image.dataUrl === current.dataUrl)),
+  );
+  if (duplicateIndex >= 0) target.splice(duplicateIndex, 1);
+  target.push(image);
+}
+
+function agentReferencesForPrompt(
+  conversation: ImageConversation | null,
+  prompt: string,
+  uploadedReferences: StoredReferenceImage[],
+) {
+  const uploads = uploadedReferences.filter(hasUsableReference).map(normalizeUploadedAgentReference);
+  if (!uploads.length) return continuationAgentReferences(conversation, prompt);
+  if (!conversation || shouldUseUploadedReferencesOnly(prompt)) return uploads.slice(-4);
+  const baseReferences = shouldUseOriginalProductAnchor(prompt)
+    ? productAnchorReferences(conversation)
+    : continuationAgentReferences(conversation, prompt);
+  const merged: StoredReferenceImage[] = [];
+  for (const image of baseReferences.filter((item) => referenceRole(item) === "working_canvas").slice(-1)) pushUniqueReference(merged, image);
+  for (const image of baseReferences.filter((item) => referenceRole(item) === "product_anchor").slice(0, 2)) pushUniqueReference(merged, image);
+  for (const image of uploads) pushUniqueReference(merged, image);
+  for (const image of baseReferences.filter((item) => referenceRole(item) === "reference")) pushUniqueReference(merged, image);
+  return merged.length ? merged : uploads.slice(-4);
+}
+
 async function buildReferencePayload(
   images: StoredReferenceImage[],
   turnId: string,
@@ -339,9 +610,76 @@ async function buildReferencePayload(
   };
 }
 
+function agentReferencePayload(images: StoredReferenceImage[]) {
+  return images
+    .filter(hasUsableReference)
+    .slice(-4)
+    .map((image) => ({
+      name: image.name,
+      type: image.type,
+      dataUrl: String(image.dataUrl || "").trim() || undefined,
+      url: String(image.url || "").trim() || undefined,
+      role: image.role || referenceRole(image),
+    }));
+}
+
+function hasUsableReference(image: StoredReferenceImage) {
+  return Boolean(String(image.dataUrl || "").trim() || String(image.url || "").trim());
+}
+
+async function prepareAgentReferencePayload(
+  images: StoredReferenceImage[],
+  turnId: string,
+  preparedReferences: Map<string, ReferenceUploadItem> = new Map(),
+): Promise<AgentReferencePayloadItem[]> {
+  const references = images.filter(hasUsableReference).slice(-4);
+  if (!references.length) return [];
+  const items = await Promise.all<AgentReferencePayloadItem | null>(references.map(async (image, index) => {
+    const publicUrl = String(image.url || "").trim();
+    const role = image.role || referenceRole(image);
+    if (publicUrl && isPublicUrl(publicUrl)) {
+      return { name: image.name, type: image.type, url: publicUrl, role };
+    }
+    const dataUrl = String(image.dataUrl || "").trim();
+    if (!dataUrl) {
+      return publicUrl ? { name: image.name, type: image.type, url: publicUrl, role } : null;
+    }
+    const prepared = preparedReferences.get(dataUrl);
+    if (prepared?.url) {
+      return { name: image.name, type: image.type, url: prepared.url, role };
+    }
+    try {
+      const file = dataUrlToFile(dataUrl, image.name || `${turnId}-${index + 1}.png`, image.type);
+      const response = await preuploadImageReferences([file]);
+      const item = response.items[0];
+      if (item?.url) {
+        preparedReferences.set(dataUrl, item);
+        return { name: image.name || item.filename || file.name, type: image.type || file.type || "image/png", url: item.url, role };
+      }
+    } catch {
+      // If reference pre-upload is unavailable, fall back to the inline data URL.
+    }
+    return { name: image.name, type: image.type, dataUrl, role };
+  }));
+  return items.filter((item): item is AgentReferencePayloadItem => Boolean(item?.dataUrl || item?.url));
+}
+
+function mergeStoredReferences(existing: StoredReferenceImage[], additions: StoredReferenceImage[]) {
+  const merged: StoredReferenceImage[] = [];
+  for (const image of [...existing, ...additions]) {
+    const duplicateIndex = merged.findIndex((current) =>
+      Boolean((image.url && image.url === current.url) || (image.dataUrl && image.dataUrl === current.dataUrl)),
+    );
+    if (duplicateIndex >= 0) merged.splice(duplicateIndex, 1);
+    merged.push(image);
+  }
+  return merged.slice(-4);
+}
+
 function progressLabel(progress?: string) {
   const value = String(progress || "").trim();
   if (!value) return "";
+  if (value.startsWith("retrying_aspect_ratio")) return "比例不符，正在重新生成";
   if (value.startsWith("retrying")) return "失败后重新排队";
   const labels: Record<string, string> = {
     queued: "等待生成",
@@ -373,7 +711,7 @@ function friendlyImageError(value?: string) {
     || lowered.includes("moderation")
     || lowered.includes("blocked")
   ) {
-    return "提示词被内容安全策略拦截，请改成更中性的商品视觉描述后重试";
+    return "该请求包含需要改写的品牌、作品、角色或敏感表达；请调整为原创或中性视觉描述后重试";
   }
   return text;
 }
@@ -381,7 +719,22 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
   if (task.status === "success") {
     const first = task.data?.[0];
     if (!first?.b64_json && !first?.url) return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: "未返回图片数据" };
-    return { ...image, taskId: task.id, status: "success", taskStatus: undefined, progress: undefined, b64_json: first.url ? undefined : first.b64_json, url: first.url, revised_prompt: first.revised_prompt, error: undefined, durationMs: task.duration_ms };
+    return {
+      ...image,
+      taskId: task.id,
+      status: "success",
+      taskStatus: undefined,
+      progress: undefined,
+      b64_json: first.url ? undefined : first.b64_json,
+      url: first.url,
+      revised_prompt: first.revised_prompt,
+      width: first.width,
+      height: first.height,
+      requestedSize: first.requested_size,
+      aspectRatioCorrected: first.aspect_ratio_corrected,
+      error: undefined,
+      durationMs: task.duration_ms,
+    };
   }
   if (task.status === "error") return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: friendlyImageError(task.error) || "生成失败", durationMs: task.duration_ms };
   if (task.status === "canceled") return { ...image, taskId: task.id, status: "canceled", taskStatus: undefined, progress: undefined, error: task.error || "任务已中止", durationMs: task.duration_ms };
@@ -500,7 +853,11 @@ export function useImageWorkspace(isAdmin: boolean) {
   const referenceImages = ref<StoredReferenceImage[]>([]);
   const batchProductImage = ref<StoredReferenceImage | null>(null);
   const batchFolderImages = ref<StoredReferenceImage[]>([]);
+  const agentFolder = ref<AgentFolderAsset | null>(null);
   const preserveSubject = ref(false);
+  const promptEngineMode = ref<PromptEngineMode>("standard");
+  const longTermMemoryEnabled = ref(true);
+  const submitPhase = ref("");
   const conversations = ref<ImageConversation[]>([]);
   const selectedConversationId = ref<string | null>(null);
   const appendToSelectedConversation = ref(false);
@@ -526,14 +883,46 @@ export function useImageWorkspace(isAdmin: boolean) {
     return Boolean(relay?.enabled && relay.base_url && (relay.has_api_key || relay.api_key || Number(relay.api_key_count || 0) > 0));
   });
   const imageTimeoutRetrySecs = computed(() => Number(settingsConfig.value?.image_timeout_retry_secs || 30));
-  const parsedCount = computed(() => Number(clampImageCount(imageCount.value)));
+  const parsedCount = computed(() => Number(clampImageCount(
+    imageCount.value,
+    promptEngineMode.value === "professional" && agentFolder.value?.folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : 100,
+  )));
   const selectedConversation = computed(() => conversations.value.find((item) => item.id === selectedConversationId.value) || null);
+  const canResumeAgentWithReferences = computed(() => (
+    promptEngineMode.value === "professional"
+    && appendToSelectedConversation.value
+    && Boolean(selectedConversation.value)
+  ));
   const activeTaskCount = computed(() => conversations.value.reduce((sum, conversation) => { const stats = getImageConversationStats(conversation); return sum + stats.queued + stats.running; }, 0));
   const todayGeneratedCount = computed(() => { const today = new Date().toISOString().slice(0, 10); return conversations.value.reduce((total, conversation) => total + conversation.turns.reduce((sum, turn) => sum + (turn.createdAt.startsWith(today) ? turn.images.filter((image) => image.status === "success").length : 0), 0), 0); });
   const totalGeneratedCount = computed(() => conversations.value.reduce((total, conversation) => total + conversation.turns.reduce((sum, turn) => sum + turn.images.filter((image) => image.status === "success").length, 0), 0));
   const displayModel = computed(() => formatImageModel(imageModel.value));
-  const deleteConfirmTitle = computed(() => deleteConfirm.value?.type === "all" ? "清空历史记录" : deleteConfirm.value?.type === "prompt" ? "删除提示词记录" : deleteConfirm.value?.type === "results" ? "删除生成结果" : deleteConfirm.value?.type === "one" ? "删除对话" : "");
-  const deleteConfirmDescription = computed(() => deleteConfirm.value?.type === "all" ? "确认删除全部图片历史记录吗？删除后无法恢复。" : deleteConfirm.value?.type === "prompt" ? "确认删除这条提示词记录吗？对应生成结果会保留。" : deleteConfirm.value?.type === "results" ? "确认删除这条生成结果吗？对应提示词记录会保留。" : deleteConfirm.value?.type === "one" ? "确认删除这条图片对话吗？删除后无法恢复。" : "");
+  const deleteResultNoun = computed(() => {
+    const target = deleteConfirm.value;
+    if (target?.type !== "results") return "生成结果";
+    const turn = conversations.value.find((item) => item.id === target.conversationId)?.turns.find((item) => item.id === target.turnId);
+    if (!turn || turn.images.length) return "生成结果";
+    if (hasAgentProposalPages(turn)) return "方案";
+    return isAgentImageTurn(turn) ? "回答" : "生成结果";
+  });
+  const deleteConfirmTitle = computed(() => {
+    const target = deleteConfirm.value;
+    if (target?.type === "all") return "清空历史记录";
+    if (target?.type === "many") return `删除 ${target.ids.length} 条历史记录`;
+    if (target?.type === "prompt") return "删除消息记录";
+    if (target?.type === "results") return `删除${deleteResultNoun.value}`;
+    if (target?.type === "one") return "删除对话";
+    return "";
+  });
+  const deleteConfirmDescription = computed(() => {
+    const target = deleteConfirm.value;
+    if (target?.type === "all") return "确认删除全部图片历史记录吗？删除后无法恢复。";
+    if (target?.type === "many") return `确认删除选中的 ${target.ids.length} 条图片对话吗？删除后无法恢复。`;
+    if (target?.type === "prompt") return "确认删除这条用户消息吗？对应的回答或图片会保留。";
+    if (target?.type === "results") return `确认删除这条${deleteResultNoun.value}吗？对应的用户消息会保留。`;
+    if (target?.type === "one") return "确认删除这条图片对话吗？删除后无法恢复。";
+    return "";
+  });
 
   function formatConversationTime(value: string) {
     const date = new Date(value);
@@ -555,11 +944,339 @@ export function useImageWorkspace(isAdmin: boolean) {
       conversationTaskPersistedAt.set(conversationId, Date.now());
     }
   }
+
+  function agentStatusFromEvent(current: AgentRun, event: AgentEvent): AgentRun["status"] {
+    if (event.type === "run.started" || event.type === "run.resumed" || event.type === "decision.made" || event.type === "step.started" || event.type === "tool.started" || event.type === "agent.intent.classified" || event.type === "agent.update") return "running";
+    if (event.type === "run.completed") return "completed";
+    if (event.type === "run.failed") return "failed";
+    if (event.type === "run.canceled") return "canceled";
+    if (event.type === "run.waiting_for_images") return "waiting_for_images";
+    if (event.type === "run.waiting_for_input") return "waiting_for_input";
+    return current.status;
+  }
+
+  async function applyAgentEvent(conversationId: string, turnId: string, event: AgentEvent) {
+    await updateConversation(conversationId, (current) => {
+      if (!current) return current!;
+      return {
+        ...current,
+        turns: current.turns.map((turn) => {
+          if (turn.id !== turnId || !turn.agentRun) return turn;
+          const events = [...(turn.agentRun.events || []).filter((item) => item.sequence !== event.sequence), event]
+            .sort((left, right) => left.sequence - right.sequence)
+            .slice(-160);
+          const observedToolCalls = events.filter((item) => item.type === "tool.started").length;
+          const phase = event.type === "agent.update" ? String(event.payload.phase || "") : "";
+          const nextTurnStatus = event.type === "run.waiting_for_input"
+            ? "waiting_for_input" as const
+            : event.type === "run.waiting_for_images"
+              ? "generating" as const
+            : event.type === "run.resumed" || phase === "planning" || phase === "analysis"
+              ? "planning" as const
+              : phase === "generation" || phase === "inspection" || phase === "revision"
+                ? "generating" as const
+                : turn.status;
+          return {
+            ...turn,
+            status: nextTurnStatus,
+            agentRun: {
+              ...turn.agentRun,
+              status: agentStatusFromEvent(turn.agentRun, event),
+              events,
+              stepCount: event.type === "step.started" ? Math.max(turn.agentRun.stepCount, Number(event.payload.index || 0)) : turn.agentRun.stepCount,
+              toolCalls: Math.max(turn.agentRun.toolCalls, observedToolCalls),
+            },
+          };
+        }),
+        updatedAt: new Date().toISOString(),
+      };
+    }, false);
+  }
+
+  async function applyAgentRunResult(conversationId: string, turnId: string, run: AgentRun) {
+    const result = run.result;
+    if (!result) {
+      const compactRun = compactAgentRun(run);
+      await updateConversation(conversationId, (current) => {
+        if (!current) return current!;
+        return {
+          ...current,
+          turns: current.turns.map((turn) => turn.id === turnId ? {
+            ...turn,
+            status: run.status === "waiting_for_input"
+              ? "waiting_for_input" as const
+              : run.status === "waiting_for_images"
+                ? "generating" as const
+                : turn.status,
+            agentRun: { ...compactRun, events: mergeAgentEvents(turn.agentRun?.events, compactRun.events) },
+          } : turn),
+          updatedAt: new Date().toISOString(),
+        };
+      }, false);
+      return;
+    }
+    await updateConversation(conversationId, (current) => {
+      if (!current) return current!;
+      return {
+        ...current,
+        turns: current.turns.map((turn) => {
+          if (turn.id !== turnId) return turn;
+          if (run.status === "waiting_for_images") {
+            const compactRun = compactAgentRun(run);
+            return {
+              ...turn,
+              status: "generating" as const,
+              agentRun: { ...compactRun, events: mergeAgentEvents(turn.agentRun?.events, compactRun.events) },
+              error: undefined,
+            };
+          }
+          const qualityChecks = result?.qualityChecks || [];
+          const proposal = result?.proposal?.pages?.length ? result.proposal : undefined;
+          const agentAdvisor = result?.assistantMessage || result?.suggestions?.length || result?.creativeBrief || result?.memoryUpdates?.length
+            ? {
+                assistantMessage: String(result.assistantMessage || proposal?.assistantMessage || ""),
+                suggestions: (result.suggestions || proposal?.suggestions || []).slice(0, 4),
+                intent: result.intent,
+                recommendedAction: result.recommendedAction,
+                creativeBrief: result.creativeBrief || proposal?.creativeBrief,
+                knowledgeSources: result.knowledgeSources,
+                memorySources: result.memorySources,
+                memoryUpdates: result.memoryUpdates,
+              }
+            : turn.agentAdvisor;
+          if (run.status === "waiting_for_input") {
+            const compactRun = compactAgentRun(run);
+            const folderCount = Number((result.folderSummary as Record<string, unknown> | undefined)?.fileCount || 0);
+            const proposalCount = Number(proposal?.imageCount || 0);
+            return {
+              ...turn,
+              status: "waiting_for_input" as const,
+              count: Math.max(1, proposalCount || turn.count || folderCount || proposal?.pages?.length || 1),
+              images: [],
+              agentProposal: proposal,
+              agentAdvisor,
+              agentBatchPlanId: result.batchPlanId,
+              agentBatchProgress: result.batchProgress,
+              agentBatchItems: result.batchItems,
+              agentRun: { ...compactRun, events: mergeAgentEvents(turn.agentRun?.events, compactRun.events) },
+              error: undefined,
+            };
+          }
+          const retryIndex = turn.agentRetryImageId ? turn.images.findIndex((image) => image.id === turn.agentRetryImageId) : -1;
+          const images = result?.images?.length
+            ? turn.images.length
+              ? turn.images.map((image, index) => {
+                  if (retryIndex >= 0 && index !== retryIndex) return image;
+                  const resultIndex = retryIndex >= 0 ? 0 : index;
+                  const generated = result.images[resultIndex];
+                  const check = qualityChecks[resultIndex];
+                  if (!generated) return { ...image, status: "error" as const, error: "Agent 未返回这张图片" };
+                  return {
+                    ...image,
+                    taskId: generated.taskId || image.taskId,
+                    pageId: generated.pageId || proposal?.pages?.[resultIndex]?.id || image.pageId,
+                    pageTitle: generated.pageTitle || proposal?.pages?.[resultIndex]?.title || image.pageTitle,
+                    purpose: generated.purpose || proposal?.pages?.[resultIndex]?.purpose || image.purpose,
+                    status: "success" as const,
+                    taskStatus: undefined,
+                    progress: undefined,
+                    b64_json: generated.b64_json || undefined,
+                    url: generated.url || undefined,
+                    revised_prompt: generated.revised_prompt || undefined,
+                    width: generated.width || undefined,
+                    height: generated.height || undefined,
+                    requestedSize: generated.requestedSize || undefined,
+                    aspectRatioCorrected: generated.aspectRatioCorrected || undefined,
+                    qualityCheck: check,
+                    error: undefined,
+                  };
+                })
+              : result.images.map((generated, index) => {
+                  const check = qualityChecks[index];
+                  const page = proposal?.pages?.[index];
+                  return {
+                    id: `${turn.id}-agent-image-${index}`,
+                    taskId: generated.taskId,
+                    pageId: generated.pageId || page?.id || undefined,
+                    pageTitle: generated.pageTitle || page?.title || undefined,
+                    purpose: generated.purpose || page?.purpose || undefined,
+                    status: "success" as const,
+                    b64_json: generated.b64_json || undefined,
+                    url: generated.url || undefined,
+                    revised_prompt: generated.revised_prompt || undefined,
+                    width: generated.width || undefined,
+                    height: generated.height || undefined,
+                    requestedSize: generated.requestedSize || undefined,
+                    aspectRatioCorrected: generated.aspectRatioCorrected || undefined,
+                    qualityCheck: check,
+                  };
+                })
+            : turn.images.map((image) => ({ ...image, status: "error" as const, error: run.error || "Agent 未返回图片" }));
+          const promptPlan = result?.promptPlan || {};
+          const resolvedSize = String(promptPlan.resolvedSize || result.images.find((image) => image.requestedSize)?.requestedSize || turn.size);
+          const sceneType = String(promptPlan.sceneType || turn.promptEngine?.sceneType || "auto") as ProfessionalSceneType;
+          const promptEngine = turn.promptEngine
+            ? {
+                ...turn.promptEngine,
+                sceneType,
+                sceneName: String(promptPlan.sceneName || turn.promptEngine.sceneName),
+                model: String(promptPlan.model || turn.promptEngine.model),
+                productName: typeof promptPlan.productProfile?.productName === "string" ? promptPlan.productProfile.productName : turn.promptEngine.productName,
+                editIntent: promptPlan.editIntent || turn.promptEngine.editIntent,
+                subjectMutationPolicy: promptPlan.subjectMutationPolicy || turn.promptEngine.subjectMutationPolicy,
+                needsTypography: typeof promptPlan.needsTypography === "boolean" ? promptPlan.needsTypography : turn.promptEngine.needsTypography,
+            }
+            : turn.promptEngine;
+          const compactRun = compactAgentRun(run);
+          return {
+            ...turn,
+            prompt: String(promptPlan.finalPrompt || turn.prompt),
+            size: resolvedSize,
+            ratio: inferImageRatio(resolvedSize, turn.ratio),
+            promptEngine,
+            images,
+            agentRun: { ...compactRun, events: mergeAgentEvents(turn.agentRun?.events, compactRun.events) },
+            agentProposal: proposal || turn.agentProposal,
+            agentAdvisor,
+            agentBatchPlanId: result.batchPlanId || turn.agentBatchPlanId,
+            agentBatchProgress: result.batchProgress || turn.agentBatchProgress,
+            agentBatchItems: result.batchItems || turn.agentBatchItems,
+            agentRequested: true,
+            agentRetryImageId: undefined,
+            ...deriveTurnStatus({ ...turn, images }),
+          };
+        }),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  async function failAgentTurn(conversationId: string, turnId: string, message: string) {
+    await updateConversation(conversationId, (current) => {
+      if (!current) return current!;
+      return {
+        ...current,
+        turns: current.turns.map((turn) => turn.id !== turnId ? turn : {
+          ...turn,
+          status: "error" as const,
+          error: message,
+          images: turn.images.map((image) => image.status === "loading" ? { ...image, status: "error" as const, error: message, taskStatus: undefined, progress: undefined } : image),
+        }),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  async function startAgentForTurn(conversationId: string, turn: ImageTurn) {
+    const conversation = conversations.value.find((item) => item.id === conversationId) || null;
+    const preparedReferences = new Map<string, ReferenceUploadItem>();
+    const turnReferences = turn.referenceImages.filter(hasUsableReference);
+    const inheritReferenceImages = Boolean(
+      conversation
+      && !turn.folderId
+      && turnReferences.length === 0
+      && hasConversationReferenceAnchor(conversation)
+    );
+    const effectiveReferences = turnReferences.length
+      ? agentReferencesForPrompt(conversation, turn.sourcePrompt || turn.prompt, turnReferences)
+      : inheritReferenceImages
+        ? continuationAgentReferences(conversation, turn.sourcePrompt || turn.prompt)
+        : [];
+    const effectiveMode: ImageConversationMode = effectiveReferences.length || inheritReferenceImages ? "edit" : turn.mode;
+    const agentImages = await prepareAgentReferencePayload(effectiveReferences, turn.id, preparedReferences);
+    const response = await startImageAgentRun({
+      prompt: turn.sourcePrompt || turn.prompt,
+      agentEngine: "cowagent",
+      mode: effectiveMode,
+      model: resolveAllowedImageModel(turn.model),
+      size: turn.size,
+      quality: turn.quality,
+      count: turn.agentRetryImageId ? 1 : Math.min(turn.folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, Math.max(1, turn.count)),
+      sceneType: "auto",
+      preserveSubject: effectiveMode === "edit",
+      inheritReferenceImages,
+      useLongTermMemory: turn.useLongTermMemory !== false,
+      conversationId,
+      turnId: turn.id,
+      folderId: turn.folderId,
+      images: agentImages,
+      conversationContext: buildAgentConversationContext(conversation),
+    });
+    const turnKey = imageTurnQueueKey(conversationId, turn.id);
+    if (canceledImageAgentTurnIds.has(turnKey)) {
+      const canceled = await cancelAgentRun(response.agentRun.runId).catch(() => response);
+      response.agentRun = canceled.agentRun;
+    }
+    await updateConversation(conversationId, (current) => {
+      if (!current) return current!;
+      return {
+        ...current,
+        turns: current.turns.map((item) => item.id === turn.id ? {
+          ...item,
+          mode: effectiveMode,
+          referenceImages: effectiveReferences,
+          preserveSubject: effectiveMode === "edit",
+          agentRequested: true,
+          agentRun: response.agentRun,
+        } : item),
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    void watchImageAgent(conversationId, turn.id, response.agentRun.runId);
+  }
+
+  async function resumeAgentTurn(turnId: string, message = "确认，开始生成") {
+    const conversation = selectedConversation.value;
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!conversation || !turn?.agentRun || turn.agentRun.status !== "waiting_for_input") return;
+    setSelectedConversationId(conversation.id, true);
+    imagePrompt.value = message;
+    imageCount.value = String(Math.max(1, Math.min(turn.folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, turn.count || 1)));
+    appendToSelectedConversation.value = true;
+    await submit();
+  }
+
+  async function watchImageAgent(conversationId: string, turnId: string, runId: string) {
+    if (activeImageAgentIds.has(runId)) return;
+    activeImageAgentIds.add(runId);
+    try {
+      const initial = await fetchAgentRun(runId);
+      await applyAgentRunResult(conversationId, turnId, initial.agentRun).catch(() => undefined);
+      if (initial.agentRun.events?.length) {
+        for (const event of initial.agentRun.events) await applyAgentEvent(conversationId, turnId, event);
+      }
+      let latestStatus = initial.agentRun.status;
+      let lastSequence = initial.agentRun.events?.at(-1)?.sequence || 0;
+      if (latestStatus === "pending" || latestStatus === "running" || latestStatus === "waiting_for_images") {
+        await streamAgentRunEvents(runId, async (event) => {
+          lastSequence = Math.max(lastSequence, event.sequence);
+          await applyAgentEvent(conversationId, turnId, event);
+        }, { after: lastSequence });
+      }
+      const finalRun = await fetchAgentRun(runId, true);
+      latestStatus = finalRun.agentRun.status;
+      if (latestStatus === "completed" || latestStatus === "failed" || latestStatus === "canceled" || latestStatus === "waiting_for_input") {
+        if (finalRun.agentRun.events?.length) {
+          for (const event of finalRun.agentRun.events) {
+            if (event.sequence > lastSequence) await applyAgentEvent(conversationId, turnId, event);
+          }
+        }
+        if (latestStatus === "failed") await failAgentTurn(conversationId, turnId, finalRun.agentRun.error || "Agent 执行失败");
+        else await applyAgentRunResult(conversationId, turnId, finalRun.agentRun);
+      }
+    } catch (error) {
+      await failAgentTurn(conversationId, turnId, error instanceof Error ? error.message : "Agent 执行失败");
+    } finally {
+      activeImageAgentIds.delete(runId);
+      scanQueues();
+    }
+  }
   function clearComposer() {
     imagePrompt.value = "";
     referenceImages.value = [];
     batchProductImage.value = null;
     batchFolderImages.value = [];
+    agentFolder.value = null;
   }
   function setSelectedConversationId(id: string | null, append: boolean) {
     suppressSelectionAppend = true;
@@ -571,7 +1288,13 @@ export function useImageWorkspace(isAdmin: boolean) {
     setSelectedConversationId(null, false);
     clearComposer();
   }
+  function syncModeFromConversation(conversation?: ImageConversation) {
+    const latestTurn = conversation?.turns.at(-1);
+    if (!latestTurn) return;
+    promptEngineMode.value = isAgentImageTurn(latestTurn) ? "professional" : "standard";
+  }
   function selectConversation(id: string) {
+    syncModeFromConversation(conversations.value.find((item) => item.id === id));
     setSelectedConversationId(id, true);
   }
   async function loadQuota() { availableQuota.value = isAdmin ? (isOpenAIRelayEnabled.value ? "中转站" : "API") : "--"; }
@@ -589,10 +1312,18 @@ export function useImageWorkspace(isAdmin: boolean) {
       imageQuality.value = localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) || "auto";
       imageCount.value = clampImageCount(localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) || DEFAULT_IMAGE_COUNT);
       preserveSubject.value = localStorage.getItem(PRESERVE_SUBJECT_STORAGE_KEY) === "true";
+      promptEngineMode.value = localStorage.getItem(PROMPT_ENGINE_MODE_STORAGE_KEY) === "professional" ? "professional" : "standard";
+      const memoryPreferenceKey = `${LONG_TERM_MEMORY_STORAGE_PREFIX}:${sessionState.session?.subjectId || sessionState.session?.username || "anonymous"}`;
+      longTermMemoryEnabled.value = localStorage.getItem(memoryPreferenceKey) !== "false";
       const items = await recoverHistory(await listImageConversations());
       if (unmounted) return;
       conversations.value = items;
-      setSelectedConversationId(null, false);
+      const storedConversationId = localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+      const activeConversationId = storedConversationId && items.some((item) => item.id === storedConversationId)
+        ? storedConversationId
+        : null;
+      if (activeConversationId) syncModeFromConversation(items.find((item) => item.id === activeConversationId));
+      setSelectedConversationId(activeConversationId, Boolean(activeConversationId));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "读取会话记录失败");
     } finally { isLoadingHistory.value = false; }
@@ -654,6 +1385,20 @@ export function useImageWorkspace(isAdmin: boolean) {
     try {
       const files = (await pickImageFiles({ directory: true, multiple: true })).filter((item) => item.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(item.name));
       if (!files.length) { toast.error("文件夹里没有可用图片"); return; }
+      if (promptEngineMode.value === "professional") {
+        const folder = await uploadAgentFolder(
+          files,
+          files[0]?.webkitRelativePath?.split(/[\\/]/)[0] || "上传文件夹",
+          selectedConversationId.value || "",
+        );
+        agentFolder.value = folder;
+        const currentCount = Math.max(0, Math.floor(Number(imageCount.value) || 0));
+        const defaultFolderCount = currentCount > 1 ? currentCount : Math.min(AGENT_IMAGE_COUNT_MAX, folder.itemCount);
+        imageCount.value = String(Math.max(1, Math.min(AGENT_FOLDER_IMAGE_COUNT_MAX, folder.itemCount, defaultFolderCount)));
+        preserveSubject.value = true;
+        toast.success(`已保存文件夹：${folder.itemCount} 张图片，Agent 将先分析摘要`);
+        return;
+      }
       batchFolderImages.value = await Promise.all(files.map(fileToReference));
       imageCount.value = String(batchFolderImages.value.length);
       preserveSubject.value = true;
@@ -663,7 +1408,7 @@ export function useImageWorkspace(isAdmin: boolean) {
       toast.success(batchProductImage.value ? `已读取 ${files.length} 张文件夹图片，可批量换商品` : `已读取 ${files.length} 张文件夹图片，输入提示词后可批量生图`);
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取文件夹失败"); }
   }
-  function clearBatch() { batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量素材"); }
+  function clearBatch() { agentFolder.value = null; batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量素材"); }
 
   function createLoadingImages(turnId: string, count: number): StoredImage[] {
     return Array.from({ length: count }, (_, index) => {
@@ -741,9 +1486,10 @@ export function useImageWorkspace(isAdmin: boolean) {
       }
       const taskPrompt = buildCompliantImagePrompt(activeTurn.prompt, imageIndex, activeTurn.images.length, Boolean(activeTurn.batchReplace));
       const taskModel = resolveAllowedImageModel(activeTurn.model);
+      const taskPromptEngineMode = activeTurn.promptEngine?.engineMode || (activeTurn.promptEngine ? "professional" : "standard");
       const task = activeTurn.mode === "edit"
-        ? await createImageEditTask(taskId, payload.files, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, payload.urls, activeTurn.preserveSubject === true, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, payload.referenceUploadMs, payload.referenceCacheHits)
-        : await createImageGenerationTask(taskId, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length);
+        ? await createImageEditTask(taskId, payload.files, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, payload.urls, activeTurn.preserveSubject === true, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, payload.referenceUploadMs, payload.referenceCacheHits, taskPromptEngineMode)
+        : await createImageGenerationTask(taskId, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, taskPromptEngineMode);
       if (canceledImageTaskIds.has(taskId)) await cancelImageTask(taskId).catch(() => undefined);
       return task;
     };
@@ -1085,6 +1831,13 @@ export function useImageWorkspace(isAdmin: boolean) {
   function scanQueues() {
     for (const conversation of conversations.value) {
       for (const turn of conversation.turns) {
+        if (
+          turn.agentRun?.runId
+          && (turn.agentRun.status === "pending" || turn.agentRun.status === "running" || turn.agentRun.status === "waiting_for_images")
+          && !activeImageAgentIds.has(turn.agentRun.runId)
+        ) {
+          void watchImageAgent(conversation.id, turn.id, turn.agentRun.runId);
+        }
         if (shouldRunImageTurn(turn) && !activeImageTurnQueueIds.has(imageTurnQueueKey(conversation.id, turn.id))) void runConversationQueue(conversation.id, turn.id);
       }
     }
@@ -1095,59 +1848,161 @@ export function useImageWorkspace(isAdmin: boolean) {
     const rawPrompt = imagePrompt.value.trim();
     const prompt = stripHighRiskClaims(rawPrompt);
     const hasBatchFolder = batchFolderImages.value.length > 0;
+    const hasAgentFolder = Boolean(agentFolder.value?.folderId);
     const isBatchReplace = Boolean(batchProductImage.value && hasBatchFolder);
     const isBatchFolder = Boolean(hasBatchFolder && !batchProductImage.value);
-    if (!prompt && !isBatchReplace) { toast.error("请输入提示词"); return; }
+    const isImageAgent = promptEngineMode.value === "professional" && !isBatchReplace && !isBatchFolder;
+    const composerReferences = referenceImages.value.filter(hasUsableReference);
+    const referencePayload = isImageAgent ? agentReferencePayload(composerReferences) : [];
+    if (!prompt && !isBatchReplace && !referencePayload.length && !hasAgentFolder) { toast.error("请输入提示词或上传文件夹"); return; }
     if (batchProductImage.value && !batchFolderImages.value.length) { toast.error("请先上传包含场景图的文件夹"); return; }
     isSubmitting.value = true;
+    submitPhase.value = isImageAgent
+      ? "正在启动专业视觉智能体..."
+      : "正在创建生图任务...";
+    let agentTurnPersisted = false;
+    let agentConversationId = "";
+    let agentTurnId = "";
     try {
       const target = appendToSelectedConversation.value && selectedConversationId.value ? conversations.value.find((item) => item.id === selectedConversationId.value) || null : null;
+      const inheritedFolderId = target?.turns.at(-1)?.folderId || "";
       const now = new Date().toISOString();
       const conversationId = target?.id || createId();
       const turnId = createId();
+      agentConversationId = conversationId;
+      agentTurnId = turnId;
       const batchReplace: ImageBatchReplacePlan | undefined = isBatchReplace && batchProductImage.value ? { productImage: batchProductImage.value, folderImages: batchFolderImages.value } : undefined;
       const batchFolder: ImageBatchFolderPlan | undefined = isBatchFolder ? { folderImages: batchFolderImages.value } : undefined;
-      const effectiveReferences = batchReplace ? [batchReplace.productImage, ...batchReplace.folderImages] : batchFolder ? batchFolder.folderImages : referenceImages.value;
-      const mode: ImageConversationMode = effectiveReferences.length ? "edit" : "generate";
-      const effectivePrompt = batchReplace ? buildBatchReplacePrompt(prompt) : prompt;
+      const folderId = agentFolder.value?.folderId || inheritedFolderId;
+      const shouldInheritAgentReferences = Boolean(
+        isImageAgent
+        && target
+        && !folderId
+        && hasConversationReferenceAnchor(target)
+      );
+      const effectiveReferences = batchReplace
+        ? [batchReplace.productImage, ...batchReplace.folderImages]
+        : batchFolder
+          ? batchFolder.folderImages
+          : isImageAgent
+            ? agentReferencesForPrompt(target, prompt, composerReferences)
+            : composerReferences;
+      const conversationalPrompt = prompt || (isImageAgent && effectiveReferences.length
+        ? "请分析我刚上传的图片，并根据当前对话继续给出专业建议。"
+        : isImageAgent && folderId
+          ? "请先读取这个文件夹的摘要和少量样本，分析图片分类并给出批处理方案。"
+          : prompt);
+      const mode: ImageConversationMode = effectiveReferences.length || hasAgentFolder || shouldInheritAgentReferences ? "edit" : "generate";
+      const shouldPreserveSubject = mode === "edit" && (isImageAgent || preserveSubject.value || Boolean(batchReplace));
+      let effectivePrompt = batchReplace ? buildBatchReplacePrompt(prompt) : conversationalPrompt;
+      let promptEngine: ImagePromptEngineMetadata | undefined = isImageAgent
+        ? {
+            mode: "professional",
+            agentEngine: "cowagent",
+            sceneType: "auto",
+            sceneName: "Agent 自动规划",
+            model: resolveAllowedImageModel(imageModel.value),
+          }
+        : undefined;
       const selectedCount = parsedCount.value;
-      const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : resolveImageCountFromPrompt(prompt, selectedCount);
+      const folderItemCount = Math.max(0, agentFolder.value?.itemCount || 0);
+      const folderCount = folderId
+        ? Math.max(1, Math.min(AGENT_FOLDER_IMAGE_COUNT_MAX, folderItemCount || AGENT_FOLDER_IMAGE_COUNT_MAX, selectedCount))
+        : 0;
+      const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : folderId ? folderCount : resolveImageCountFromPrompt(prompt, selectedCount);
       const submitModel = resolveAllowedImageModel(imageModel.value);
+      const configuredSize = `${imageWidth.value || 1024}x${imageHeight.value || 1024}`;
+      const resolvedSize = resolveImageSizeFromPrompt(conversationalPrompt, configuredSize);
+      const resolvedRatio = inferImageRatio(resolvedSize, imageRatio.value);
       imageModel.value = submitModel;
+      if (promptEngine && !promptEngine.model) promptEngine.model = submitModel;
+      const agentCount = isImageAgent ? Math.min(folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, count) : count;
       const turn: ImageTurn = {
         id: turnId,
         prompt: effectivePrompt,
+        sourcePrompt: promptEngine ? conversationalPrompt : undefined,
+        promptEngine,
+        agentRequested: isImageAgent,
+        folderId: isImageAgent ? folderId || undefined : undefined,
         model: submitModel,
         mode,
         referenceImages: mode === "edit" ? effectiveReferences : [],
         batchReplace,
         batchFolder,
-        preserveSubject: mode === "edit" && (preserveSubject.value || Boolean(batchReplace)),
-        count,
-        size: `${imageWidth.value || 1024}x${imageHeight.value || 1024}`,
-        ratio: imageRatio.value,
+        preserveSubject: shouldPreserveSubject,
+        useLongTermMemory: isImageAgent ? longTermMemoryEnabled.value : undefined,
+        count: agentCount,
+        size: resolvedSize,
+        ratio: resolvedRatio,
         tier: imageTier.value,
         quality: imageQuality.value,
-        images: batchReplace ? createBatchLoadingImages(turnId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(turnId, batchFolder.folderImages) : createLoadingImages(turnId, count),
+        images: batchReplace
+          ? createBatchLoadingImages(turnId, batchReplace.folderImages)
+          : batchFolder
+            ? createBatchLoadingImages(turnId, batchFolder.folderImages)
+          : isImageAgent
+              ? []
+              : createLoadingImages(turnId, agentCount),
         createdAt: now,
-        status: "queued",
+        status: isImageAgent ? "planning" : "queued",
       };
-      const conversationTitle = batchReplace ? `批量换商品 ${batchReplace.folderImages.length} 张` : batchFolder ? `文件夹批量生图 ${batchFolder.folderImages.length} 张` : prompt;
+      const conversationTitle = batchReplace ? `批量换商品 ${batchReplace.folderImages.length} 张` : batchFolder ? `文件夹批量生图 ${batchFolder.folderImages.length} 张` : conversationalPrompt;
       const conversation: ImageConversation = target ? { ...target, updatedAt: now, turns: [...target.turns, turn] } : { id: conversationId, title: buildConversationTitle(conversationTitle), createdAt: now, updatedAt: now, turns: [turn] };
-      setSelectedConversationId(conversationId, false);
+      setSelectedConversationId(conversationId, true);
       clearComposer();
       await persistConversation(conversation);
-      void runConversationQueue(conversationId, turnId);
+      agentTurnPersisted = isImageAgent;
+      if (isImageAgent) {
+        const agentImages = await prepareAgentReferencePayload(effectiveReferences, turnId, new Map<string, ReferenceUploadItem>());
+        const agentResponse = await startImageAgentRun({
+          prompt: conversationalPrompt,
+          agentEngine: "cowagent",
+          mode,
+          model: submitModel,
+          size: resolvedSize,
+          quality: imageQuality.value,
+          count: agentCount,
+          sceneType: "auto",
+          preserveSubject: shouldPreserveSubject,
+          inheritReferenceImages: shouldInheritAgentReferences && composerReferences.length === 0,
+          useLongTermMemory: longTermMemoryEnabled.value,
+          conversationId,
+          turnId,
+          folderId: folderId || undefined,
+          images: agentImages,
+          conversationContext: buildAgentConversationContext(target),
+        });
+        const turnKey = imageTurnQueueKey(conversationId, turnId);
+        if (canceledImageAgentTurnIds.has(turnKey)) {
+          const canceled = await cancelAgentRun(agentResponse.agentRun.runId).catch(() => agentResponse);
+          agentResponse.agentRun = canceled.agentRun;
+        }
+        await updateConversation(conversationId, (current) => {
+          if (!current) return current!;
+          return { ...current, turns: current.turns.map((item) => item.id === turnId ? { ...item, agentRun: agentResponse.agentRun } : item), updatedAt: new Date().toISOString() };
+        });
+        void watchImageAgent(conversationId, turnId, agentResponse.agentRun.runId);
+      } else {
+        void runConversationQueue(conversationId, turnId);
+      }
       if (batchReplace) toast.success(`已创建批量替换任务：${batchReplace.folderImages.length} 张图`);
       else if (batchFolder) toast.success(`已创建文件夹批量生图任务：${batchFolder.folderImages.length} 张图`);
+      else if (isImageAgent) toast.success(target ? "已继续专业智能体对话，确认方案后才会生图" : "已进入专业智能体规划，确认方案后才会生图");
       else if (target) toast.success("已追加到选中的图片任务");
       else toast.success("已创建新图片任务并开始处理");
-      if (!batchReplace && selectedCount === 1 && count > 1) {
-        toast.info(`检测到多张独立图片需求，本次已按 ${count} 张独立任务生成`);
+      if (resolvedSize !== configuredSize) toast.info(`已按本轮要求将画布调整为 ${resolvedRatio}（${resolvedSize}）`);
+      if (!isImageAgent && !batchReplace && selectedCount === 1 && count > 1) {
+        toast.info(`检测到多张独立图片需求，本次已按 ${agentCount} 张独立任务生成`);
       }
       if (rawPrompt && rawPrompt !== prompt) toast.info("已自动替换高风险宣传表达，避免生成违规宣传文字");
+      if (promptEngine && !isImageAgent) toast.success(`专业 Prompt 已完成：${promptEngine.sceneName}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "图片任务提交失败";
+      if (isImageAgent && agentTurnPersisted) await failAgentTurn(agentConversationId, agentTurnId, message);
+      toast.error(message);
     } finally {
       isSubmitting.value = false;
+      submitPhase.value = "";
     }
   }
 
@@ -1160,9 +2015,11 @@ export function useImageWorkspace(isAdmin: boolean) {
     const batchReplace = source.batchReplace;
     const batchFolder = source.batchFolder;
     const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : Math.max(1, source.count || source.images.length || 1);
-    const nextTurn: ImageTurn = { ...source, id: nextId, model: resolveAllowedImageModel(source.model), createdAt: now, status: "queued", error: undefined, images: batchReplace ? createBatchLoadingImages(nextId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(nextId, batchFolder.folderImages) : createLoadingImages(nextId, count), count };
+    const isAgentTurn = Boolean(source.agentRequested || source.promptEngine?.mode === "professional");
+    const nextTurn: ImageTurn = { ...source, id: nextId, model: resolveAllowedImageModel(source.model), createdAt: now, status: isAgentTurn ? "planning" : "queued", error: undefined, agentRun: undefined, agentRequested: isAgentTurn, agentRetryImageId: undefined, agentProposal: undefined, agentAdvisor: undefined, images: batchReplace ? createBatchLoadingImages(nextId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(nextId, batchFolder.folderImages) : isAgentTurn ? [] : createLoadingImages(nextId, count), count };
     await persistConversation({ ...conversation, updatedAt: now, turns: [...conversation.turns, nextTurn] });
-    void runConversationQueue(conversation.id, nextId);
+    if (nextTurn.agentRequested) void startAgentForTurn(conversation.id, nextTurn);
+    else void runConversationQueue(conversation.id, nextId);
     toast.success("已开始重新生成");
   }
 
@@ -1172,25 +2029,108 @@ export function useImageWorkspace(isAdmin: boolean) {
     const turn = conversation.turns.find((item) => item.id === turnId);
     if (!turn) return;
     const retryId = `${turnId}-${createId()}`;
-    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, failureReportId: image.failureReportId || image.id || image.taskId || retryId, status: "loading" as const, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
+    const isAgentTurn = Boolean(turn.agentRequested || turn.promptEngine?.mode === "professional");
+    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, agentRequested: isAgentTurn, agentRun: isAgentTurn ? undefined : item.agentRun, agentRetryImageId: isAgentTurn ? retryId : undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, failureReportId: image.failureReportId || image.id || image.taskId || retryId, status: "loading" as const, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
     await persistConversation(next);
-    void runConversationQueue(conversation.id, turnId);
+    if (isAgentTurn) {
+      canceledImageAgentTurnIds.delete(imageTurnQueueKey(conversation.id, turnId));
+      void startAgentForTurn(conversation.id, next.turns.find((item) => item.id === turnId)!);
+    } else void runConversationQueue(conversation.id, turnId);
+  }
+
+  async function retryBatchItem(turnId: string, itemId: number) {
+    const conversation = selectedConversation.value;
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!conversation || !turn?.agentBatchPlanId) return;
+    const item = turn.agentBatchItems?.find((candidate) => candidate.id === itemId);
+    if (!item) return;
+    try {
+      const response = await retryAgentBatchItemRemote(turn.agentBatchPlanId, itemId, {
+        model: turn.model,
+        size: turn.size,
+        quality: turn.quality,
+      });
+      const refreshed = response.items.find((candidate) => candidate.id === itemId);
+      await updateConversation(conversation.id, (current) => {
+        if (!current) return current!;
+        return {
+          ...current,
+          turns: current.turns.map((candidate) => candidate.id !== turnId ? candidate : {
+            ...candidate,
+            agentBatchItems: candidate.agentBatchItems?.map((entry) => entry.id === itemId ? { ...entry, status: refreshed?.status || "queued", taskId: refreshed?.taskId, error: refreshed?.error } : entry),
+          }),
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      const taskId = refreshed?.taskId;
+      if (!taskId) throw new Error("重试任务未创建");
+      let latest: ImageTask | undefined;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const tasks = await fetchImageTasks([taskId]);
+        latest = tasks.items[0];
+        if (latest?.status === "success" || latest?.status === "error" || latest?.status === "canceled") break;
+        await sleep(1000);
+      }
+      if (!latest || latest.status !== "success") throw new Error(latest?.error || "批处理项重试失败");
+      const output = latest.data?.[0];
+      if (!output) throw new Error("重试任务未返回图片");
+      await updateConversation(conversation.id, (current) => {
+        if (!current) return current!;
+        return {
+          ...current,
+          turns: current.turns.map((candidate) => candidate.id !== turnId ? candidate : {
+            ...candidate,
+            images: [...candidate.images, {
+              id: `${turnId}-retry-${itemId}`,
+              taskId,
+              pageId: `folder-item-${itemId}`,
+              pageTitle: item.title,
+              purpose: item.purpose,
+              status: "success" as const,
+              url: output.url,
+              b64_json: output.b64_json,
+              width: output.width,
+              height: output.height,
+              requestedSize: output.requested_size,
+            }],
+            agentBatchItems: candidate.agentBatchItems?.map((entry) => entry.id === itemId ? { ...entry, status: "success", error: undefined } : entry),
+            agentBatchProgress: candidate.agentBatchProgress ? { ...candidate.agentBatchProgress, completed: candidate.agentBatchProgress.completed + 1, failed: Math.max(0, candidate.agentBatchProgress.failed - 1) } : candidate.agentBatchProgress,
+          }),
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      toast.success(`已重试文件夹图片：${item.name}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "批处理项重试失败");
+    }
   }
 
   async function cancelTurn(turnId: string) {
     const conversation = selectedConversation.value;
     const turn = conversation?.turns.find((item) => item.id === turnId);
     if (!conversation || !turn) return;
+    const activeAgent = turn.agentRun && (turn.agentRun.status === "pending" || turn.agentRun.status === "running" || turn.agentRun.status === "waiting_for_images" || turn.agentRun.status === "waiting_for_input") ? turn.agentRun : undefined;
+    if (turn.agentRequested) canceledImageAgentTurnIds.add(imageTurnQueueKey(conversation.id, turnId));
     const loadingIds = turn.images.flatMap((image) => image.status === "loading" && image.taskId ? [image.taskId] : []);
-    if (!loadingIds.length) return;
+    if (!loadingIds.length && !activeAgent) return;
+    let canceledAgentRun: AgentRun | undefined;
+    if (activeAgent) {
+      try { canceledAgentRun = (await cancelAgentRun(activeAgent.runId)).agentRun; } catch { /* Local state still blocks late Agent results. */ }
+    }
     const taskIds = new Set(loadingIds);
     loadingIds.forEach((id) => { canceledImageTaskIds.add(id); submittedImageTaskIds.delete(id); });
     await updateConversation(conversation.id, (current) => {
       const base = current || conversation;
       return { ...base, updatedAt: new Date().toISOString(), turns: base.turns.map((item) => item.id !== turnId ? item : { ...item, ...deriveTurnStatus({ ...item, images: item.images.map((image) => image.taskId && taskIds.has(image.taskId) ? { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" } : image) }), images: item.images.map((image) => image.taskId && taskIds.has(image.taskId) ? { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" } : image) }) };
     });
+    if (canceledAgentRun) {
+      await updateConversation(conversation.id, (current) => {
+        if (!current) return current!;
+        return { ...current, updatedAt: new Date().toISOString(), turns: current.turns.map((item) => item.id === turnId ? { ...item, status: "canceled" as const, agentRun: canceledAgentRun } : item) };
+      });
+    }
     await Promise.allSettled(loadingIds.map((id) => cancelImageTask(id)));
-    toast.info(`已中止 ${loadingIds.length} 个生成任务`);
+    toast.info(loadingIds.length ? `已中止 ${loadingIds.length} 个生成任务` : "已取消本次图片方案");
   }
 
   async function continueTimeoutRetry() {
@@ -1227,11 +2167,27 @@ export function useImageWorkspace(isAdmin: boolean) {
   function requestDeletePrompt(turnId: string) { if (selectedConversation.value) deleteConfirm.value = { type: "prompt", conversationId: selectedConversation.value.id, turnId }; }
   function requestDeleteResults(turnId: string) { if (selectedConversation.value) deleteConfirm.value = { type: "results", conversationId: selectedConversation.value.id, turnId }; }
   function requestDeleteConversation(id: string) { deleteConfirm.value = { type: "one", id }; }
+  function requestDeleteConversations(ids: string[]) {
+    const targetIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean)));
+    if (!targetIds.length) return;
+    deleteConfirm.value = { type: "many", ids: targetIds };
+  }
   function requestClearHistory() { deleteConfirm.value = { type: "all" }; }
   async function deleteConversation(id: string) {
     conversations.value = conversations.value.filter((item) => item.id !== id);
     if (selectedConversationId.value === id) setSelectedConversationId(null, false);
     await deleteImageConversation(id);
+  }
+  async function deleteManyConversations(ids: string[]) {
+    const targetIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean)));
+    if (!targetIds.length) return;
+    const targetSet = new Set(targetIds);
+    conversations.value = conversations.value.filter((item) => !targetSet.has(item.id));
+    if (selectedConversationId.value && targetSet.has(selectedConversationId.value)) {
+      setSelectedConversationId(null, false);
+      clearComposer();
+    }
+    await deleteImageConversations(targetIds);
   }
   async function deleteTurnPart(conversationId: string, turnId: string, part: "prompt" | "results") {
     const conversation = conversations.value.find((item) => item.id === conversationId);
@@ -1239,7 +2195,16 @@ export function useImageWorkspace(isAdmin: boolean) {
     const turns = conversation.turns.map((turn) => {
       if (turn.id !== turnId) return turn;
       const images = part === "results" ? turn.images.map((image) => ({ id: image.id, status: "error" as const, error: "生成结果已删除" })) : turn.images;
-      return { ...turn, prompt: part === "prompt" ? "" : turn.prompt, promptDeleted: part === "prompt" ? true : turn.promptDeleted, resultsDeleted: part === "results" ? true : turn.resultsDeleted, images, ...deriveTurnStatus({ ...turn, images }) };
+      return {
+        ...turn,
+        prompt: part === "prompt" ? "" : turn.prompt,
+        sourcePrompt: part === "prompt" ? undefined : turn.sourcePrompt,
+        promptDeleted: part === "prompt" ? true : turn.promptDeleted,
+        resultsDeleted: part === "results" ? true : turn.resultsDeleted,
+        images,
+        ...(part === "results" ? { agentRun: undefined, agentProposal: undefined, agentAdvisor: undefined, agentDialogue: undefined } : {}),
+        ...deriveTurnStatus({ ...turn, images }),
+      };
     }).filter((turn) => !(turn.promptDeleted && turn.resultsDeleted));
     if (!turns.length) return deleteConversation(conversationId);
     await persistConversation({ ...conversation, turns, updatedAt: new Date().toISOString() });
@@ -1249,6 +2214,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     deleteConfirm.value = null;
     if (!target) return;
     if (target.type === "all") { await clearImageConversations(); conversations.value = []; setSelectedConversationId(null, false); clearComposer(); toast.success("已清空历史记录"); return; }
+    if (target.type === "many") { await deleteManyConversations(target.ids); toast.success(`已删除 ${target.ids.length} 条历史记录`); return; }
     if (target.type === "one") { await deleteConversation(target.id); return; }
     await deleteTurnPart(target.conversationId, target.turnId, target.type);
   }
@@ -1256,19 +2222,20 @@ export function useImageWorkspace(isAdmin: boolean) {
   async function reuseTurnConfig(turnId: string) {
     const turn = selectedConversation.value?.turns.find((item) => item.id === turnId);
     if (!turn || !turn.prompt.trim()) return;
-    imagePrompt.value = turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; referenceImages.value = turn.referenceImages; toast.success("已复用这条提示词配置"); await nextTick();
+    imagePrompt.value = turn.sourcePrompt || turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; longTermMemoryEnabled.value = turn.useLongTermMemory !== false; promptEngineMode.value = isAgentImageTurn(turn) ? "professional" : "standard"; referenceImages.value = turn.referenceImages; toast.success("已复用这条内容和配置"); await nextTick();
   }
   async function continueEdit(image: StoredImage | StoredReferenceImage) {
     try {
       const reference = "name" in image && "type" in image
-        ? image.dataUrl
-          ? { referenceImage: image, file: dataUrlToFile(image.dataUrl, image.name, image.type) }
-          : image.url
-            ? await storedImageToReference({ id: `reference-${Date.now()}`, status: "success", url: image.url }, image.name || `conversation-${Date.now()}.png`)
-            : null
-        : await storedImageToReference(image, `conversation-${Date.now()}.png`);
+        ? image.dataUrl || image.url
+          ? { referenceImage: image }
+          : null
+        : storedImageToReference(image, `working-canvas-manual-${Date.now()}.png`);
       if (!reference) return;
-      referenceImages.value = [...referenceImages.value, reference.referenceImage];
+      const nextReference = "name" in image && "type" in image
+        ? reference.referenceImage
+        : markReferenceRole(reference.referenceImage, "working_canvas", `working-canvas-manual-${Date.now()}`);
+      referenceImages.value = [...referenceImages.value, nextReference];
       imagePrompt.value = "";
       toast.success("已加入当前参考图，继续输入描述即可编辑");
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取结果图失败"); }
@@ -1282,6 +2249,9 @@ export function useImageWorkspace(isAdmin: boolean) {
     localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel.value);
     if (parsedCount.value > 0) localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount.value));
     localStorage.setItem(PRESERVE_SUBJECT_STORAGE_KEY, preserveSubject.value ? "true" : "false");
+    localStorage.setItem(PROMPT_ENGINE_MODE_STORAGE_KEY, promptEngineMode.value);
+    const memoryPreferenceKey = `${LONG_TERM_MEMORY_STORAGE_PREFIX}:${sessionState.session?.subjectId || sessionState.session?.username || "anonymous"}`;
+    localStorage.setItem(memoryPreferenceKey, longTermMemoryEnabled.value ? "true" : "false");
   }
 
   onMounted(async () => {
@@ -1290,8 +2260,8 @@ export function useImageWorkspace(isAdmin: boolean) {
     await loadHistory();
     if (!unmounted) scanQueues();
   });
-  onBeforeUnmount(() => { unmounted = true; activeImageTurnQueueIds.clear(); submittedImageTaskIds.clear(); });
-  watch([imageRatio, imageTier, imageQuality, imageModel, imageCount, preserveSubject], persistPreferences);
+  onBeforeUnmount(() => { unmounted = true; activeImageTurnQueueIds.clear(); activeImageAgentIds.clear(); canceledImageAgentTurnIds.clear(); submittedImageTaskIds.clear(); });
+  watch([imageRatio, imageTier, imageQuality, imageModel, imageCount, preserveSubject, promptEngineMode, longTermMemoryEnabled], persistPreferences);
   watch(selectedConversationId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id);
     else localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
@@ -1299,7 +2269,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
-    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, batchProductImage, batchFolderImages, preserveSubject, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, appendReferenceFiles, removeReference, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
+    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, appendReferenceFiles, removeReference, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
   };
 }
 

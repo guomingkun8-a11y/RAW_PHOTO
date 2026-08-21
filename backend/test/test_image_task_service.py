@@ -13,8 +13,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from services.image_task_service import ImageTaskService
-from services.image_task_store import DatabaseImageTaskStore
+from services.image.image_prompt_compliance import IMAGE_PROMPT_DIRECTOR_MARKER, IMAGE_PROMPT_STANDARD_MARKER
+from services.image.image_task_assets import ImageAspectRatioMismatchError
+from services.image.image_task_service import ImageTaskService
+from services.image.image_task_store import DatabaseImageTaskStore
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -24,12 +26,14 @@ OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
 class MemoryTaskQueue:
     def __init__(self):
         self.items: list[str] = []
+        self.priorities: list[str] = []
         self.max_concurrency = 0
         self._lock = threading.Lock()
 
-    def enqueue(self, task_key: str) -> None:
+    def enqueue(self, task_key: str, priority: str = "agent") -> None:
         with self._lock:
             self.items.append(task_key)
+            self.priorities.append(priority)
 
     def dequeue(self, timeout_secs: int = 5) -> str | None:
         with self._lock:
@@ -60,8 +64,8 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 class ImageTaskServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.monitoring_patcher = mock.patch("services.image_task_service.generation_monitoring_service")
-        self.library_patcher = mock.patch("services.image_task_service.image_library_service")
+        self.monitoring_patcher = mock.patch("services.image.image_task_service.generation_monitoring_service")
+        self.library_patcher = mock.patch("services.image.image_task_service.image_library_service")
         self.monitoring_patcher.start()
         self.library_patcher.start()
 
@@ -114,6 +118,94 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+
+    def test_queue_priority_is_persisted_and_forwarded(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            queue = MemoryTaskQueue()
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                task_queue=queue,
+                run_inline=False,
+            )
+            task = service.submit_generation(
+                OWNER,
+                client_task_id="batch-priority-task",
+                prompt="batch image",
+                model="gpt-image-2",
+                size="1024x1024",
+                queue_priority="batch",
+            )
+
+            self.assertEqual("batch", task["queue_priority"])
+            self.assertEqual(["batch"], queue.priorities)
+
+    def test_result_postprocessing_releases_queue_consumer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            queue = MemoryTaskQueue()
+            store = DatabaseImageTaskStore(f"sqlite:///{root / 'tasks.db'}")
+            service = self.make_service(
+                root / "image_tasks.json",
+                task_store=store,
+                task_queue=queue,
+                run_inline=False,
+            )
+            service._postprocess_executor = ThreadPoolExecutor(max_workers=1)
+            postprocess_started = threading.Event()
+            allow_postprocess = threading.Event()
+
+            def delayed_normalize(data, **_kwargs):
+                postprocess_started.set()
+                allow_postprocess.wait(2)
+                return data
+
+            try:
+                with mock.patch(
+                    "services.image.image_task_service.normalize_task_result",
+                    side_effect=delayed_normalize,
+                ):
+                    service.submit_generation(
+                        OWNER,
+                        client_task_id="pipeline-task",
+                        prompt="pipeline image",
+                        model="gpt-image-2",
+                        size="1024x1024",
+                    )
+                    key = queue.dequeue(0)
+                    self.assertIsNotNone(key)
+                    returned = service.process_queued_task(key or "")
+                    self.assertTrue(postprocess_started.wait(1))
+                    self.assertEqual("running", returned["status"])
+                    allow_postprocess.set()
+                    completed = wait_for_task(service, OWNER, "pipeline-task", "success")
+                    self.assertEqual("success", completed["status"])
+            finally:
+                allow_postprocess.set()
+                service.close()
+
+    def test_standard_task_does_not_receive_professional_director_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            seen_payloads: list[dict] = []
+
+            def handler(payload):
+                seen_payloads.append(payload)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="standard-task",
+                prompt="plain product photo",
+                model="gpt-image-2",
+                size=None,
+                prompt_engine_mode="standard",
+            )
+
+            wait_for_task(service, OWNER, "standard-task", "success")
+            self.assertEqual(len(seen_payloads), 1)
+            self.assertIn(IMAGE_PROMPT_STANDARD_MARKER, seen_payloads[0]["prompt"])
+            self.assertNotIn(IMAGE_PROMPT_DIRECTOR_MARKER, seen_payloads[0]["prompt"])
+            self.assertEqual(seen_payloads[0]["prompt_engine_mode"], "standard")
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -703,6 +795,65 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["size"], "816x816")
             self.assertEqual(seen_payloads[0]["size"], "816x816")
 
+    def test_professional_wrong_aspect_ratio_retries_with_strict_native_canvas(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            store = DatabaseImageTaskStore(f"sqlite:///{root / 'tasks.db'}")
+            queue = MemoryTaskQueue()
+            handler_calls = 0
+            seen_payloads: list[dict[str, object]] = []
+
+            def handler(_payload):
+                nonlocal handler_calls
+                handler_calls += 1
+                seen_payloads.append(dict(_payload))
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(
+                root / "image_tasks.json",
+                handler,
+                task_store=store,
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 3,
+            )
+            with mock.patch(
+                "services.image.image_task_service.normalize_task_result",
+                side_effect=[
+                    ImageAspectRatioMismatchError(expected=(1024, 1024), actual=(1536, 1024)),
+                    [{"url": "http://assets.test/square.png", "width": 1024, "height": 1024}],
+                ],
+            ) as normalize_result:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="wrong-ratio-task",
+                    prompt="square product image",
+                    model="gpt-image-2",
+                    size="1024x1024",
+                    quality="high",
+                    base_url="http://local.test",
+                )
+
+                first_key = queue.dequeue(0)
+                self.assertIsNotNone(first_key)
+                service.process_queued_task(first_key or "")
+                retrying = service.list_tasks(OWNER, ["wrong-ratio-task"])["items"][0]
+                self.assertEqual(retrying["status"], "queued")
+
+                second_key = queue.dequeue(0)
+                self.assertIsNotNone(second_key)
+                service.process_queued_task(second_key or "")
+                completed = service.list_tasks(OWNER, ["wrong-ratio-task"])["items"][0]
+
+            self.assertEqual(completed["status"], "success")
+            self.assertEqual(handler_calls, 2)
+            self.assertIn("画布比例重试硬约束：", str(seen_payloads[1]["prompt"]))
+            self.assertIn("目标画布", str(seen_payloads[1]["prompt"]))
+            self.assertEqual(seen_payloads[1]["size"], "1024x1024")
+            self.assertEqual(normalize_result.call_args_list[0].kwargs["aspect_policy"], "reject")
+            self.assertEqual(normalize_result.call_args_list[1].kwargs["aspect_policy"], "conform")
+            service.close()
+
     def test_relay_enabled_uses_relay_generation_handler(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = self.make_service(
@@ -712,7 +863,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             service.relay_enabled_getter = lambda: True
             with (
                 mock.patch(
-                    "services.image_task_service.openai_relay_service.image_generations",
+                    "services.image.image_task_service.openai_relay_service.image_generations",
                     return_value={"data": [{"url": "http://relay.test/image.png"}]},
                 ) as relay_handler,
             ):
@@ -745,7 +896,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             service._record_monitoring_event("owner-1:recorded-success-task")
-            from services import image_task_service as module
+            from services.image import image_task_service as module
 
             module.image_library_service.record_task_result.assert_called()
             module.generation_monitoring_service.record_task_event.assert_called()
@@ -772,8 +923,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "sync-missing-task", "success")
             wait_for_task(service, OTHER_OWNER, "sync-other-task", "success")
 
-            from services import image_task_service as module
+            from services.image import image_task_service as module
 
+            deadline = time.time() + 2
+            while module.image_library_service.record_task_result.call_count < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(module.image_library_service.record_task_result.call_count, 2)
             module.image_library_service.record_task_result.reset_mock()
             module.image_library_service.has_task_result.side_effect = lambda task_id: task_id == "sync-missing-task"
 
@@ -821,7 +976,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertIn("转发模式", str(ctx.exception))
 
-    def test_preserve_subject_adds_locked_prompt_and_mask_without_compositing(self):
+    def test_professional_preserve_subject_adds_locked_prompt_and_mask_without_compositing(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             product = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             draw = ImageDraw.Draw(product)
@@ -849,12 +1004,13 @@ class ImageTaskServiceTests(unittest.TestCase):
             service.submit_edit(
                 OWNER,
                 client_task_id="preserve-task",
-                prompt="put it on a marble table",
+                prompt="把商品放到大理石台面",
                 model="gpt-image-2",
                 size=None,
                 base_url="http://local.test",
                 images=[(product_buf.getvalue(), "product.png", "image/png")],
                 preserve_subject=True,
+                prompt_engine_mode="professional",
             )
 
             task = wait_for_task(service, OWNER, "preserve-task", "success")
@@ -866,6 +1022,109 @@ class ImageTaskServiceTests(unittest.TestCase):
                 mask = mask.convert("RGBA")
                 self.assertGreater(mask.getpixel((32, 32))[3], 200)
                 self.assertLess(mask.getpixel((4, 4))[3], 20)
+
+    def test_standard_scene_edit_uses_lightweight_preservation_without_mask(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            product = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(product)
+            draw.rectangle((22, 18, 42, 46), fill=(220, 20, 30, 255))
+            product_buf = io.BytesIO()
+            product.save(product_buf, format="PNG")
+
+            def handler(payload):
+                self.assertNotIn("Product subject preservation mode", payload["prompt"])
+                self.assertIn("标准 Prompt 约束", payload["prompt"])
+                self.assertIn("不得覆盖本轮明确修改要求", payload["prompt"])
+                self.assertEqual(payload["mask"], [])
+                return {"data": [{"url": "http://example.test/standard-scene.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="standard-scene-task",
+                prompt="把商品放到真实厨房场景",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+                images=[(product_buf.getvalue(), "product.png", "image/png")],
+                preserve_subject=True,
+                prompt_engine_mode="standard",
+            )
+
+            task = wait_for_task(service, OWNER, "standard-scene-task", "success")
+            self.assertEqual(task["data"][0]["url"], "http://example.test/standard-scene.png")
+
+    def test_standard_product_edit_disables_conflicting_preserve_prompt_and_mask(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            product = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(product)
+            draw.rectangle((22, 18, 42, 46), fill=(220, 20, 30, 255))
+            product_buf = io.BytesIO()
+            product.save(product_buf, format="PNG")
+
+            seen_payloads: list[dict] = []
+
+            def handler(payload):
+                seen_payloads.append(payload)
+                self.assertNotIn("Product subject preservation mode", payload["prompt"])
+                self.assertIn("允许严格按照用户原始提示修改商品", payload["prompt"])
+                self.assertEqual(payload["mask"], [])
+                return {"data": [{"url": "http://example.test/product-style.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="standard-product-style-task",
+                prompt="换一个商品的瓶子的样子",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+                images=[(product_buf.getvalue(), "product.png", "image/png")],
+                preserve_subject=True,
+                prompt_engine_mode="standard",
+            )
+
+            task = wait_for_task(service, OWNER, "standard-product-style-task", "success")
+
+            self.assertEqual(task["data"][0]["url"], "http://example.test/product-style.png")
+            self.assertEqual(len(seen_payloads), 1)
+
+    def test_professional_product_edit_policy_disables_conflicting_preserve_mask(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            product = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(product)
+            draw.rectangle((22, 18, 42, 46), fill=(220, 20, 30, 255))
+            product_buf = io.BytesIO()
+            product.save(product_buf, format="PNG")
+
+            seen_payloads: list[dict] = []
+
+            def handler(payload):
+                seen_payloads.append(payload)
+                self.assertNotIn("Product subject preservation mode", payload["prompt"])
+                self.assertIn("允许修改用户明确指定的商品属性", payload["prompt"])
+                self.assertEqual(payload["mask"], [])
+                self.assertEqual(payload["subject_mutation_policy"], "mutate_requested_attributes")
+                return {"data": [{"url": "http://example.test/professional-product-style.png"}]}
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_edit(
+                OWNER,
+                client_task_id="professional-product-style-task",
+                prompt="把瓶身改成方形磨砂包装",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+                images=[(product_buf.getvalue(), "product.png", "image/png")],
+                preserve_subject=True,
+                prompt_engine_mode="professional",
+                subject_mutation_policy="mutate_requested_attributes",
+            )
+
+            task = wait_for_task(service, OWNER, "professional-product-style-task", "success")
+
+            self.assertEqual(task["data"][0]["url"], "http://example.test/professional-product-style.png")
+            self.assertEqual(len(seen_payloads), 1)
 
     def test_preserve_subject_skips_auto_mask_when_relay_cannot_use_masks(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -886,8 +1145,8 @@ class ImageTaskServiceTests(unittest.TestCase):
             service = self.make_service(Path(tmp_dir) / "image_tasks.json")
             service.relay_enabled_getter = lambda: True
             with (
-                mock.patch("services.image_task_service.openai_relay_service.image_edits", side_effect=handler),
-                mock.patch("services.image_task_service.openai_relay_service.supports_image_edit_masks", return_value=False),
+                mock.patch("services.image.image_task_service.openai_relay_service.image_edits", side_effect=handler),
+                mock.patch("services.image.image_task_service.openai_relay_service.supports_image_edit_masks", return_value=False),
             ):
                 service.submit_edit(
                     OWNER,

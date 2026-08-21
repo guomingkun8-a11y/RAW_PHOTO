@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
-from services.proxy_service import proxy_settings
+from services.platform.proxy_service import proxy_settings
 from utils.log import logger
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}

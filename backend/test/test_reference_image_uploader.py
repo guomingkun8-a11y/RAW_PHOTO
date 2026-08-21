@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 from minio.error import S3Error
 
-from services import reference_image_uploader
+from services.image import reference_image_uploader
 
 
 def _s3_error(code: str) -> S3Error:

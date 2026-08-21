@@ -4,9 +4,9 @@ from pathlib import Path
 
 from fastapi import HTTPException, Request
 
-from services.auth_service import auth_service
-from services.config import config
-from services.user_service import user_service
+from services.accounts.auth_service import auth_service
+from services.platform.config import config
+from services.accounts.user_service import user_service
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 WEB_DIST_DIRS = [

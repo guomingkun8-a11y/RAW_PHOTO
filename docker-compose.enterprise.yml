@@ -30,6 +30,19 @@ services:
       timeout: 5s
       retries: 12
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required}
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   schema-init:
     build:
       context: .
@@ -39,9 +52,15 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      qdrant:
+        condition: service_healthy
     environment: &app-environment
+      GMKRAW_ENTERPRISE_MODE: "true"
+      GMKRAW_REQUIRE_VECTOR_SEARCH: ${GMKRAW_REQUIRE_VECTOR_SEARCH:-true}
       GMKRAW_AUTH_KEY: ${GMKRAW_AUTH_KEY:?GMKRAW_AUTH_KEY is required}
       GMKRAW_STRICT_SECRET_SOURCES: "true"
+      STORAGE_BACKEND: mysql
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
       GMKRAW_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
       MYSQL_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
       IMAGE_TASK_DATABASE_URL: mysql+pymysql://${MYSQL_USER:-raw_photo}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-raw_photo}?charset=utf8mb4
@@ -54,9 +73,31 @@ services:
       IMAGE_TASK_WORKER_CONCURRENCY: ${IMAGE_TASK_WORKER_CONCURRENCY:-5}
       IMAGE_TASK_OWNER_CONCURRENCY: ${IMAGE_TASK_OWNER_CONCURRENCY:-2}
       IMAGE_TASK_OWNER_PENDING_LIMIT: ${IMAGE_TASK_OWNER_PENDING_LIMIT:-30}
+      AGENT_QUEUE_ENABLED: "true"
+      AGENT_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      AGENT_QUEUE_NAME: ${AGENT_QUEUE_NAME:-professional_agent_jobs}
+      AGENT_WORKER_CONCURRENCY: ${AGENT_WORKER_CONCURRENCY:-4}
+      AGENT_TOTAL_CONCURRENCY: ${AGENT_TOTAL_CONCURRENCY:-4}
+      AGENT_OWNER_CONCURRENCY: ${AGENT_OWNER_CONCURRENCY:-1}
+      AGENT_OWNER_PENDING_LIMIT: ${AGENT_OWNER_PENDING_LIMIT:-10}
+      AGENT_SLOT_LEASE_SECS: ${AGENT_SLOT_LEASE_SECS:-900}
+      AGENT_JOB_RETENTION_SECS: ${AGENT_JOB_RETENTION_SECS:-86400}
+      AGENT_MAX_RETRIES: ${AGENT_MAX_RETRIES:-3}
+      AGENT_RETRY_BASE_DELAY_SECS: ${AGENT_RETRY_BASE_DELAY_SECS:-2}
+      AGENT_RETRY_MAX_DELAY_SECS: ${AGENT_RETRY_MAX_DELAY_SECS:-60}
+      AGENT_DEAD_LETTER_RETENTION_SECS: ${AGENT_DEAD_LETTER_RETENTION_SECS:-604800}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-raw_professional_memory}
+      QDRANT_FOLDER_COLLECTION: ${QDRANT_FOLDER_COLLECTION:-raw_professional_folder_assets}
+      QDRANT_KNOWLEDGE_COLLECTION: ${QDRANT_KNOWLEDGE_COLLECTION:-raw_professional_knowledge}
+      WEB_SECURITY_SSRF_PROTECTION: "true"
       GMKRAW_OPENAI_RELAY_ENABLED: ${GMKRAW_OPENAI_RELAY_ENABLED:-false}
       GMKRAW_OPENAI_RELAY_BASE_URL: ${GMKRAW_OPENAI_RELAY_BASE_URL:-}
       GMKRAW_OPENAI_RELAY_API_KEY: ${GMKRAW_OPENAI_RELAY_API_KEY:-}
+      GMKRAW_EMBEDDING_BASE_URL: ${GMKRAW_EMBEDDING_BASE_URL:-}
+      GMKRAW_EMBEDDING_API_KEY: ${GMKRAW_EMBEDDING_API_KEY:-}
+      GMKRAW_EMBEDDING_MODEL: ${GMKRAW_EMBEDDING_MODEL:-text-embedding-3-small}
       GMKRAW_IMAGE_REFERENCE_UPLOAD_ENABLED: "true"
       GMKRAW_OSS_ENDPOINT: ${GMKRAW_OSS_ENDPOINT:-https://oss-cn-beijing.aliyuncs.com}
       GMKRAW_OSS_ACCESS_KEY_ID: ${GMKRAW_OSS_ACCESS_KEY_ID:?GMKRAW_OSS_ACCESS_KEY_ID is required}
@@ -66,15 +107,19 @@ services:
       GMKRAW_OSS_REFERENCE_PREFIX: ${GMKRAW_OSS_REFERENCE_PREFIX:-raw-photo/reference}
       GMKRAW_OSS_REFERENCE_PUBLIC_BASE_URL: ${GMKRAW_OSS_REFERENCE_PUBLIC_BASE_URL:-}
       GMKRAW_IMAGE_STORAGE_ENABLED: "true"
-      GMKRAW_IMAGE_STORAGE_MODE: both
-      GMKRAW_IMAGE_STORAGE_PROVIDER: minio
-      GMKRAW_MINIO_ENDPOINT: ${GMKRAW_OSS_ENDPOINT:-https://oss-cn-beijing.aliyuncs.com}
-      GMKRAW_MINIO_ACCESS_KEY: ${GMKRAW_OSS_ACCESS_KEY_ID:?GMKRAW_OSS_ACCESS_KEY_ID is required}
-      GMKRAW_MINIO_SECRET_KEY: ${GMKRAW_OSS_ACCESS_KEY_SECRET:?GMKRAW_OSS_ACCESS_KEY_SECRET is required}
-      GMKRAW_MINIO_BUCKET: ${GMKRAW_OSS_BUCKET:?GMKRAW_OSS_BUCKET is required}
-      GMKRAW_MINIO_REGION: ${GMKRAW_OSS_REGION:-oss-cn-beijing}
+      GMKRAW_IMAGE_STORAGE_MODE: ${GMKRAW_IMAGE_STORAGE_MODE:-both}
+      GMKRAW_IMAGE_STORAGE_PROVIDER: ${GMKRAW_IMAGE_STORAGE_PROVIDER:-minio}
+      GMKRAW_MINIO_ENDPOINT: ${GMKRAW_MINIO_ENDPOINT:-${GMKRAW_OSS_ENDPOINT:-https://oss-cn-beijing.aliyuncs.com}}
+      GMKRAW_MINIO_ACCESS_KEY: ${GMKRAW_MINIO_ACCESS_KEY:-${GMKRAW_OSS_ACCESS_KEY_ID:?GMKRAW_OSS_ACCESS_KEY_ID is required}}
+      GMKRAW_MINIO_SECRET_KEY: ${GMKRAW_MINIO_SECRET_KEY:-${GMKRAW_OSS_ACCESS_KEY_SECRET:?GMKRAW_OSS_ACCESS_KEY_SECRET is required}}
+      GMKRAW_MINIO_BUCKET: ${GMKRAW_MINIO_BUCKET:-${GMKRAW_OSS_BUCKET:?GMKRAW_OSS_BUCKET is required}}
+      GMKRAW_MINIO_REGION: ${GMKRAW_MINIO_REGION:-${GMKRAW_OSS_REGION:-oss-cn-beijing}}
       GMKRAW_MINIO_ROOT_PATH: ${GMKRAW_MINIO_ROOT_PATH:-raw-photo/images}
       GMKRAW_IMAGE_STORAGE_PUBLIC_BASE_URL: ${GMKRAW_IMAGE_STORAGE_PUBLIC_BASE_URL:-}
+      GMKRAW_WEBDAV_URL: ${GMKRAW_WEBDAV_URL:-}
+      GMKRAW_WEBDAV_USERNAME: ${GMKRAW_WEBDAV_USERNAME:-}
+      GMKRAW_WEBDAV_PASSWORD: ${GMKRAW_WEBDAV_PASSWORD:-}
+      GMKRAW_WEBDAV_ROOT_PATH: ${GMKRAW_WEBDAV_ROOT_PATH:-raw-photo/images}
 
   app:
     image: raw-photo:enterprise
@@ -83,6 +128,8 @@ services:
       mysql:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      qdrant:
         condition: service_healthy
       schema-init:
         condition: service_completed_successfully
@@ -107,6 +154,24 @@ services:
     volumes:
       - ./data:/app/data
 
+  agent-worker:
+    image: raw-photo:enterprise
+    restart: unless-stopped
+    command: ["uv", "run", "python", "agent_worker.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    environment: *app-environment
+    volumes:
+      - ./data:/app/data
+
 volumes:
   mysql-data:
   redis-data:
+  qdrant-data:

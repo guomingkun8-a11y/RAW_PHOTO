@@ -9,12 +9,16 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
-from services.image_size import normalize_image_size
+from services.image.image_prompt_compliance import ensure_image_prompt_engineered
+from services.image.image_size import normalize_image_size
 from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    prompt = str(body.get("prompt") or "")
+    prompt = ensure_image_prompt_engineered(
+        str(body.get("prompt") or ""),
+        prompt_engine_mode=str(body.get("prompt_engine_mode") or "professional"),
+    )
     model = str(body.get("model") or "gpt-image-2")
     n = int(body.get("n") or 1)
     size = normalize_image_size(body.get("size"))

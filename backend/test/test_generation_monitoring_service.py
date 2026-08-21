@@ -7,7 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from services.generation_monitoring_service import GenerationMonitoringService
+from services.image.generation_monitoring_service import GenerationMonitoringService
 
 
 class GenerationMonitoringServiceTests(unittest.TestCase):

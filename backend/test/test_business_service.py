@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from services.business_service import (
+from services.accounts.business_service import (
     LEGACY_DEFAULT_TEMPLATE_CONTENT,
     BusinessService,
     PromptTemplateModel,
@@ -127,6 +127,36 @@ class BusinessServiceTemplateTests(unittest.TestCase):
                     self.assertEqual(custom_content, row.content)
                 finally:
                     session.close()
+            finally:
+                if service.engine is not None:
+                    service.engine.dispose()
+
+    def test_public_templates_are_read_only_for_regular_users(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self._service(tmp_dir)
+            try:
+                user = {"id": "user-1", "role": "user"}
+                listed = service.list_templates(identity=user, enabled_only=False)
+                system_template = next(
+                    item for item in listed["items"] if item["id"] and not item["can_manage"]
+                )
+                self.assertFalse(system_template["can_manage"])
+                self.assertIsNone(
+                    service.update_template(
+                        identity=user,
+                        template_id=system_template["id"],
+                        data={"name": "should remain unchanged"},
+                    )
+                )
+
+                created = service.create_template(
+                    identity=user,
+                    data={"name": "User template", "content": "A private prompt"},
+                )
+                self.assertTrue(created["can_manage"])
+                refreshed = service.list_templates(identity=user, enabled_only=False)
+                own_template = next(item for item in refreshed["items"] if item["id"] == created["id"])
+                self.assertTrue(own_template["can_manage"])
             finally:
                 if service.engine is not None:
                     service.engine.dispose()

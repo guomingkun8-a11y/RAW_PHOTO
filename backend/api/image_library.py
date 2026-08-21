@@ -12,9 +12,9 @@ from pydantic import BaseModel
 
 from api.image_inputs import _download_image_url
 from api.support import require_identity, resolve_image_base_url
-from services.image_library_service import image_library_service
-from services.image_storage_service import image_storage_service
-from services.image_task_service import image_task_service
+from services.image.image_library_service import image_library_service
+from services.image.image_storage_service import image_storage_service
+from services.image.image_task_service import image_task_service
 
 ZIP_MAX_ITEM_BYTES = 50 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024

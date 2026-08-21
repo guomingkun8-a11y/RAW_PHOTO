@@ -114,6 +114,7 @@
     "api_key_pool_lease_secs": 600,
     "api_key_pool_cooldown_secs": 60,
     "api_key_pool_max_attempts": 3,
-    "prompt_analysis_model": "gpt-4o"
+    "prompt_analysis_model": "gpt-4o",
+    "embedding_model": "text-embedding-3-small"
   }
 }

@@ -4,6 +4,7 @@ import {
   Bell,
   Camera,
   Clock3,
+  History,
   ImageIcon,
   KeyRound,
   Library,
@@ -11,14 +12,14 @@ import {
   LogOut,
   Menu,
   Moon,
-  Search,
+  PanelLeftClose,
+  PanelLeftOpen,
   Sparkles,
   Sun,
   UserRound,
   Users,
   WandSparkles,
   X,
-  Zap,
 } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -33,7 +34,6 @@ import { sessionState, setSession } from "@/stores/session";
 const route = useRoute();
 const router = useRouter();
 const mobileOpen = ref(false);
-const searchValue = ref("");
 const taskCount = ref(0);
 const showNotifications = ref(false);
 const announcements = ref<SystemAnnouncement[]>([]);
@@ -58,6 +58,8 @@ let taskCountPromise: Promise<void> | null = null;
 let passwordClearTimers: number[] = [];
 const TASK_COUNT_CACHE_MS = 30_000;
 const ANNOUNCEMENT_CACHE_MS = 60_000;
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "gmkraw:studio_sidebar_collapsed";
+const sidebarCollapsed = ref(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true");
 
 const navItems = [
   { href: "/image", label: "图片生成", detail: "AI 创作台", icon: WandSparkles },
@@ -65,17 +67,26 @@ const navItems = [
   { href: "/image-library", label: "历史图库", detail: "瀑布流资产", icon: Library },
   { href: "/monitoring", label: "监控看板", detail: "运行状态", icon: Activity, adminOnly: true },
   { href: "/users", label: "成员权限", detail: "团队管理", icon: Users, adminOnly: true },
+  { href: "/image?history=1", activePath: "/image", activeQuery: { history: "1" }, label: "生成历史记录", detail: "全部生成任务", icon: History },
 ];
 
 const visibleNavItems = computed(() => navItems.filter((item) => !item.adminOnly || sessionState.session?.role === "admin"));
+const contentInsetClass = computed(() => sidebarCollapsed.value ? "lg:pl-0" : "lg:pl-[var(--studio-content-left)]");
 const userInitial = computed(() => {
   const source = sessionState.session?.name || sessionState.session?.username || "U";
   return source.trim().slice(0, 1).toUpperCase();
 });
 const userAvatarUrl = computed(() => resolveApiAssetUrl(sessionState.session?.avatarUrl));
 
-function isActive(href: string) {
-  return route.path === href || route.path.startsWith(`${href}/`);
+function isActive(item: (typeof navItems)[number]) {
+  const targetPath = item.activePath || item.href.split("?")[0] || item.href;
+  const pathMatched = route.path === targetPath || route.path.startsWith(`${targetPath}/`);
+  if (!pathMatched) return false;
+  if (item.activeQuery) {
+    return Object.entries(item.activeQuery).every(([key, value]) => route.query[key] === value);
+  }
+  if (route.path === "/image" && route.query.history === "1" && targetPath === "/image") return false;
+  return true;
 }
 
 async function loadTaskCount(force = false) {
@@ -140,15 +151,9 @@ function toggleTheme() {
   localStorage.setItem("gmkraw-theme", isDark.value ? "dark" : "light");
 }
 
-async function submitSearch() {
-  const query = searchValue.value.trim();
-  mobileOpen.value = false;
-  if (route.path === "/image-library") {
-    await router.replace({ path: "/image-library", query: query ? { search: query } : {} });
-    window.dispatchEvent(new CustomEvent("image-library-search", { detail: { query } }));
-    return;
-  }
-  await router.push({ path: "/image-library", query: query ? { search: query } : {} });
+function toggleSidebarCollapsed() {
+  sidebarCollapsed.value = !sidebarCollapsed.value;
+  localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed.value ? "true" : "false");
 }
 
 async function handleLogout() {
@@ -304,13 +309,17 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="min-h-[100dvh] bg-[#F8FAFC] dark:bg-[#0f1115]">
+  <div class="min-h-[100dvh] bg-[#F8FAFC] dark:bg-[#0f1115]" :class="{ 'studio-shell-sidebar-collapsed': sidebarCollapsed }">
     <header class="sticky top-0 z-40 flex h-[var(--studio-nav-height)] items-center border-b border-black/[0.06] bg-[#F8FAFC]/88 px-4 backdrop-blur-2xl dark:border-white/10 dark:bg-[#0f1115]/84 sm:px-5">
       <div class="mx-auto grid h-14 w-full max-w-[1680px] grid-cols-[auto_1fr_auto] items-center gap-3">
         <div class="flex min-w-0 items-center gap-3">
           <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:hidden" aria-label="打开导航" @click="mobileOpen = !mobileOpen">
             <X v-if="mobileOpen" class="size-5" />
             <Menu v-else class="size-5" />
+          </button>
+          <button type="button" class="studio-button hidden size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:inline-flex" :aria-label="sidebarCollapsed ? '展开导航' : '收起导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" data-testid="studio-sidebar-toggle" @click="toggleSidebarCollapsed">
+            <PanelLeftOpen v-if="sidebarCollapsed" class="size-5" />
+            <PanelLeftClose v-else class="size-5" />
           </button>
           <RouterLink to="/image" class="group flex min-w-0 items-center gap-3 rounded-2xl pr-2 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-[#4F7CFF]/20" aria-label="AI Image Studio">
             <span class="relative flex size-12 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-slate-950 text-white shadow-[0_16px_36px_rgba(17,24,39,0.18)] dark:bg-white dark:text-slate-950">
@@ -323,16 +332,7 @@ onBeforeUnmount(() => {
           </RouterLink>
         </div>
 
-        <form class="relative mx-auto hidden h-12 w-full max-w-[560px] items-center rounded-2xl border border-black/[0.06] bg-white px-4 text-slate-700 shadow-[0_12px_30px_rgba(15,23,42,0.05)] focus-within:border-[#4F7CFF]/35 focus-within:ring-[4px] focus-within:ring-[#4F7CFF]/10 dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 md:flex" @submit.prevent="submitSearch">
-          <Search class="pointer-events-none size-4 text-slate-400" />
-          <input v-model="searchValue" placeholder="搜索历史、模板、图片" class="h-full min-w-0 flex-1 bg-transparent px-3 text-[14px] outline-none placeholder:text-slate-500" />
-          <span class="rounded-lg border border-black/[0.06] bg-slate-50 px-2 py-1 text-[11px] font-medium text-slate-400 dark:border-white/10 dark:bg-white/[0.06]">⌘ K</span>
-        </form>
-
         <div class="relative flex min-w-0 items-center justify-end gap-2">
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300 md:hidden" aria-label="全局搜索" @click="submitSearch">
-            <Search class="size-4" />
-          </button>
           <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" @click="toggleNotifications">
             <Bell class="size-4" />
           </button>
@@ -401,13 +401,10 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <aside class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl dark:border-white/10 dark:bg-white/[0.055] lg:flex">
-      <div class="mb-3 rounded-2xl bg-slate-950 p-3 text-white dark:bg-white dark:text-slate-950">
-        <div class="flex items-center gap-2 text-sm font-semibold"><Zap class="size-4 text-[#4F7CFF]" />Creative OS</div>
-      </div>
+    <aside class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl transition-[transform,opacity] duration-300 ease-[var(--studio-ease)] dark:border-white/10 dark:bg-white/[0.055] lg:flex" :class="sidebarCollapsed ? 'pointer-events-none -translate-x-[260px] opacity-0' : 'translate-x-0 opacity-100'">
       <nav class="flex flex-col gap-2">
-        <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="group relative flex min-h-[58px] items-center gap-3 rounded-2xl border px-3.5 py-3 text-left transition" :class="isActive(item.href) ? 'border-[#4F7CFF]/20 bg-[#4F7CFF]/10 text-slate-950 shadow-[0_8px_18px_rgba(79,124,255,0.12)] dark:text-white' : 'border-transparent text-slate-600 hover:border-black/[0.04] hover:bg-[#4F7CFF]/[0.08] hover:text-slate-950 dark:text-stone-300 dark:hover:border-white/10 dark:hover:text-white'">
-          <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="isActive(item.href) ? 'bg-[#4F7CFF] text-white' : 'bg-slate-100 text-slate-600 dark:bg-white/[0.07] dark:text-stone-300'"><component :is="item.icon" class="size-4" /></span>
+        <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="group relative flex min-h-[58px] items-center gap-3 rounded-2xl border px-3.5 py-3 text-left transition" :class="isActive(item) ? 'border-[#4F7CFF]/20 bg-[#4F7CFF]/10 text-slate-950 shadow-[0_8px_18px_rgba(79,124,255,0.12)] dark:text-white' : 'border-transparent text-slate-600 hover:border-black/[0.04] hover:bg-[#4F7CFF]/[0.08] hover:text-slate-950 dark:text-stone-300 dark:hover:border-white/10 dark:hover:text-white'">
+          <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="isActive(item) ? 'bg-[#4F7CFF] text-white' : 'bg-slate-100 text-slate-600 dark:bg-white/[0.07] dark:text-stone-300'"><component :is="item.icon" class="size-4" /></span>
           <span class="min-w-0"><span class="block truncate text-[15px] font-semibold">{{ item.label }}</span><span class="mt-0.5 block truncate text-[12px] text-slate-500 dark:text-stone-400">{{ item.detail }}</span></span>
         </RouterLink>
       </nav>
@@ -415,11 +412,11 @@ onBeforeUnmount(() => {
 
     <div v-if="mobileOpen" class="fixed inset-x-3 top-[86px] z-50 rounded-[20px] border border-black/[0.06] bg-white p-3 shadow-[0_24px_70px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21] lg:hidden">
       <nav class="flex flex-col gap-2">
-        <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="flex items-center gap-3 rounded-2xl px-3.5 py-3 text-slate-700 hover:bg-[#4F7CFF]/10 dark:text-stone-200"><component :is="item.icon" class="size-4" />{{ item.label }}</RouterLink>
+        <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="flex items-center gap-3 rounded-2xl px-3.5 py-3 text-slate-700 hover:bg-[#4F7CFF]/10 dark:text-stone-200" :class="isActive(item) ? 'bg-[#4F7CFF]/10 text-slate-950 dark:text-white' : ''"><component :is="item.icon" class="size-4" />{{ item.label }}</RouterLink>
       </nav>
     </div>
 
-    <div class="relative z-10 min-h-[calc(100dvh_-_var(--studio-nav-height))] lg:pl-[var(--studio-content-left)]"><slot /></div>
+    <div class="relative z-10 min-h-[calc(100dvh_-_var(--studio-nav-height))] transition-[padding] duration-300 ease-[var(--studio-ease)]" :class="contentInsetClass" data-testid="studio-content"><slot /></div>
 
     <BaseModal :open="passwordOpen" title="修改密码" description="修改后当前登录会失效，需要使用新密码重新登录。" width-class="max-w-[440px]" :show-close="!passwordSaving" @close="closePasswordModal">
       <form class="space-y-4 p-5" @submit.prevent="submitPasswordChange">

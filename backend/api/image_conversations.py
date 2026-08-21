@@ -7,7 +7,8 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.support import require_identity
-from services.image_conversation_service import image_conversation_service
+from services.image.image_conversation_service import image_conversation_service
+from services.ecommerce.ecommerce_agent_memory_service import ecommerce_agent_memory_service
 
 
 class ImageConversationUpsertRequest(BaseModel):
@@ -83,6 +84,11 @@ def create_router() -> APIRouter:
         )
         if not deleted:
             raise HTTPException(status_code=404, detail={"error": "conversation not found"})
+        await run_in_threadpool(
+            ecommerce_agent_memory_service.delete_conversation,
+            owner_id=str(identity.get("id") or identity.get("username") or "anonymous"),
+            conversation_id=conversation_id,
+        )
         return {"ok": True}
 
     @router.delete("/api/image-conversations")
@@ -91,6 +97,10 @@ def create_router() -> APIRouter:
         deleted = await run_in_threadpool(
             image_conversation_service.clear_conversations,
             identity=identity,
+        )
+        await run_in_threadpool(
+            ecommerce_agent_memory_service.clear_conversations,
+            owner_id=str(identity.get("id") or identity.get("username") or "anonymous"),
         )
         return {"ok": True, "deleted": deleted}
 

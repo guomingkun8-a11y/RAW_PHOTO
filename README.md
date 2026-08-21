@@ -113,7 +113,41 @@ redis-server
 Get-NetTCPConnection -LocalPort 6379 -State Listen
 ```
 
-### 4. 启动后端
+### 4. 启动 Qdrant
+
+专业 Agent 的长期记忆和文件夹视觉分析可以使用 Qdrant。Docker Desktop 启动后执行：
+
+```powershell
+docker compose -f docker-compose.local.yml up -d qdrant
+```
+
+本地 Dashboard：
+
+```text
+http://127.0.0.1:6333/dashboard
+```
+
+本地 `.env.local` 配置：
+
+```text
+QDRANT_URL=http://127.0.0.1:6333
+QDRANT_COLLECTION=raw_professional_memory
+QDRANT_FOLDER_COLLECTION=raw_professional_folder_assets
+QDRANT_KNOWLEDGE_COLLECTION=raw_professional_knowledge
+GMKRAW_EMBEDDING_BASE_URL=https://embedding.example.com/v1
+GMKRAW_EMBEDDING_API_KEY=replace-with-embedding-api-key
+GMKRAW_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+Qdrant 只负责保存和检索向量，Embedding 由 `GMKRAW_EMBEDDING_BASE_URL` 指向的 OpenAI 兼容 `/v1/embeddings` 服务生成。本地模式在 Embedding 暂时不可用时会退回关键词检索；企业模式要求知识库和长期记忆向量回填完整，否则 `schema-init` 会拒绝启动 app 和 worker。
+
+配置好 Embedding 后可手动执行一次全量回填：
+
+```powershell
+.\.venv\Scripts\python.exe backend\scripts\reindex_professional_vectors.py
+```
+
+### 5. 启动后端
 
 ```powershell
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8002 --log-level info
@@ -126,7 +160,7 @@ http://127.0.0.1:8002
 http://127.0.0.1:8002/docs
 ```
 
-### 5. 启动 worker
+### 6. 启动 worker
 
 新开一个 PowerShell：
 
@@ -137,7 +171,18 @@ cd "D:\raw photo"
 
 worker 负责真正消费生图任务。只启动后端和前端，任务会入队但不会被处理。
 
-### 6. 启动前端
+### 7. 启动 Agent worker
+
+再新开一个 PowerShell：
+
+```powershell
+cd "D:\raw photo"
+.\.venv\Scripts\python.exe agent_worker.py
+```
+
+Agent worker 负责专业模式的对话、文件夹分析、批计划执行和长期记忆蒸馏。
+
+### 8. 启动前端
 
 新开一个 PowerShell：
 
@@ -193,9 +238,15 @@ MYSQL_ROOT_PASSWORD
 REDIS_PASSWORD
 GMKRAW_OPENAI_RELAY_BASE_URL
 GMKRAW_OPENAI_RELAY_API_KEY
+GMKRAW_EMBEDDING_BASE_URL
+GMKRAW_EMBEDDING_API_KEY
+GMKRAW_EMBEDDING_MODEL
+GMKRAW_OSS_ACCESS_KEY_ID
+GMKRAW_OSS_ACCESS_KEY_SECRET
+GMKRAW_OSS_BUCKET
 ```
 
-如果使用阿里云 OSS，还需要配置 `GMKRAW_OSS_*` 对象存储参数。
+企业模式固定使用 MySQL、Redis 队列、Qdrant 和远端对象存储，并拒绝任何 `sqlite://` 业务数据库配置。`schema-init` 会先执行数据库迁移、同步专业知识正文，再回填知识库和长期记忆向量；任一步未完成都不会启动正式服务。
 
 ### 3. 启动企业版内网栈
 
@@ -249,6 +300,12 @@ IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_THRESHOLD=10
 IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_MAX=20
 IMAGE_TASK_OWNER_PENDING_LIMIT=30
 IMAGE_TASK_MAX_RETRIES=2
+AGENT_QUEUE_ENABLED=true
+AGENT_REDIS_URL=redis://:password@redis:6379/0
+AGENT_WORKER_CONCURRENCY=4
+AGENT_TOTAL_CONCURRENCY=4
+AGENT_OWNER_CONCURRENCY=1
+AGENT_OWNER_PENDING_LIMIT=10
 ```
 
 含义：
@@ -259,6 +316,12 @@ IMAGE_TASK_MAX_RETRIES=2
 - `IMAGE_TASK_DYNAMIC_OWNER_CONCURRENCY_*`：低活跃用户时按全局空闲槽弹性提高单用户上限，超过阈值后回到固定上限。
 - `IMAGE_TASK_OWNER_PENDING_LIMIT`：单个用户排队加运行的任务上限。
 - `IMAGE_TASK_MAX_RETRIES`：失败自动重试次数。
+- `AGENT_TOTAL_CONCURRENCY`：所有 Agent worker 的全局执行上限。
+- `AGENT_WORKER_CONCURRENCY`：单个 Agent worker 的消费线程数。
+- `AGENT_OWNER_CONCURRENCY`：单个用户同时执行的 Agent 数量上限。
+- `AGENT_OWNER_PENDING_LIMIT`：单个用户排队加运行的 Agent 数量上限。
+
+专业 Agent 的 run、事件和取消状态保存在 MySQL，Redis Streams 负责持久排队、分布式并发槽、用户会话锁与 SSE 事件唤醒。部署时必须同时运行 `agent-worker.py`；多个 app 实例和 Agent worker 需要共用 MySQL、Redis 以及 `data` 目录。
 
 建议先保守设置，例如：
 

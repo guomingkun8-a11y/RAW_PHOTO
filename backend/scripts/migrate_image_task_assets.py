@@ -10,11 +10,11 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.config import config
-from services.database_migrations import run_migrations
-from services.enterprise_schema import resolve_enterprise_database_url
-from services.image_task_assets import contains_inline_assets, normalize_task_result, prepare_task_payload
-from services.image_task_store import DatabaseImageTaskStore
+from services.platform.config import config
+from services.platform.database_migrations import run_migrations
+from services.platform.enterprise_schema import resolve_enterprise_database_url
+from services.image.image_task_assets import contains_inline_assets, normalize_task_result, prepare_task_payload
+from services.image.image_task_store import DatabaseImageTaskStore
 
 
 def main() -> None:

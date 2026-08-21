@@ -14,7 +14,8 @@ from services.protocol.conversation import (
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
-from services.image_size import normalize_image_size
+from services.image.image_prompt_compliance import ensure_image_prompt_engineered
+from services.image.image_size import normalize_image_size
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
 
 
@@ -50,7 +51,13 @@ def _composite_mask(
 
 
 def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
-    prompt = str(body.get("prompt") or "")
+    prompt = ensure_image_prompt_engineered(
+        str(body.get("prompt") or ""),
+        has_reference=bool(body.get("images") or body.get("image_urls")),
+        preserve_subject=bool(body.get("preserve_subject") or body.get("preserve_product")),
+        prompt_engine_mode=str(body.get("prompt_engine_mode") or "professional"),
+        subject_mutation_policy=str(body.get("subject_mutation_policy") or "preserve"),
+    )
     images = body.get("images") or []
     masks = body.get("mask") or []
     images = _composite_mask(images, masks)

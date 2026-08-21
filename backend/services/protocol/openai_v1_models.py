@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from services.account_service import account_service
-from services.cache_utils import TTLCache
-from services.openai_backend_api import OpenAIBackendAPI
+from services.accounts.account_service import account_service
+from services.platform.cache_utils import TTLCache
+from services.providers.openai_backend_api import OpenAIBackendAPI
 from utils.helper import CODEX_IMAGE_MODEL
 
 

@@ -7,7 +7,15 @@ import {
   renameImageConversationRemote,
   upsertImageConversationRemote,
   type ImageConversationApiPayload,
+  type AgentEvent,
+  type AgentRun,
+  type ImageAgentAdvisor,
+  type ImageAgentProposal,
   type ImageModel,
+  type ProfessionalAgentEngine,
+  type ProfessionalEditIntent,
+  type ProfessionalSceneType,
+  type SubjectMutationPolicy,
 } from "@/lib/api";
 import { getStoredAuthKey, getStoredAuthSession } from "@/stores/auth";
 
@@ -18,6 +26,7 @@ export type StoredReferenceImage = {
   type: string;
   dataUrl?: string;
   url?: string;
+  role?: "working_canvas" | "product_anchor" | "reference";
 };
 
 export type StoredImageQualityCheck = {
@@ -44,13 +53,20 @@ export type StoredImage = {
   elapsedSecs?: number;
   elapsedUpdatedAt?: number;
   durationMs?: number;
+  width?: number;
+  height?: number;
+  requestedSize?: string;
+  aspectRatioCorrected?: boolean;
   qualityCheck?: StoredImageQualityCheck;
   sourceImageIndex?: number;
   sourceName?: string;
   failureReportId?: string;
+  pageId?: string;
+  pageTitle?: string;
+  purpose?: string;
 };
 
-export type ImageTurnStatus = "queued" | "generating" | "success" | "error" | "canceled";
+export type ImageTurnStatus = "planning" | "waiting_for_input" | "queued" | "generating" | "success" | "error" | "canceled";
 
 export type ImageBatchReplacePlan = {
   productImage: StoredReferenceImage;
@@ -61,15 +77,32 @@ export type ImageBatchFolderPlan = {
   folderImages: StoredReferenceImage[];
 };
 
+export type ImagePromptEngineMetadata = {
+  mode: "professional";
+  agentEngine?: ProfessionalAgentEngine;
+  engineMode?: "professional" | "general";
+  sceneType: ProfessionalSceneType;
+  sceneName: string;
+  model: string;
+  productName?: string;
+  editIntent?: ProfessionalEditIntent;
+  subjectMutationPolicy?: SubjectMutationPolicy;
+  needsTypography?: boolean;
+};
+
 export type ImageTurn = {
   id: string;
   prompt: string;
+  sourcePrompt?: string;
+  promptEngine?: ImagePromptEngineMetadata;
   model: ImageModel;
   mode: ImageConversationMode;
   referenceImages: StoredReferenceImage[];
+  folderId?: string;
   batchReplace?: ImageBatchReplacePlan;
   batchFolder?: ImageBatchFolderPlan;
   preserveSubject?: boolean;
+  useLongTermMemory?: boolean;
   count: number;
   size: string;
   ratio: string;
@@ -81,6 +114,20 @@ export type ImageTurn = {
   createdAt: string;
   status: ImageTurnStatus;
   error?: string;
+  agentRun?: AgentRun;
+  agentRequested?: boolean;
+  agentRetryImageId?: string;
+  agentProposal?: ImageAgentProposal;
+  agentBatchPlanId?: string;
+  agentBatchProgress?: { total: number; completed: number; failed: number };
+  agentBatchItems?: Array<{ id: number; folderItemId: number; index: number; name: string; category: string; title: string; purpose: string; taskId?: string; status: string; attempts: number; error?: string }>;
+  agentAdvisor?: ImageAgentAdvisor;
+  agentDialogue?: Array<{
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+    knowledgeSources?: Array<{ id: string; title: string }>;
+  }>;
   promptDeleted?: boolean;
   resultsDeleted?: boolean;
 };
@@ -113,6 +160,7 @@ const ACCOUNT_IMAGE_CONVERSATIONS_PREFIX = "items:account:";
 const ANONYMOUS_IMAGE_CONVERSATIONS_KEY = "items:anonymous";
 const IMAGE_CONVERSATIONS_LEGACY_MIGRATION_KEY = "legacy_migration_v1";
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
+let imageConversationRemoteWriteQueue: Promise<void> = Promise.resolve();
 let imageConversationMigrationPromise: Promise<void> | null = null;
 const INLINE_IMAGE_REMOTE_LIMIT = 2048;
 
@@ -152,12 +200,19 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
     durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
+    width: typeof image.width === "number" && image.width > 0 ? image.width : undefined,
+    height: typeof image.height === "number" && image.height > 0 ? image.height : undefined,
+    requestedSize: typeof image.requestedSize === "string" && image.requestedSize ? image.requestedSize : undefined,
+    aspectRatioCorrected: image.aspectRatioCorrected === true ? true : undefined,
     sourceImageIndex:
       typeof image.sourceImageIndex === "number" && Number.isInteger(image.sourceImageIndex) && image.sourceImageIndex >= 0
         ? image.sourceImageIndex
         : undefined,
     sourceName: typeof image.sourceName === "string" && image.sourceName ? image.sourceName : undefined,
     failureReportId: typeof image.failureReportId === "string" && image.failureReportId ? image.failureReportId : undefined,
+    pageId: typeof image.pageId === "string" && image.pageId ? image.pageId : undefined,
+    pageTitle: typeof image.pageTitle === "string" && image.pageTitle ? image.pageTitle : undefined,
+    purpose: typeof image.purpose === "string" && image.purpose ? image.purpose : undefined,
     qualityCheck,
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success" || image.status === "canceled") {
@@ -175,6 +230,35 @@ function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceIm
     type: image.type || "image/png",
     dataUrl: typeof image.dataUrl === "string" && image.dataUrl ? image.dataUrl : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
+    role: image.role === "working_canvas" || image.role === "product_anchor" || image.role === "reference" ? image.role : undefined,
+  };
+}
+
+function normalizeAgentRun(value: unknown): AgentRun | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Partial<AgentRun>;
+  if (!source.runId || !source.agent || !source.status) return undefined;
+  const events = Array.isArray(source.events)
+    ? source.events
+        .filter((event): event is AgentEvent => Boolean(event && typeof event === "object" && typeof event.sequence === "number"))
+        .map((event) => ({ ...event, payload: event.payload && typeof event.payload === "object" ? event.payload : {} }))
+    : [];
+  const steps = Array.isArray(source.steps) ? source.steps : [];
+  return {
+    runId: String(source.runId),
+    agent: String(source.agent),
+    status: source.status,
+    startedAt: String(source.startedAt || new Date().toISOString()),
+    finishedAt: source.finishedAt ? String(source.finishedAt) : undefined,
+    durationMs: typeof source.durationMs === "number" ? source.durationMs : undefined,
+    maxSteps: Number(source.maxSteps || 0),
+    stepCount: Number(source.stepCount || steps.length),
+    toolCalls: Number(source.toolCalls || 0),
+    steps,
+    events,
+    error: source.error ? String(source.error) : undefined,
+    waitingForInput: source.waitingForInput ? String(source.waitingForInput) : undefined,
+    result: source.result,
   };
 }
 
@@ -262,6 +346,8 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
           : "success";
   const validStatus =
     turn.status === "queued" ||
+    turn.status === "planning" ||
+    turn.status === "waiting_for_input" ||
     turn.status === "generating" ||
     turn.status === "success" ||
     turn.status === "error" ||
@@ -272,12 +358,29 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
   return {
     id: String(turn.id || `${Date.now()}`),
     prompt: String(turn.prompt || ""),
+    sourcePrompt: typeof turn.sourcePrompt === "string" ? turn.sourcePrompt : undefined,
+    promptEngine: turn.promptEngine && typeof turn.promptEngine === "object" && turn.promptEngine.mode === "professional"
+      ? {
+          mode: "professional",
+          agentEngine: "cowagent",
+          engineMode: turn.promptEngine.engineMode === "general" ? "general" : "professional",
+          sceneType: (turn.promptEngine.sceneType || "auto") as ProfessionalSceneType,
+          sceneName: String(turn.promptEngine.sceneName || "智能体自动规划"),
+          model: String(turn.promptEngine.model || ""),
+          productName: typeof turn.promptEngine.productName === "string" ? turn.promptEngine.productName : undefined,
+          editIntent: typeof turn.promptEngine.editIntent === "string" ? turn.promptEngine.editIntent as ProfessionalEditIntent : undefined,
+          subjectMutationPolicy: typeof turn.promptEngine.subjectMutationPolicy === "string" ? turn.promptEngine.subjectMutationPolicy as SubjectMutationPolicy : undefined,
+          needsTypography: typeof turn.promptEngine.needsTypography === "boolean" ? turn.promptEngine.needsTypography : undefined,
+        }
+      : undefined,
     model: (turn.model as ImageModel) || "gpt-image-2",
     mode: turn.mode === "edit" ? "edit" : "generate",
     referenceImages: getLegacyReferenceImages(turn),
+    folderId: typeof turn.folderId === "string" && turn.folderId ? turn.folderId : undefined,
     batchReplace: normalizeBatchReplacePlan(turn.batchReplace),
     batchFolder: normalizeBatchFolderPlan(turn.batchFolder),
     preserveSubject: turn.preserveSubject === true,
+    useLongTermMemory: turn.useLongTermMemory !== false,
     count: Math.max(1, Number(turn.count || normalizedImages.length || 1)),
     size: typeof turn.size === "string" ? turn.size : "",
     ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
@@ -287,10 +390,66 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     templateId: Number(turn.templateId || 0) > 0 ? Number(turn.templateId) : undefined,
     images: normalizedImages,
     createdAt: String(turn.createdAt || new Date().toISOString()),
-    status: normalizedImages.some((image) => image.status === "loading")
-      ? validStatus === "queued" ? "queued" : "generating"
-      : derivedStatus,
+    status: validStatus === "planning" || validStatus === "waiting_for_input"
+      ? validStatus
+      : normalizedImages.some((image) => image.status === "loading")
+        ? validStatus === "queued" ? "queued" : "generating"
+        : derivedStatus,
     error: typeof turn.error === "string" ? turn.error : undefined,
+    agentRun: normalizeAgentRun(turn.agentRun),
+    agentRequested: turn.agentRequested === true,
+    agentRetryImageId: typeof turn.agentRetryImageId === "string" && turn.agentRetryImageId ? turn.agentRetryImageId : undefined,
+    agentProposal: turn.agentProposal && Array.isArray(turn.agentProposal.pages) ? turn.agentProposal : undefined,
+    agentBatchPlanId: typeof turn.agentBatchPlanId === "string" && turn.agentBatchPlanId ? turn.agentBatchPlanId : undefined,
+    agentBatchProgress: turn.agentBatchProgress && typeof turn.agentBatchProgress === "object"
+      ? {
+          total: Number(turn.agentBatchProgress.total || 0),
+          completed: Number(turn.agentBatchProgress.completed || 0),
+          failed: Number(turn.agentBatchProgress.failed || 0),
+        }
+      : undefined,
+    agentBatchItems: Array.isArray(turn.agentBatchItems) ? turn.agentBatchItems.slice(0, 300) as ImageTurn["agentBatchItems"] : undefined,
+    agentAdvisor: turn.agentAdvisor && typeof turn.agentAdvisor === "object"
+      ? {
+          assistantMessage: String(turn.agentAdvisor.assistantMessage || ""),
+          suggestions: Array.isArray(turn.agentAdvisor.suggestions) ? turn.agentAdvisor.suggestions.map(String).filter(Boolean).slice(0, 4) : [],
+          intent: typeof turn.agentAdvisor.intent === "string" ? turn.agentAdvisor.intent : undefined,
+          recommendedAction: typeof turn.agentAdvisor.recommendedAction === "string" ? turn.agentAdvisor.recommendedAction : undefined,
+          creativeBrief: turn.agentAdvisor.creativeBrief && typeof turn.agentAdvisor.creativeBrief === "object" ? turn.agentAdvisor.creativeBrief : undefined,
+          knowledgeSources: Array.isArray(turn.agentAdvisor.knowledgeSources)
+            ? turn.agentAdvisor.knowledgeSources
+              .filter((item): item is { id: string; title: string } => Boolean(item && typeof item.id === "string" && typeof item.title === "string"))
+              .slice(0, 5)
+            : undefined,
+          memorySources: Array.isArray(turn.agentAdvisor.memorySources)
+            ? turn.agentAdvisor.memorySources
+              .filter((item) => Boolean(item && typeof item.id === "string" && typeof item.title === "string"))
+              .slice(0, 8)
+            : undefined,
+          memoryUpdates: Array.isArray(turn.agentAdvisor.memoryUpdates)
+            ? turn.agentAdvisor.memoryUpdates
+              .filter((item) => Boolean(
+                item
+                && typeof item.memoryId === "string"
+                && typeof item.content === "string"
+                && typeof item.category === "string"
+                && ["user", "brand", "project", "conversation"].includes(item.scope),
+              ))
+              .slice(0, 8)
+            : undefined,
+        }
+      : undefined,
+    agentDialogue: Array.isArray(turn.agentDialogue)
+      ? turn.agentDialogue
+        .filter((item) => Boolean(item && (item.role === "user" || item.role === "assistant") && typeof item.content === "string" && item.content.trim()))
+        .slice(-24)
+        .map((item, index) => ({
+          id: typeof item.id === "string" && item.id ? item.id : `${turn.id}-dialogue-${index}`,
+          role: item.role as "user" | "assistant",
+          content: item.content.trim(),
+          knowledgeSources: Array.isArray(item.knowledgeSources) ? item.knowledgeSources.slice(0, 5) : undefined,
+        }))
+      : undefined,
     promptDeleted: turn.promptDeleted === true,
     resultsDeleted: turn.resultsDeleted === true,
   };
@@ -565,6 +724,15 @@ function queueImageConversationWrite<T>(operation: () => Promise<T>): Promise<T>
   return result;
 }
 
+function queueImageConversationRemoteWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const result = imageConversationRemoteWriteQueue.then(operation);
+  imageConversationRemoteWriteQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 async function currentImageConversationStorageKey() {
   const session = await getStoredAuthSession().catch(() => null);
   const owner = String(session?.subjectId || session?.username || "").trim();
@@ -600,7 +768,11 @@ async function syncRemoteConversation(conversation: ImageConversation, headers?:
 
 async function syncRemoteConversations(conversations: ImageConversation[]) {
   const headers = await currentAuthHeaders();
-  await Promise.allSettled(conversations.map((conversation) => syncRemoteConversation(conversation, headers)));
+  await Promise.allSettled(
+    conversations.map((conversation) => (
+      queueImageConversationRemoteWrite(() => syncRemoteConversation(conversation, headers))
+    )),
+  );
 }
 
 export async function listImageConversations(): Promise<ImageConversation[]> {
@@ -662,7 +834,7 @@ export async function saveImageConversation(
     ]);
     await writeStoredImageConversations(nextItems);
     const headers = await currentAuthHeaders();
-    void syncRemoteConversation(persistedConversation, headers);
+    void queueImageConversationRemoteWrite(() => syncRemoteConversation(persistedConversation, headers));
   });
 }
 
@@ -682,9 +854,9 @@ export async function renameImageConversation(
     await writeStoredImageConversations(nextItems);
     const headers = await currentAuthHeaders();
     try {
-      await renameImageConversationRemote(id, title, headers);
+      await queueImageConversationRemoteWrite(() => renameImageConversationRemote(id, title, headers));
     } catch {
-      void syncRemoteConversation(updated, headers);
+      void queueImageConversationRemoteWrite(() => syncRemoteConversation(updated, headers));
     }
   });
 }
@@ -697,10 +869,26 @@ export async function deleteImageConversation(
     await writeStoredImageConversations(items.filter((item) => item.id !== id));
     const headers = await currentAuthHeaders();
     try {
-      await deleteImageConversationRemote(id, headers);
+      await queueImageConversationRemoteWrite(() => deleteImageConversationRemote(id, headers));
     } catch {
       // Keep the local delete even when offline; the server copy will be refreshed on the next successful save.
     }
+  });
+}
+
+export async function deleteImageConversations(
+  ids: string[],
+): Promise<void> {
+  const targetIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean)));
+  if (!targetIds.length) return;
+  await queueImageConversationWrite(async () => {
+    const targetSet = new Set(targetIds);
+    const items = await readStoredImageConversations();
+    await writeStoredImageConversations(items.filter((item) => !targetSet.has(item.id)));
+    const headers = await currentAuthHeaders();
+    await Promise.allSettled(
+      targetIds.map((id) => queueImageConversationRemoteWrite(() => deleteImageConversationRemote(id, headers))),
+    );
   });
 }
 
@@ -710,7 +898,7 @@ export async function clearImageConversations(): Promise<void> {
     await singleImageConversationStorage.removeItem(IMAGE_CONVERSATIONS_KEY);
     const headers = await currentAuthHeaders();
     try {
-      await clearImageConversationsRemote(headers);
+      await queueImageConversationRemoteWrite(() => clearImageConversationsRemote(headers));
     } catch {
       // Local clear still protects this browser session if the API is temporarily unavailable.
     }

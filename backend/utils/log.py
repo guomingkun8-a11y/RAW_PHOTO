@@ -21,7 +21,7 @@ class Logger:
 
     def _enabled(self, level: str) -> bool:
         try:
-            from services.config import config
+            from services.platform.config import config
             levels = set(config.log_levels)
         except Exception:
             levels = set()

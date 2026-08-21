@@ -6,9 +6,9 @@ from pydantic import BaseModel, Field
 
 from api.image_inputs import collect_http_image_urls, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
-from services import openai_relay_service
-from services.content_filter import check_request
-from services.log_service import LoggedCall
+from services.providers import openai_relay_service
+from services.platform.content_filter import check_request
+from services.platform.log_service import LoggedCall
 from services.protocol import (
     openai_v1_image_edit,
     openai_v1_image_generations,

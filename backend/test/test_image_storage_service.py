@@ -7,7 +7,7 @@ from unittest import mock
 
 from PIL import Image
 
-from services.image_storage_service import ImageStorageService
+from services.image.image_storage_service import ImageStorageService
 
 
 def png_bytes() -> bytes:
@@ -29,6 +29,9 @@ class FakeWebDAVClient:
 
     def get(self, rel: str) -> bytes:
         return self.uploaded[rel]
+
+    def exists(self, rel: str) -> bool:
+        return rel in self.uploaded
 
     def delete(self, rel: str) -> bool:
         self.deleted.append(rel)
@@ -54,6 +57,9 @@ class FakeMinIOClient:
 
     def get(self, rel: str) -> bytes:
         return self.uploaded[rel]
+
+    def exists(self, rel: str) -> bool:
+        return rel in self.uploaded
 
     def delete(self, rel: str) -> bool:
         self.deleted.append(rel)
@@ -89,7 +95,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "minio_root_path": "gmkraw/images",
             "public_base_url": "",
         }
-        self.config_patcher = mock.patch("services.image_storage_service.config")
+        self.config_patcher = mock.patch("services.image.image_storage_service.config")
         self.mock_config = self.config_patcher.start()
         self.addCleanup(self.config_patcher.stop)
         self.mock_config.images_dir = self.images_dir
@@ -118,7 +124,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "webdav_url": "https://dav.example.test",
             "webdav_password": "secret",
         })
-        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+        with mock.patch("services.image.image_storage_service.WebDAVClient", FakeWebDAVClient):
             stored = self.service().save(png_bytes(), "http://app.test")
             payload = self.service().get_bytes(stored.rel)
 
@@ -138,7 +144,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "minio_bucket": "raw-photo",
             "minio_secure": False,
         })
-        with mock.patch("services.image_storage_service.MinIOClient", FakeMinIOClient):
+        with mock.patch("services.image.image_storage_service.MinIOClient", FakeMinIOClient):
             stored = self.service().save(png_bytes(), "http://app.test")
             payload = self.service().get_bytes(stored.rel)
 
@@ -146,6 +152,28 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertFalse((self.images_dir / stored.rel).exists())
         self.assertIn(stored.rel, FakeMinIOClient.uploaded)
         self.assertEqual(payload, FakeMinIOClient.uploaded[stored.rel])
+
+    def test_remote_asset_is_readable_without_local_index_metadata(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "minio",
+            "provider": "minio",
+            "minio_endpoint": "http://minio.example.test:9000",
+            "minio_access_key": "access",
+            "minio_secret_key": "secret",
+            "minio_bucket": "raw-photo",
+            "minio_secure": False,
+        })
+        first_instance = self.service()
+        second_instance = ImageStorageService(self.data_dir / "another-instance-index.json")
+        with mock.patch("services.image.image_storage_service.MinIOClient", FakeMinIOClient):
+            stored = first_instance.save(png_bytes(), "http://app.test")
+            self.assertFalse(second_instance.index_file.exists())
+            self.assertTrue(second_instance.exists(stored.rel))
+            self.assertEqual(second_instance.get_bytes(stored.rel), FakeMinIOClient.uploaded[stored.rel])
+            self.assertTrue(second_instance.delete(stored.rel))
+
+        self.assertNotIn(stored.rel, FakeMinIOClient.uploaded)
 
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()
@@ -168,7 +196,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "webdav_password": "secret",
             "public_base_url": "https://cdn.example.test/images",
         })
-        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+        with mock.patch("services.image.image_storage_service.WebDAVClient", FakeWebDAVClient):
             stored = self.service().save(png_bytes(), "http://app.test")
 
         self.assertEqual(stored.storage, "both")
@@ -223,7 +251,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(png_bytes())
 
-        with mock.patch("services.image_storage_service.MinIOClient", FakeMinIOClient):
+        with mock.patch("services.image.image_storage_service.MinIOClient", FakeMinIOClient):
             first = self.service().sync_all(workers=2)
             second = self.service().sync_all(workers=2)
 
@@ -239,7 +267,7 @@ class ImageStorageServiceTests(unittest.TestCase):
             "webdav_url": "https://dav.example.test",
             "webdav_password": "secret",
         })
-        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+        with mock.patch("services.image.image_storage_service.WebDAVClient", FakeWebDAVClient):
             result = self.service().test_webdav()
 
         self.assertTrue(result["ok"])

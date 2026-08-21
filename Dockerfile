@@ -31,7 +31,6 @@ WORKDIR /app
 # - libpq-dev: PostgreSQL 客户端库
 # - gcc: 编译 psycopg2-binary 需要
 RUN apt-get update && apt-get install -y --no-install-recommends \
-RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
@@ -45,6 +44,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
 COPY worker.py ./
+COPY agent_worker.py ./
 COPY config.example.json ./config.json
 COPY VERSION ./
 COPY backend ./backend

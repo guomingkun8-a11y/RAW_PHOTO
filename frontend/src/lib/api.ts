@@ -1,5 +1,6 @@
 import { httpRequest, request } from "@/lib/request";
 import { webConfig } from "@/lib/config";
+import { getStoredAuthKey } from "@/stores/auth";
 
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
@@ -82,7 +83,16 @@ export type ImageTask = {
   conversation_id?: string;
   product_id?: number;
   template_id?: number;
-  data?: Array<{ b64_json?: string; url?: string; storage_rel?: string; revised_prompt?: string }>;
+  data?: Array<{
+    b64_json?: string;
+    url?: string;
+    storage_rel?: string;
+    revised_prompt?: string;
+    width?: number;
+    height?: number;
+    requested_size?: string;
+    aspect_ratio_corrected?: boolean;
+  }>;
   error?: string;
   progress?: string;
   elapsed_secs?: number;
@@ -105,6 +115,285 @@ export type ImageTask = {
     running: number;
     queued: number;
   };
+};
+
+export type AgentRunStatus = "pending" | "running" | "waiting_for_images" | "waiting_for_input" | "completed" | "failed" | "canceled";
+
+export type AgentEvent = {
+  sequence: number;
+  type: string;
+  timestamp: string;
+  payload: Record<string, unknown>;
+};
+
+export type AgentStep = {
+  stepId: string;
+  index: number;
+  action: "call_tool" | "finish" | "ask_user" | "fail";
+  status: "running" | "completed" | "failed" | "waiting_for_input";
+  title: string;
+  toolName?: string;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  error?: string;
+};
+
+export type ImageAgentQualityCheck = {
+  imageIndex: number;
+  pageId?: string;
+  pageTitle?: string;
+  status: "passed" | "review" | "failed";
+  score: number;
+  summary: string;
+  issues: string[];
+  suggestions: string[];
+  model?: string;
+};
+
+export type ImageAgentProposalPage = {
+  id: string;
+  title: string;
+  purpose: string;
+  visualDirection?: string;
+  scene?: string;
+  composition?: string;
+  lighting?: string;
+  background?: string;
+  prompt: string;
+  needsTypography: boolean;
+};
+
+export type ImageAgentCreativeBrief = {
+  scene?: string;
+  background?: string;
+  composition?: string;
+  camera?: string;
+  lighting?: string;
+  palette?: string;
+  props?: string;
+  typography?: string;
+  visualHook?: string;
+};
+
+export type ImageAgentAdvisor = {
+  assistantMessage: string;
+  suggestions: string[];
+  intent?: string;
+  recommendedAction?: string;
+  creativeBrief?: ImageAgentCreativeBrief;
+  knowledgeSources?: Array<{ id: string; title: string }>;
+  memorySources?: AgentMemorySource[];
+  memoryUpdates?: AgentMemoryUpdate[];
+};
+
+export type AgentMemoryScope = "user" | "brand" | "project" | "conversation";
+
+export type AgentMemoryUpdate = {
+  memoryId: string;
+  content: string;
+  category: string;
+  scope: AgentMemoryScope;
+  scopeId?: string;
+};
+
+export type AgentMemorySource = {
+  id: string;
+  title: string;
+  scope?: AgentMemoryScope;
+  category?: string;
+};
+
+export type AgentMemoryItem = {
+  id: number;
+  memoryId: string;
+  scope: AgentMemoryScope;
+  scopeId: string;
+  memoryKey: string;
+  category: string;
+  content: string;
+  sourceConversationId?: string;
+  sourceRunId?: string;
+  confidence: number;
+  confirmed: boolean;
+  status: string;
+  supersedesId?: number | null;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt?: string;
+  metadata?: Record<string, unknown>;
+  sourceMessageIds?: Array<string | number>;
+};
+
+export type AgentMemoryCounts = {
+  active: number;
+  pendingReview: number;
+};
+
+export type ImageAgentProposal = {
+  title: string;
+  summary: string;
+  creativeConcept?: string;
+  visualHook?: string;
+  imageCount: number;
+  pages: ImageAgentProposalPage[];
+  strategyText?: string;
+  assistantMessage?: string;
+  suggestions?: string[];
+  creativeBrief?: ImageAgentCreativeBrief;
+  folderId?: string;
+  folderSummary?: Record<string, unknown>;
+  batchPlanId?: string;
+};
+
+export type ImageAgentResult = {
+  phase?: "awaiting_confirmation" | "completed" | string;
+  promptPlan: Record<string, unknown> & {
+    model?: string;
+    sceneType?: ProfessionalSceneType;
+    sceneName?: string;
+    finalPrompt?: string;
+    negativePrompt?: string;
+    productProfile?: { productName?: string };
+    editIntent?: ProfessionalEditIntent;
+    subjectMutationPolicy?: SubjectMutationPolicy;
+    changedAttributes?: string[];
+    needsTypography?: boolean;
+    needsClarification?: boolean;
+    clarificationQuestion?: string;
+    resolvedSize?: string;
+  };
+  turnIntent?: {
+    intent?: string;
+    originalIntent?: string;
+    confidence?: number;
+    reason?: string;
+    source?: string;
+  };
+  proposal?: ImageAgentProposal;
+  images: Array<{
+    taskId: string;
+    pageId?: string | null;
+    pageTitle?: string | null;
+    purpose?: string | null;
+    b64_json?: string | null;
+    url?: string | null;
+    revised_prompt?: string | null;
+    width?: number | null;
+    height?: number | null;
+    requestedSize?: string | null;
+    aspectRatioCorrected?: boolean;
+  }>;
+  qualityChecks: ImageAgentQualityCheck[];
+  revisionCount: number;
+  assistantMessage?: string;
+  suggestions?: string[];
+  intent?: string;
+  recommendedAction?: string;
+  creativeBrief?: ImageAgentCreativeBrief;
+  knowledgeSources?: Array<{ id: string; title: string }>;
+  memorySources?: AgentMemorySource[];
+  memoryUpdates?: AgentMemoryUpdate[];
+  longTermMemoryEnabled?: boolean;
+  optimizationRoute?: "direct_consult" | "confirmed_generation" | "full_agent" | string;
+  agentExecutionProfile?: string;
+  modelUsage?: {
+    dialogueCalls: number;
+    visionCalls: number;
+    totalCalls: number;
+    imageGenerationCalls: number;
+    estimatedInputChars?: number;
+    estimatedOutputChars?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+  };
+  folderId?: string;
+  batchPlanId?: string;
+  folderSummary?: Record<string, unknown>;
+  batchProgress?: { total: number; completed: number; failed: number };
+  batchItems?: AgentBatchPlanItem[];
+};
+
+export type AgentRun = {
+  runId: string;
+  agent: string;
+  status: AgentRunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  maxSteps: number;
+  stepCount: number;
+  toolCalls: number;
+  steps: AgentStep[];
+  events?: AgentEvent[];
+  error?: string;
+  waitingForInput?: string;
+  result?: ImageAgentResult;
+};
+
+export type AgentFolderItem = {
+  id: number;
+  folderId: string;
+  relativeName: string;
+  name: string;
+  type: string;
+  size: number;
+  width: number;
+  height: number;
+  category: string;
+  storageRel?: string;
+  url: string;
+  analysis?: { text?: string; question?: string; updatedAt?: string; [key: string]: unknown };
+  status: string;
+};
+
+export type AgentFolderAsset = {
+  folderId: string;
+  ownerId?: string;
+  conversationId?: string;
+  name: string;
+  status: string;
+  itemCount: number;
+  totalBytes: number;
+  summary: {
+    fileCount?: number;
+    totalBytes?: number;
+    categories?: Record<string, number>;
+    mimeTypes?: Record<string, number>;
+    dimensions?: Record<string, number>;
+    samples?: Array<{ id: number; name: string; category: string; width: number; height: number; url: string }>;
+    [key: string]: unknown;
+  };
+  items?: AgentFolderItem[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type AgentBatchPlanItem = {
+  id: number;
+  folderItemId: number;
+  index: number;
+  name: string;
+  category: string;
+  title: string;
+  purpose: string;
+  taskId?: string;
+  status: string;
+  attempts: number;
+  error?: string;
+};
+
+export type AgentBatchPlan = {
+  planId: string;
+  folderId: string;
+  status: string;
+  totalItems: number;
+  completedItems: number;
+  failedItems: number;
+  summary?: Record<string, unknown>;
+  items: AgentBatchPlanItem[];
+  updatedAt?: string;
 };
 
 export type ImageLibraryItem = {
@@ -187,6 +476,7 @@ export type PromptTemplate = {
   quality?: string;
   preserve_subject: boolean;
   enabled: boolean;
+  can_manage?: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -208,6 +498,30 @@ export type ImagePromptAnalysisResponse = {
   optimizedPrompt: string;
   negativePrompt: string;
 };
+
+export type PromptEngineMode = "standard" | "professional" | "general";
+export type ProfessionalAgentEngine = "cowagent";
+
+export type ProfessionalEditIntent =
+  | "scene_edit"
+  | "visual_style_edit"
+  | "product_attribute_edit"
+  | "product_replace"
+  | "generate_new"
+  | "ambiguous";
+
+export type SubjectMutationPolicy = "preserve" | "mutate_requested_attributes" | "replace";
+
+export type ProfessionalSceneType =
+  | "auto"
+  | "taobao_text_main"
+  | "white_background"
+  | "lifestyle"
+  | "material_macro"
+  | "poster_banner"
+  | "social_cover"
+  | "magazine_editorial"
+  | "luxury_atmosphere";
 
 export type AuditLogItem = {
   id: number;
@@ -317,14 +631,26 @@ export type MonitoringQueueSummary = {
   enabled: boolean;
   executor: string;
   queue_depth: number;
+  queue_depths?: { standard?: number; agent?: number; batch?: number };
   queued_tasks: number;
   running_tasks: number;
   stale_running_tasks: number;
   active_slots: number;
   slot_limit: number;
+  adaptive_concurrency?: {
+    enabled: boolean;
+    configured_limit: number;
+    effective_limit: number;
+    minimum_limit?: number;
+    recovery_successes?: number;
+    recovery_target?: number;
+    cooldown_remaining_secs?: number;
+  };
   active_workers: number;
   worker_concurrency: number;
   local_concurrency_limit: number;
+  postprocess_concurrency?: number;
+  async_postprocess_enabled?: boolean;
   configured_total_concurrency: number;
   total_concurrency: number;
   owner_concurrency: number;
@@ -337,6 +663,21 @@ export type MonitoringQueueSummary = {
   stale_running_timeout_secs: number;
   worker_heartbeat_secs: number;
   owner_activity?: MonitoringQueueOwnerActivity[];
+};
+
+export type MonitoringAgentQueueSummary = {
+  enabled: boolean;
+  available?: boolean;
+  error?: string;
+  queue?: string;
+  lag?: number;
+  pending?: number;
+  active?: number;
+  activeWorkers?: number;
+  workerConcurrency?: number;
+  totalConcurrency?: number;
+  ownerConcurrency?: number;
+  ownerPendingLimit?: number;
 };
 
 export type MonitoringLatencySummary = {
@@ -361,6 +702,7 @@ export type MonitoringSummary = {
   total_users: number;
   online_window_minutes: number;
   task_queue: MonitoringQueueSummary;
+  agent_queue?: MonitoringAgentQueueSummary;
   task_latency: MonitoringLatencySummary;
   stage_latency: MonitoringStageLatencySummary;
   users: MonitoringUserStat[];
@@ -510,6 +852,188 @@ export async function analyzeImagePrompt(body: {
   });
 }
 
+export async function startImageAgentRun(body: {
+  prompt: string;
+  agentEngine?: ProfessionalAgentEngine;
+  mode: "generate" | "edit";
+  model: ImageModel;
+  size?: string;
+  quality: string;
+  count: number;
+  sceneType: ProfessionalSceneType;
+  preserveSubject?: boolean;
+  inheritReferenceImages?: boolean;
+  useLongTermMemory?: boolean;
+  conversationId: string;
+  turnId: string;
+  folderId?: string;
+  images?: Array<{ name: string; type: string; dataUrl?: string; url?: string; role?: "working_canvas" | "product_anchor" | "reference" | string }>;
+  conversationContext?: Array<{
+    userRequest: string;
+    sceneName?: string;
+    proposalSummary?: string;
+    visualDirection?: string;
+    resultStatus?: string;
+    assistantMessage?: string;
+    suggestions?: string[];
+    creativeBrief?: ImageAgentCreativeBrief;
+  }>;
+}) {
+  return httpRequest<{ agentRun: AgentRun }>("/api/image-agent/runs", {
+    method: "POST",
+    body,
+    timeout: 120_000,
+  });
+}
+
+export async function fetchAgentMemories(options: {
+  conversationId?: string;
+  projectId?: string;
+  brandId?: string;
+  includePending?: boolean;
+} = {}) {
+  const params = new URLSearchParams();
+  if (options.conversationId) params.set("conversationId", options.conversationId);
+  if (options.projectId) params.set("projectId", options.projectId);
+  if (options.brandId) params.set("brandId", options.brandId);
+  if (options.includePending) params.set("includePending", "true");
+  params.set("limit", "200");
+  return httpRequest<{ items: AgentMemoryItem[]; counts?: AgentMemoryCounts }>(`/api/image-agent/memory?${params.toString()}`);
+}
+
+export async function createAgentMemory(body: {
+  content: string;
+  category: string;
+  scope: AgentMemoryScope;
+  scopeId?: string;
+  conversationId?: string;
+}) {
+  return httpRequest<{ item: AgentMemoryItem }>("/api/image-agent/memory", { method: "POST", body });
+}
+
+export async function updateAgentMemory(memoryId: string, body: {
+  content: string;
+  category: string;
+  scope: AgentMemoryScope;
+  scopeId?: string;
+}) {
+  return httpRequest<{ item: AgentMemoryItem }>(`/api/image-agent/memory/${encodeURIComponent(memoryId)}`, {
+    method: "PATCH",
+    body,
+  });
+}
+
+export async function deleteAgentMemory(memoryId: string) {
+  return httpRequest<{ ok: boolean }>(`/api/image-agent/memory/${encodeURIComponent(memoryId)}`, { method: "DELETE" });
+}
+
+export async function reviewAgentMemory(memoryId: string, decision: "approve" | "reject") {
+  return httpRequest<{ item: AgentMemoryItem }>(`/api/image-agent/memory/${encodeURIComponent(memoryId)}/review`, {
+    method: "POST",
+    body: { decision },
+  });
+}
+
+export async function clearAgentMemories() {
+  return httpRequest<{ ok: boolean; deleted: number }>("/api/image-agent/memory", { method: "DELETE" });
+}
+
+export async function uploadAgentFolder(files: File[], folderName = "上传文件夹", conversationId = "") {
+  const formData = new FormData();
+  files.forEach((file) => {
+    formData.append("files", file, file.name);
+    formData.append("relative_names", file.webkitRelativePath || file.name);
+  });
+  formData.append("folder_name", folderName);
+  if (conversationId) formData.append("conversation_id", conversationId);
+  return httpRequest<AgentFolderAsset>("/api/image-agent/folders", {
+    method: "POST",
+    body: formData,
+    timeout: 600_000,
+  });
+}
+
+export async function fetchAgentFolder(folderId: string) {
+  return httpRequest<AgentFolderAsset>(`/api/image-agent/folders/${encodeURIComponent(folderId)}`);
+}
+
+export async function deleteAgentFolder(folderId: string) {
+  return httpRequest<{ ok: boolean }>(`/api/image-agent/folders/${encodeURIComponent(folderId)}`, { method: "DELETE" });
+}
+
+export async function fetchAgentBatchPlan(planId: string) {
+  return httpRequest<AgentBatchPlan>(`/api/image-agent/batch-plans/${encodeURIComponent(planId)}`);
+}
+
+export async function retryAgentBatchItem(planId: string, itemId: number, body: { model?: ImageModel; size?: string; quality?: string } = {}) {
+  return httpRequest<AgentBatchPlan>(`/api/image-agent/batch-plans/${encodeURIComponent(planId)}/items/${encodeURIComponent(String(itemId))}/retry`, {
+    method: "POST",
+    body: {
+      model: body.model || "gpt-image-2",
+      size: body.size || "",
+      quality: body.quality || "auto",
+    },
+  });
+}
+
+export async function fetchAgentRun(runId: string, includeResult = false) {
+  return httpRequest<{ agentRun: AgentRun }>(`/api/agent/runs/${encodeURIComponent(runId)}${includeResult ? "?includeResult=true" : ""}`);
+}
+
+export async function cancelAgentRun(runId: string) {
+  return httpRequest<{ agentRun: AgentRun }>(`/api/agent/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
+  });
+}
+
+export async function streamAgentRunEvents(
+  runId: string,
+  onEvent: (event: AgentEvent) => void | Promise<void>,
+  options: { after?: number; signal?: AbortSignal } = {},
+) {
+  const authKey = await getStoredAuthKey();
+  const after = Math.max(0, Math.floor(options.after || 0));
+  const response = await fetch(`${webConfig.apiUrl}/api/agent/runs/${encodeURIComponent(runId)}/events?after=${after}`, {
+    method: "GET",
+    headers: {
+      Accept: "text/event-stream",
+      ...(authKey ? { Authorization: `Bearer ${authKey}` } : {}),
+    },
+    signal: options.signal,
+  });
+  if (!response.ok) {
+    let message = `Agent 事件流连接失败 (${response.status})`;
+    try {
+      const payload = await response.json() as { detail?: { error?: string } | string };
+      message = typeof payload.detail === "string" ? payload.detail : payload.detail?.error || message;
+    } catch {
+      // Keep the HTTP status fallback when the server did not return JSON.
+    }
+    throw new Error(message);
+  }
+  if (!response.body) throw new Error("当前浏览器无法读取 Agent 事件流");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      const data = frame
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (!data) continue;
+      await onEvent(JSON.parse(data) as AgentEvent);
+    }
+    if (done) break;
+  }
+}
+
 export async function createImageGenerationTask(
   clientTaskId: string,
   prompt: string,
@@ -523,6 +1047,7 @@ export async function createImageGenerationTask(
   batchId?: string,
   batchIndex = 0,
   batchTotal = 1,
+  promptEngineMode: PromptEngineMode = "standard",
 ) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
@@ -532,6 +1057,7 @@ export async function createImageGenerationTask(
       ...(model ? { model } : {}),
       ...(size ? { size } : {}),
       quality,
+      prompt_engine_mode: promptEngineMode,
       ...(conversationId ? { conversation_id: conversationId } : {}),
       ...(turnId ? { turn_id: turnId } : {}),
       ...(productId ? { product_id: productId } : {}),
@@ -559,6 +1085,7 @@ export async function createImageEditTask(
   batchTotal = 1,
   referenceUploadMs = 0,
   referenceCacheHits = 0,
+  promptEngineMode: PromptEngineMode = "standard",
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
@@ -578,6 +1105,7 @@ export async function createImageEditTask(
     formData.append("size", size);
   }
   formData.append("quality", quality);
+  formData.append("prompt_engine_mode", promptEngineMode);
   formData.append("preserve_subject", preserveSubject ? "true" : "false");
   if (conversationId) {
     formData.append("conversation_id", conversationId);

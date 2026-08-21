@@ -10,10 +10,12 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.config import config
+from services.platform.config import config
+from services.platform.runtime_requirements import validate_enterprise_runtime
 
 
 def main() -> None:
+    validate_enterprise_runtime()
     settings = config.get_image_task_queue_settings()
     if not settings.get("enabled"):
         raise SystemExit("image task queue is disabled; set IMAGE_TASK_QUEUE_ENABLED=true to run the worker")
@@ -26,7 +28,7 @@ def main() -> None:
 
         # Bootstrap recovery once in the parent. Celery child processes inherit
         # the skip flag and rely on Redis/Celery for delivery thereafter.
-        from services.image_task_service import image_task_service
+        from services.image.image_task_service import image_task_service
 
         image_task_service.close()
         os.environ["IMAGE_TASK_SKIP_STARTUP_RECOVERY"] = "true"
@@ -36,10 +38,15 @@ def main() -> None:
             "-m",
             "celery",
             "-A",
-            "services.celery_app:celery_app",
+            "services.platform.celery_app:celery_app",
             "worker",
             "--loglevel=INFO",
             f"--concurrency={max(1, int(settings.get('worker_concurrency') or 1))}",
+            "--queues=" + ",".join([
+                f"{settings.get('queue_name')}:standard",
+                str(settings.get("queue_name")),
+                f"{settings.get('queue_name')}:batch",
+            ]),
         ]
         if os.name == "nt":
             command.append("--pool=solo")
@@ -53,7 +60,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    from services.image_task_service import image_task_service
+    from services.image.image_task_service import image_task_service
 
     image_task_service.work_forever(
         stop_event=stop_event,

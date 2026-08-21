@@ -14,7 +14,7 @@ from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from services.proxy_service import proxy_settings
+from services.platform.proxy_service import proxy_settings
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
@@ -71,9 +71,12 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "n": _parse_count(fields.get("n")),
         "size": _clean(fields.get("size")) or None,
         "quality": _clean(fields.get("quality"), "auto"),
+        "prompt_engine_mode": _clean(fields.get("prompt_engine_mode"), "standard").lower(),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream"), "stream"),
     }
+    if payload["prompt_engine_mode"] not in {"standard", "professional"}:
+        raise HTTPException(status_code=400, detail={"error": "prompt_engine_mode must be standard or professional"})
     preserve_value = fields.get("preserve_subject")
     if preserve_value is None:
         preserve_value = fields.get("preserve_product")
@@ -214,6 +217,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
         "n",
         "size",
         "quality",
+        "prompt_engine_mode",
         "response_format",
         "stream",
         "preserve_subject",

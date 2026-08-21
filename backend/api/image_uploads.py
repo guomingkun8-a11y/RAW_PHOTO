@@ -6,7 +6,7 @@ from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from api.support import require_identity
-from services import reference_image_uploader
+from services.image import reference_image_uploader
 
 
 MAX_REFERENCE_FILES = 100

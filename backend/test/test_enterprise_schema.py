@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from services.enterprise_schema import (
+from services.platform.enterprise_schema import (
     ENTERPRISE_TABLES,
     ImageTaskBatchModel,
     ImageTaskItemModel,

@@ -20,6 +20,7 @@ frontend/.vite/
 frontend/test-results/
 frontend/playwright-report/
 frontend/blob-report/
+frontend/ui-check-*.png
 
 legacy/react-web/node_modules/
 legacy/react-web/.next/

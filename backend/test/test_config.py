@@ -17,7 +17,7 @@ class ConfigLoadingTests(unittest.TestCase):
             ROOT_CONFIG_FILE.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
             cls._created_root_config = True
 
-        from services import config as config_module
+        from services.platform import config as config_module
 
         cls.config_module = config_module
 

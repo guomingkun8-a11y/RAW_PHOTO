@@ -173,7 +173,7 @@ onMounted(load);
             <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ item.quality || 'auto' }}</span>
             <span v-if="item.preserve_subject" class="rounded-full bg-[#4F7CFF]/10 px-2 py-1 text-[#315be8]">主体保真</span>
           </div>
-          <div class="mt-auto flex gap-2 pt-5">
+          <div v-if="item.can_manage" class="mt-auto flex gap-2 pt-5">
             <button type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 text-xs font-semibold dark:border-white/10" @click="edit(item)">
               <Pencil class="size-3.5" />
               编辑

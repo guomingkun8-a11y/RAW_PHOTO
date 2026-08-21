@@ -11,7 +11,7 @@ ROOT_DIR = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.security_config import find_embedded_secret_paths
+from services.platform.security_config import find_embedded_secret_paths
 
 
 def main() -> None:

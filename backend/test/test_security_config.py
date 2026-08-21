@@ -5,8 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from services.config import ConfigStore
-from services.security_config import find_embedded_secret_paths
+from services.platform.config import ConfigStore
+from services.platform.security_config import find_embedded_secret_paths
+from services.platform.runtime_requirements import validate_enterprise_runtime
 
 
 class SecurityConfigTests(unittest.TestCase):
@@ -124,6 +125,81 @@ class SecurityConfigTests(unittest.TestCase):
         self.assertIn("image_task_queue.redis_url", output)
         self.assertNotIn("do-not-print", output)
         self.assertNotIn("password@", output)
+
+    def test_enterprise_runtime_rejects_sqlite(self) -> None:
+        environment = {
+            "GMKRAW_ENTERPRISE_MODE": "true",
+            "GMKRAW_REQUIRE_VECTOR_SEARCH": "false",
+            "GMKRAW_DATABASE_URL": "sqlite:///enterprise.db",
+            "STORAGE_BACKEND": "sqlite",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "must not use SQLite"):
+                validate_enterprise_runtime()
+
+    def test_enterprise_runtime_accepts_mysql_vector_layout(self) -> None:
+        environment = {
+            "GMKRAW_ENTERPRISE_MODE": "true",
+            "GMKRAW_REQUIRE_VECTOR_SEARCH": "true",
+            "GMKRAW_DATABASE_URL": "mysql+pymysql://user:secret@mysql/raw_photo",
+            "STORAGE_BACKEND": "mysql",
+            "IMAGE_TASK_QUEUE_ENABLED": "true",
+            "IMAGE_TASK_REDIS_URL": "redis://redis:6379/0",
+            "AGENT_QUEUE_ENABLED": "true",
+            "AGENT_REDIS_URL": "redis://redis:6379/0",
+            "QDRANT_URL": "http://qdrant:6333",
+            "QDRANT_API_KEY": "qdrant-test-key",
+            "GMKRAW_EMBEDDING_BASE_URL": "http://embedding:8080/v1",
+            "GMKRAW_EMBEDDING_MODEL": "text-embedding-3-small",
+            "WEB_SECURITY_SSRF_PROTECTION": "true",
+            "GMKRAW_IMAGE_REFERENCE_UPLOAD_ENABLED": "true",
+            "GMKRAW_OSS_ENDPOINT": "https://oss.example.test",
+            "GMKRAW_OSS_ACCESS_KEY_ID": "access",
+            "GMKRAW_OSS_ACCESS_KEY_SECRET": "secret",
+            "GMKRAW_OSS_BUCKET": "raw-photo",
+            "GMKRAW_IMAGE_STORAGE_ENABLED": "true",
+            "GMKRAW_IMAGE_STORAGE_MODE": "both",
+            "GMKRAW_IMAGE_STORAGE_PROVIDER": "minio",
+            "GMKRAW_MINIO_ENDPOINT": "https://s3.example.test",
+            "GMKRAW_MINIO_ACCESS_KEY": "access",
+            "GMKRAW_MINIO_SECRET_KEY": "secret",
+            "GMKRAW_MINIO_BUCKET": "raw-photo",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            result = validate_enterprise_runtime()
+
+        self.assertTrue(result["enterpriseMode"])
+        self.assertTrue(result["sqliteRejected"])
+
+    def test_enterprise_runtime_requires_vector_auth_and_ssrf_protection(self) -> None:
+        environment = {
+            "GMKRAW_ENTERPRISE_MODE": "true",
+            "GMKRAW_REQUIRE_VECTOR_SEARCH": "true",
+            "GMKRAW_DATABASE_URL": "mysql+pymysql://user:secret@mysql/raw_photo",
+            "STORAGE_BACKEND": "mysql",
+            "IMAGE_TASK_QUEUE_ENABLED": "true",
+            "IMAGE_TASK_REDIS_URL": "redis://redis:6379/0",
+            "AGENT_QUEUE_ENABLED": "true",
+            "AGENT_REDIS_URL": "redis://redis:6379/0",
+            "QDRANT_URL": "http://qdrant:6333",
+            "GMKRAW_EMBEDDING_BASE_URL": "http://embedding:8080/v1",
+            "GMKRAW_EMBEDDING_MODEL": "text-embedding-3-small",
+            "GMKRAW_IMAGE_REFERENCE_UPLOAD_ENABLED": "true",
+            "GMKRAW_OSS_ENDPOINT": "https://oss.example.test",
+            "GMKRAW_OSS_ACCESS_KEY_ID": "access",
+            "GMKRAW_OSS_ACCESS_KEY_SECRET": "secret",
+            "GMKRAW_OSS_BUCKET": "raw-photo",
+            "GMKRAW_IMAGE_STORAGE_ENABLED": "true",
+            "GMKRAW_IMAGE_STORAGE_MODE": "both",
+            "GMKRAW_IMAGE_STORAGE_PROVIDER": "minio",
+            "GMKRAW_MINIO_ENDPOINT": "https://s3.example.test",
+            "GMKRAW_MINIO_ACCESS_KEY": "access",
+            "GMKRAW_MINIO_SECRET_KEY": "secret",
+            "GMKRAW_MINIO_BUCKET": "raw-photo",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "QDRANT_API_KEY.*WEB_SECURITY_SSRF_PROTECTION"):
+                validate_enterprise_runtime()
 
 
 if __name__ == "__main__":

@@ -138,6 +138,21 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(kwargs["batch_index"], 1)
         self.assertEqual(kwargs["batch_total"], 3)
 
+    def test_create_generation_task_passes_prompt_engine_mode(self):
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={
+                "client_task_id": "professional-task-1",
+                "prompt": "create a campaign image",
+                "model": "gpt-image-2",
+                "prompt_engine_mode": "professional",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.generation_calls[0][1]["prompt_engine_mode"], "professional")
+
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""
         response = self.client.post(
@@ -216,6 +231,22 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         self.assertIs(self.fake_service.edit_calls[0][1]["preserve_subject"], True)
+
+    def test_create_edit_task_passes_prompt_engine_mode(self):
+        response = self.client.post(
+            "/api/image-tasks/edits",
+            headers=AUTH_HEADERS,
+            data={
+                "client_task_id": "edit-professional-1",
+                "prompt": "create a designed ecommerce key visual",
+                "model": "gpt-image-2",
+                "prompt_engine_mode": "professional",
+            },
+            files=[("image", ("product.png", b"product", "image/png"))],
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.edit_calls[0][1]["prompt_engine_mode"], "professional")
 
     def test_list_tasks_reports_missing_ids(self):
         response = self.client.post(

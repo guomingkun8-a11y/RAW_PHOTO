@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_uploads as image_uploads_module
-from services.reference_image_uploader import ReferenceUploadResult
+from services.image.reference_image_uploader import ReferenceUploadResult
 
 
 AUTH_HEADERS = {"Authorization": "Bearer gmkraw"}

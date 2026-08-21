@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from services import openai_relay_service
+from services.providers import openai_relay_pool, openai_relay_service
+from services.image.image_prompt_compliance import (
+    IMAGE_PROMPT_DIRECTOR_MARKER,
+    IMAGE_PROMPT_GENERAL_MARKER,
+    IMAGE_PROMPT_REFERENCE_MARKER,
+    IMAGE_PROMPT_STANDARD_MARKER,
+)
 
 
 class FakeResponse:
@@ -54,6 +60,26 @@ def relay_settings() -> dict[str, object]:
 
 
 class OpenAIRelayServiceTests(unittest.TestCase):
+    def setUp(self):
+        # Relay account rotation is process-local; isolate each test's pool state.
+        openai_relay_pool._LOCAL_ROTATION_INDEX = 0
+        openai_relay_pool._LOCAL_INFLIGHT.clear()
+        openai_relay_pool._LOCAL_COOLDOWNS.clear()
+
+    def assertPromptEngineered(
+        self,
+        prompt: str,
+        original: str,
+        *,
+        has_reference: bool = False,
+        domain: str = "general",
+    ) -> None:
+        self.assertTrue(prompt.startswith(original))
+        marker = IMAGE_PROMPT_DIRECTOR_MARKER if domain == "ecommerce" else IMAGE_PROMPT_GENERAL_MARKER
+        self.assertIn(marker, prompt)
+        if has_reference:
+            self.assertIn(IMAGE_PROMPT_REFERENCE_MARKER, prompt)
+
     def test_list_models_joins_v1_base_url_once(self):
         with (
             mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
@@ -125,7 +151,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(post.call_args.args[0], "https://relay.example/v1/images/edits")
         self.assertNotIn("files", post.call_args.kwargs)
         self.assertEqual(post.call_args.kwargs["data"]["model"], "gpt-image-2")
-        self.assertEqual(post.call_args.kwargs["data"]["prompt"], "make it brighter")
+        self.assertPromptEngineered(post.call_args.kwargs["data"]["prompt"], "make it brighter", has_reference=True)
         self.assertIs(post.call_args.kwargs["multipart"], FakeCurlMime.instances[0])
         self.assertTrue(FakeCurlMime.instances[0].closed)
         self.assertEqual(
@@ -144,6 +170,51 @@ class OpenAIRelayServiceTests(unittest.TestCase):
                     "data": b"mask-bytes",
                 },
             ],
+        )
+
+    def test_standard_image_edit_keeps_standard_prompt_and_strips_internal_mode(self):
+        FakeCurlMime.instances = []
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(openai_relay_service, "CurlMime", FakeCurlMime),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"created": 1, "data": [{"url": "https://example.test/image.png"}]}),
+            ) as post,
+        ):
+            openai_relay_service.image_edits({
+                "model": "gpt-image-2",
+                "prompt": "plain product photo",
+                "images": [(b"image-bytes", "input.png", "image/png")],
+                "prompt_engine_mode": "standard",
+            })
+
+        fields = post.call_args.kwargs["data"]
+        self.assertIn(IMAGE_PROMPT_STANDARD_MARKER, fields["prompt"])
+        self.assertNotIn(IMAGE_PROMPT_DIRECTOR_MARKER, fields["prompt"])
+        self.assertNotIn("prompt_engine_mode", fields)
+
+    def test_explicit_ecommerce_generation_keeps_professional_director(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(openai_relay_service, "run_with_relay_pool", side_effect=lambda _settings, _operation, action: action()),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"created": 1, "data": [{"url": "https://example.test/product.png"}]}),
+            ) as post,
+        ):
+            openai_relay_service.image_generations({
+                "model": "gpt-image-2",
+                "prompt": "生成一张香水商品主图",
+                "prompt_engine_mode": "professional",
+            })
+
+        self.assertPromptEngineered(
+            post.call_args.kwargs["json"]["prompt"],
+            "生成一张香水商品主图",
+            domain="ecommerce",
         )
 
     def test_image_edits_falls_back_to_generations_with_reference_images_on_404(self):
@@ -172,7 +243,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(post.call_args_list[1].args[0], "https://relay.example/v1/images/generations")
         fallback_json = post.call_args_list[1].kwargs["json"]
         self.assertEqual(fallback_json["model"], "gpt-image-2")
-        self.assertEqual(fallback_json["prompt"], "make it brighter")
+        self.assertPromptEngineered(fallback_json["prompt"], "make it brighter", has_reference=True)
         self.assertEqual(fallback_json["response_format"], "url")
         self.assertEqual(fallback_json["images"], ["data:image/png;base64,aW1hZ2UtYnl0ZXM="])
 
@@ -236,7 +307,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         post.assert_called_once()
         self.assertEqual(post.call_args.args[0], "https://api.lingkeai.ai/v1/images/edits")
         self.assertEqual(post.call_args.kwargs["data"]["model"], "gpt-image-2")
-        self.assertEqual(post.call_args.kwargs["data"]["prompt"], "make it brighter")
+        self.assertPromptEngineered(post.call_args.kwargs["data"]["prompt"], "make it brighter", has_reference=True)
         self.assertIs(post.call_args.kwargs["multipart"], FakeCurlMime.instances[0])
 
     def test_lingke_image_edits_do_not_upload_references_first(self):
@@ -405,7 +476,6 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["params"]["aspectRatio"], "3:2")
         self.assertEqual(payload["params"]["images"], ["https://cdn.example.test/input.png"])
-
 
 if __name__ == "__main__":
     unittest.main()

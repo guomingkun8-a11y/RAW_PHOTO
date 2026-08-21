@@ -15,9 +15,9 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.image_task_queue import RedisImageTaskQueue
-from services.image_task_service import ImageTaskService
-from services.image_task_store import DatabaseImageTaskStore
+from services.image.image_task_queue import RedisImageTaskQueue
+from services.image.image_task_service import ImageTaskService
+from services.image.image_task_store import DatabaseImageTaskStore
 
 
 TERMINAL_STATUSES = {"success", "error", "canceled"}

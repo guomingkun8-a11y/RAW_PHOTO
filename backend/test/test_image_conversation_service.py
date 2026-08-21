@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import json
 
-from services.image_conversation_service import ImageConversationModel, ImageConversationService
+from services.image.image_conversation_service import ImageConversationModel, ImageConversationService
 
 
 class ImageConversationServiceTests(unittest.TestCase):
@@ -105,6 +105,43 @@ class ImageConversationServiceTests(unittest.TestCase):
                 self.assertNotIn("b64_json", json.dumps(stored))
                 self.assertNotIn("dataUrl", json.dumps(stored))
                 self.assertEqual(turn["images"][0]["url"], "http://app.test/images/result.png")
+            finally:
+                service.engine.dispose()
+
+    def test_stale_upsert_does_not_overwrite_newer_conversation_turns(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = ImageConversationService(f"sqlite:///{Path(tmp_dir) / 'conversations.db'}")
+            try:
+                identity = {"id": "owner-1", "role": "user"}
+                newer = {
+                    "id": "conversation-1",
+                    "title": "two turns",
+                    "updatedAt": "2026-08-16T07:00:02.000Z",
+                    "turns": [{"id": "turn-1"}, {"id": "turn-2"}],
+                }
+                stale = {
+                    "id": "conversation-1",
+                    "title": "one turn",
+                    "updatedAt": "2026-08-16T07:00:01.000Z",
+                    "turns": [{"id": "turn-1"}],
+                }
+
+                service.upsert_conversation(
+                    identity=identity,
+                    conversation_id="conversation-1",
+                    payload=newer,
+                )
+                result = service.upsert_conversation(
+                    identity=identity,
+                    conversation_id="conversation-1",
+                    payload=stale,
+                )
+
+                self.assertEqual(result["title"], "two turns")
+                self.assertEqual([turn["id"] for turn in result["turns"]], ["turn-1", "turn-2"])
+                stored = service.list_conversations(identity=identity)["items"][0]
+                self.assertEqual(stored["updatedAt"], newer["updatedAt"])
+                self.assertEqual(len(stored["turns"]), 2)
             finally:
                 service.engine.dispose()
 

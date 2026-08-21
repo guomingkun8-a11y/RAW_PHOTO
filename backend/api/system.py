@@ -8,12 +8,12 @@ from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from api.support import extract_bearer_token, require_admin, require_identity
-from services.captcha_service import captcha_service
-from services.business_service import business_service
-from services.config import config
-from services.image_service import get_image_response, get_thumbnail_response
-from services.system_announcement_service import system_announcement_service
-from services.user_service import AVATAR_DIR, AVATAR_EXTENSIONS, user_service
+from services.accounts.captcha_service import captcha_service
+from services.accounts.business_service import business_service
+from services.platform.config import config
+from services.image.image_service import get_image_response, get_thumbnail_response
+from services.platform.system_announcement_service import system_announcement_service
+from services.accounts.user_service import AVATAR_DIR, AVATAR_EXTENSIONS, user_service
 
 
 class LoginRequest(BaseModel):

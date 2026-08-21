@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sys
 
-from services.account_service import account_service
+from services.accounts.account_service import account_service
 
 
 def _fmt_remaining(seconds: int | None) -> str:

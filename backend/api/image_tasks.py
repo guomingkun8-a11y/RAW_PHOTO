@@ -6,6 +6,7 @@ import re
 import tempfile
 import zipfile
 from urllib.parse import quote, unquote, urlparse
+from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -14,12 +15,13 @@ from pydantic import BaseModel, Field
 
 from api.image_inputs import _download_image_url, collect_http_image_urls, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
-from services.content_filter import check_request
-from services.generation_monitoring_service import generation_monitoring_service
-from services.image_storage_service import image_storage_service
-from services.image_task_service import image_task_service
-from services.log_service import LoggedCall
-from services import openai_relay_service, reference_image_uploader
+from services.platform.content_filter import check_request
+from services.image.generation_monitoring_service import generation_monitoring_service
+from services.image.image_storage_service import image_storage_service
+from services.image.image_task_service import image_task_service
+from services.platform.log_service import LoggedCall
+from services.providers import openai_relay_service
+from services.image import reference_image_uploader
 
 ZIP_MAX_ITEM_BYTES = 50 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024
@@ -33,6 +35,7 @@ class ImageGenerationTaskRequest(BaseModel):
     model: str = "gpt-image-2"
     size: str | None = None
     quality: str = "auto"
+    prompt_engine_mode: Literal["standard", "professional", "general"] = "standard"
     conversation_id: str | None = None
     turn_id: str | None = None
     product_id: int | None = None
@@ -271,6 +274,7 @@ def create_router() -> APIRouter:
                 model=body.model,
                 size=body.size,
                 quality=body.quality,
+                prompt_engine_mode=body.prompt_engine_mode,
                 base_url=resolve_image_base_url(request),
                 conversation_id=str(body.conversation_id or ""),
                 turn_id=str(body.turn_id or ""),
@@ -329,6 +333,7 @@ def create_router() -> APIRouter:
                 model=model,
                 size=payload["size"],
                 quality=payload["quality"],
+                prompt_engine_mode=str(payload.get("prompt_engine_mode") or "standard"),
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,

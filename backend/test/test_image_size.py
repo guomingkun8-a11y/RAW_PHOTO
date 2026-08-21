@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from services.image_size import normalize_image_size
+from services.image.image_size import normalize_image_size
 
 
 class ImageSizeTests(unittest.TestCase):
@@ -19,6 +19,7 @@ class ImageSizeTests(unittest.TestCase):
     def test_keeps_empty_and_auto(self):
         self.assertIsNone(normalize_image_size(None))
         self.assertEqual(normalize_image_size("auto"), "auto")
+        self.assertIsNone(normalize_image_size("medium"))
 
 
 if __name__ == "__main__":

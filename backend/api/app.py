@@ -7,13 +7,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import ai, business, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system
+from api import ai, business, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
-from services.config import config
-from services.database_maintenance import ensure_database_ready, start_database_maintenance_scheduler
-from services.image_storage_service import image_storage_service
-from services.image_service import start_image_cleanup_scheduler
+from services.platform.config import config
+from services.platform.database_maintenance import ensure_database_ready, start_database_maintenance_scheduler
+from services.image.image_storage_service import image_storage_service
+from services.image.image_service import start_image_cleanup_scheduler
 from utils.log import logger
 
 
@@ -37,6 +37,12 @@ def create_app() -> FastAPI:
             stop_event.set()
             database_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            try:
+                from services.ecommerce.cow_agent_extended_tools import reset_extended_tool_services
+
+                reset_extended_tool_services()
+            except Exception as exc:
+                logger.info({"event": "cowagent_tool_cleanup_failed", "error": str(exc)})
 
     app = FastAPI(title="image-generation-api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
@@ -54,6 +60,7 @@ def create_app() -> FastAPI:
     app.include_router(image_conversations.create_router())
     app.include_router(image_library.create_router())
     app.include_router(prompt_analysis.create_router())
+    app.include_router(image_agent.create_router())
     app.include_router(monitoring.create_router())
     app.include_router(system.create_router(app_version))
 

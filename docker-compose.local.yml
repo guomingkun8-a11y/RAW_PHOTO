@@ -7,6 +7,15 @@ services:
     volumes:
       - ./data/redis:/data
 
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: gmkraw-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
   app:
     build:
       context: .
@@ -16,6 +25,7 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+      - qdrant
     ports:
       - "8000:80"
     volumes:
@@ -28,6 +38,23 @@ services:
       IMAGE_TASK_REDIS_URL: redis://redis:6379/0
       IMAGE_TASK_DATABASE_URL: sqlite:////app/data/image_tasks.db
       IMAGE_TASK_MAX_RETRIES: "2"
+      IMAGE_TASK_TOTAL_CONCURRENCY: "8"
+      IMAGE_TASK_WORKER_CONCURRENCY: "8"
+      IMAGE_TASK_OWNER_CONCURRENCY: "2"
+      AGENT_QUEUE_ENABLED: "true"
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_WORKER_CONCURRENCY: "4"
+      AGENT_TOTAL_CONCURRENCY: "4"
+      AGENT_OWNER_CONCURRENCY: "1"
+      AGENT_OWNER_PENDING_LIMIT: "10"
+      AGENT_MAX_RETRIES: "3"
+      AGENT_RETRY_BASE_DELAY_SECS: "2"
+      AGENT_RETRY_MAX_DELAY_SECS: "60"
+      AGENT_DEAD_LETTER_RETENTION_SECS: "604800"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: raw_professional_memory
+      QDRANT_FOLDER_COLLECTION: raw_professional_folder_assets
+      QDRANT_KNOWLEDGE_COLLECTION: raw_professional_knowledge
 
   worker:
     build:
@@ -49,6 +76,41 @@ services:
       IMAGE_TASK_REDIS_URL: redis://redis:6379/0
       IMAGE_TASK_DATABASE_URL: sqlite:////app/data/image_tasks.db
       IMAGE_TASK_MAX_RETRIES: "2"
+
+  agent-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gmkraw:local
+    container_name: gmkraw-agent-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "agent_worker.py"]
+    depends_on:
+      - redis
+      - qdrant
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      STORAGE_BACKEND: sqlite
+      DATABASE_URL: sqlite:////app/data/accounts.db
+      IMAGE_TASK_QUEUE_ENABLED: "true"
+      IMAGE_TASK_REDIS_URL: redis://redis:6379/0
+      IMAGE_TASK_DATABASE_URL: sqlite:////app/data/image_tasks.db
+      AGENT_QUEUE_ENABLED: "true"
+      AGENT_REDIS_URL: redis://redis:6379/0
+      AGENT_WORKER_CONCURRENCY: "4"
+      AGENT_TOTAL_CONCURRENCY: "4"
+      AGENT_OWNER_CONCURRENCY: "1"
+      AGENT_OWNER_PENDING_LIMIT: "10"
+      AGENT_MAX_RETRIES: "3"
+      AGENT_RETRY_BASE_DELAY_SECS: "2"
+      AGENT_RETRY_MAX_DELAY_SECS: "60"
+      AGENT_DEAD_LETTER_RETENTION_SECS: "604800"
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: raw_professional_memory
+      QDRANT_FOLDER_COLLECTION: raw_professional_folder_assets
+      QDRANT_KNOWLEDGE_COLLECTION: raw_professional_knowledge
     # 存储后端配置 (可选值: json, sqlite, postgres, git)
     # environment:
     #   STORAGE_BACKEND: json

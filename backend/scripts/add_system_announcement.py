@@ -8,7 +8,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.system_announcement_service import ANNOUNCEMENT_TYPES, system_announcement_service
+from services.platform.system_announcement_service import ANNOUNCEMENT_TYPES, system_announcement_service
 
 
 def main() -> int:

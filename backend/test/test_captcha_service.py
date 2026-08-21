@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from services.captcha_service import CaptchaService
+from services.accounts.captcha_service import CaptchaService
 
 
 class CaptchaServiceTests(unittest.TestCase):

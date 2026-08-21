@@ -14,8 +14,8 @@ ROOT_DIR = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.config import config
-from services.enterprise_schema import resolve_enterprise_database_url
+from services.platform.config import config
+from services.platform.enterprise_schema import resolve_enterprise_database_url
 
 
 def _percentile(values: list[int], percentile: float) -> int | None:
