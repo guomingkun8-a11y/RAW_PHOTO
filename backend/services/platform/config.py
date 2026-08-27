@@ -67,6 +67,72 @@ DEFAULT_IMAGE_REFERENCE_UPLOAD = {
     "persistent_cache_enabled": True,
 }
 
+DEFAULT_VIDEO_UPLOAD = {
+    "enabled": False,
+    "provider": "oss",
+    "oss_endpoint": "",
+    "oss_access_key": "",
+    "oss_secret_key": "",
+    "oss_bucket": "",
+    "oss_region": "oss-cn-beijing",
+    "oss_secure": True,
+    "oss_prefix": "raw-photo/video-inputs",
+    "public_base_url": "",
+    "timeout_sec": 120,
+}
+
+DEFAULT_VIDEO_ANALYSIS = {
+    "enabled": True,
+    "ffmpeg_path": "ffmpeg",
+    "ffprobe_path": "ffprobe",
+    "max_duration_secs": 300,
+    "max_frames": 12,
+    "frame_interval_secs": 8,
+    "frame_width": 768,
+    "vision_model": "gpt-5.6-sol",
+    "asr_enabled": True,
+    "asr_model": "whisper-1",
+    "audio_max_mb": 25,
+    "auto_enqueue_on_upload": False,
+    "queue_enabled": True,
+    "redis_url": "redis://127.0.0.1:6379/0",
+    "queue_name": "professional_video_analysis_jobs",
+    "worker_concurrency": 4,
+    "total_concurrency": 4,
+    "owner_concurrency": 1,
+    "owner_pending_limit": 8,
+    "slot_lease_secs": 1800,
+    "job_retention_secs": 86400,
+    "max_retries": 2,
+    "retry_base_delay_secs": 5,
+    "retry_max_delay_secs": 120,
+    "dead_letter_retention_secs": 604800,
+}
+
+DEFAULT_VIDEO_GENERATION = {
+    "enabled": False,
+    "base_url": "",
+    "api_key": "",
+    "api_keys": [],
+    "submit_path": "/v1/media/generate",
+    "status_path": "/v1/media/status",
+    "download_results": False,
+    "result_storage_prefix": "raw-photo/video-results",
+    "poll_interval_secs": 3,
+    "poll_timeout_secs": 900,
+    "queue_enabled": True,
+    "redis_url": "redis://127.0.0.1:6379/0",
+    "queue_name": "ai_video_generation_tasks",
+    "database_url": "",
+    "max_retries": 1,
+    "worker_concurrency": 2,
+    "total_concurrency": 2,
+    "owner_concurrency": 1,
+    "owner_pending_limit": 8,
+    "slot_lease_secs": 3600,
+    "stale_running_timeout_secs": 3600,
+}
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -112,7 +178,7 @@ DEFAULT_OPENAI_RELAY = {
     "api_key_pool_lease_secs": 600,
     "api_key_pool_cooldown_secs": 60,
     "api_key_pool_max_attempts": 3,
-    "prompt_analysis_model": "gpt-4o",
+    "prompt_analysis_model": "gpt-5.6-sol",
     "embedding_model": "text-embedding-3-small",
 }
 
@@ -207,6 +273,26 @@ def _strip_environment_managed_secrets(data: dict[str, object]) -> dict[str, obj
             ("image_reference_upload", "oss_secret_key"),
             "",
         ),
+        (
+            (
+                "GMKRAW_OSS_VIDEO_ACCESS_KEY_ID",
+                "GMKRAW_OSS_VIDEO_ACCESS_KEY",
+                "GMKRAW_OSS_ACCESS_KEY_ID",
+                "GMKRAW_OSS_ACCESS_KEY",
+            ),
+            ("video_upload", "oss_access_key"),
+            "",
+        ),
+        (
+            (
+                "GMKRAW_OSS_VIDEO_ACCESS_KEY_SECRET",
+                "GMKRAW_OSS_VIDEO_SECRET_KEY",
+                "GMKRAW_OSS_ACCESS_KEY_SECRET",
+                "GMKRAW_OSS_SECRET_KEY",
+            ),
+            ("video_upload", "oss_secret_key"),
+            "",
+        ),
         (("GMKRAW_WEBDAV_PASSWORD", "WEBDAV_PASSWORD"), ("image_storage", "webdav_password"), ""),
         (("GMKRAW_MINIO_ACCESS_KEY", "MINIO_ACCESS_KEY"), ("image_storage", "minio_access_key"), ""),
         (("GMKRAW_MINIO_SECRET_KEY", "MINIO_SECRET_KEY"), ("image_storage", "minio_secret_key"), ""),
@@ -216,6 +302,23 @@ def _strip_environment_managed_secrets(data: dict[str, object]) -> dict[str, obj
         (("GMKRAW_CF_CLEARANCE",), ("proxy_runtime", "clearance", "cf_clearance"), ""),
         (("IMAGE_TASK_REDIS_URL", "REDIS_URL"), ("image_task_queue", "redis_url"), DEFAULT_IMAGE_TASK_QUEUE["redis_url"]),
         (("IMAGE_TASK_DATABASE_URL", "MYSQL_DATABASE_URL"), ("image_task_queue", "database_url"), ""),
+        (
+            ("VIDEO_PARSE_REDIS_URL", "GMKRAW_VIDEO_PARSE_REDIS_URL", "REDIS_URL"),
+            ("video_analysis", "redis_url"),
+            DEFAULT_VIDEO_ANALYSIS["redis_url"],
+        ),
+        (("VIDEO_GENERATION_API_KEY", "GMKRAW_VIDEO_GENERATION_API_KEY"), ("video_generation", "api_key"), ""),
+        (("VIDEO_GENERATION_API_KEYS", "GMKRAW_VIDEO_GENERATION_API_KEYS"), ("video_generation", "api_keys"), []),
+        (
+            ("VIDEO_GENERATION_REDIS_URL", "GMKRAW_VIDEO_GENERATION_REDIS_URL", "REDIS_URL"),
+            ("video_generation", "redis_url"),
+            DEFAULT_VIDEO_GENERATION["redis_url"],
+        ),
+        (
+            ("VIDEO_GENERATION_DATABASE_URL", "GMKRAW_VIDEO_GENERATION_DATABASE_URL", "MYSQL_DATABASE_URL"),
+            ("video_generation", "database_url"),
+            "",
+        ),
     )
     for env_names, path, replacement in mappings:
         if any(os.getenv(name) is not None for name in env_names):
@@ -518,6 +621,351 @@ def _normalize_image_reference_upload_settings(value: object) -> dict[str, objec
         "persistent_cache_enabled": _normalize_bool(
             persistent_cache_env if persistent_cache_env is not None else source.get("persistent_cache_enabled"),
             bool(DEFAULT_IMAGE_REFERENCE_UPLOAD["persistent_cache_enabled"]),
+        ),
+    }
+
+
+def _normalize_video_upload_settings(
+    value: object,
+    reference: dict[str, object] | None = None,
+) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    reference_settings = reference or {}
+    enabled_env = os.getenv("GMKRAW_VIDEO_UPLOAD_ENABLED") or os.getenv("GMKRAW_OSS_VIDEO_UPLOAD_ENABLED")
+    oss_endpoint_env = os.getenv("GMKRAW_OSS_VIDEO_ENDPOINT") or os.getenv("GMKRAW_OSS_ENDPOINT")
+    oss_access_key_env = os.getenv("GMKRAW_OSS_VIDEO_ACCESS_KEY_ID") or os.getenv("GMKRAW_OSS_ACCESS_KEY_ID") or os.getenv("GMKRAW_OSS_ACCESS_KEY")
+    oss_secret_key_env = os.getenv("GMKRAW_OSS_VIDEO_ACCESS_KEY_SECRET") or os.getenv("GMKRAW_OSS_ACCESS_KEY_SECRET") or os.getenv("GMKRAW_OSS_SECRET_KEY")
+    oss_bucket_env = os.getenv("GMKRAW_OSS_VIDEO_BUCKET") or os.getenv("GMKRAW_OSS_BUCKET")
+    oss_region_env = os.getenv("GMKRAW_OSS_VIDEO_REGION") or os.getenv("GMKRAW_OSS_REGION")
+    oss_secure_env = os.getenv("GMKRAW_OSS_VIDEO_SECURE") or os.getenv("GMKRAW_OSS_SECURE")
+    oss_prefix_env = os.getenv("GMKRAW_OSS_VIDEO_PREFIX") or os.getenv("GMKRAW_VIDEO_UPLOAD_PREFIX")
+    public_base_url_env = os.getenv("GMKRAW_OSS_VIDEO_PUBLIC_BASE_URL") or os.getenv("GMKRAW_OSS_PUBLIC_BASE_URL")
+    timeout_sec_env = os.getenv("GMKRAW_OSS_VIDEO_TIMEOUT_SEC") or os.getenv("GMKRAW_VIDEO_UPLOAD_TIMEOUT_SEC")
+    reference_enabled = _normalize_bool(reference_settings.get("enabled"), False)
+    timeout_sec = _normalize_positive_int(
+        timeout_sec_env or source.get("timeout_sec"),
+        int(DEFAULT_VIDEO_UPLOAD["timeout_sec"]),
+        10,
+    )
+    return {
+        "enabled": _normalize_bool(
+            enabled_env if enabled_env is not None else source.get("enabled", reference_enabled),
+            reference_enabled,
+        ),
+        "provider": "oss",
+        "oss_endpoint": str(
+            oss_endpoint_env
+            or source.get("oss_endpoint")
+            or reference_settings.get("oss_endpoint")
+            or ""
+        ).strip().rstrip("/"),
+        "oss_access_key": str(
+            oss_access_key_env
+            or source.get("oss_access_key")
+            or source.get("oss_access_key_id")
+            or reference_settings.get("oss_access_key")
+            or ""
+        ).strip(),
+        "oss_secret_key": str(
+            oss_secret_key_env
+            or source.get("oss_secret_key")
+            or source.get("oss_access_key_secret")
+            or reference_settings.get("oss_secret_key")
+            or ""
+        ).strip(),
+        "oss_bucket": str(
+            oss_bucket_env
+            or source.get("oss_bucket")
+            or reference_settings.get("oss_bucket")
+            or ""
+        ).strip(),
+        "oss_region": str(
+            oss_region_env
+            or source.get("oss_region")
+            or reference_settings.get("oss_region")
+            or DEFAULT_VIDEO_UPLOAD["oss_region"]
+        ).strip(),
+        "oss_secure": _normalize_bool(
+            oss_secure_env if oss_secure_env is not None else source.get("oss_secure", reference_settings.get("oss_secure")),
+            bool(DEFAULT_VIDEO_UPLOAD["oss_secure"]),
+        ),
+        "oss_prefix": str(
+            oss_prefix_env
+            or source.get("oss_prefix")
+            or DEFAULT_VIDEO_UPLOAD["oss_prefix"]
+        ).strip().strip("/"),
+        "public_base_url": str(
+            public_base_url_env
+            or source.get("public_base_url")
+            or source.get("oss_public_base_url")
+            or reference_settings.get("public_base_url")
+            or ""
+        ).strip().rstrip("/"),
+        "timeout_sec": timeout_sec,
+    }
+
+
+def _normalize_video_analysis_settings(value: object, queue_reference: dict[str, object] | None = None) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    image_queue = queue_reference or {}
+    enabled_env = os.getenv("VIDEO_ANALYSIS_ENABLED") or os.getenv("GMKRAW_VIDEO_ANALYSIS_ENABLED")
+    queue_enabled_env = os.getenv("VIDEO_PARSE_QUEUE_ENABLED") or os.getenv("GMKRAW_VIDEO_PARSE_QUEUE_ENABLED")
+    redis_url_env = os.getenv("VIDEO_PARSE_REDIS_URL") or os.getenv("GMKRAW_VIDEO_PARSE_REDIS_URL")
+    default_redis_url = str(image_queue.get("redis_url") or DEFAULT_VIDEO_ANALYSIS["redis_url"])
+    return {
+        "enabled": _normalize_bool(
+            enabled_env if enabled_env is not None else source.get("enabled"),
+            bool(DEFAULT_VIDEO_ANALYSIS["enabled"]),
+        ),
+        "ffmpeg_path": str(
+            os.getenv("VIDEO_ANALYSIS_FFMPEG_PATH")
+            or os.getenv("GMKRAW_VIDEO_ANALYSIS_FFMPEG_PATH")
+            or source.get("ffmpeg_path")
+            or DEFAULT_VIDEO_ANALYSIS["ffmpeg_path"]
+        ).strip() or str(DEFAULT_VIDEO_ANALYSIS["ffmpeg_path"]),
+        "ffprobe_path": str(
+            os.getenv("VIDEO_ANALYSIS_FFPROBE_PATH")
+            or os.getenv("GMKRAW_VIDEO_ANALYSIS_FFPROBE_PATH")
+            or source.get("ffprobe_path")
+            or DEFAULT_VIDEO_ANALYSIS["ffprobe_path"]
+        ).strip() or str(DEFAULT_VIDEO_ANALYSIS["ffprobe_path"]),
+        "max_duration_secs": _normalize_positive_int(
+            os.getenv("VIDEO_ANALYSIS_MAX_DURATION_SECS") or source.get("max_duration_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["max_duration_secs"]),
+            10,
+        ),
+        "max_frames": _normalize_positive_int(
+            os.getenv("VIDEO_ANALYSIS_MAX_FRAMES") or source.get("max_frames"),
+            int(DEFAULT_VIDEO_ANALYSIS["max_frames"]),
+            1,
+        ),
+        "frame_interval_secs": _normalize_positive_int(
+            os.getenv("VIDEO_ANALYSIS_FRAME_INTERVAL_SECS") or source.get("frame_interval_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["frame_interval_secs"]),
+            1,
+        ),
+        "frame_width": _normalize_positive_int(
+            os.getenv("VIDEO_ANALYSIS_FRAME_WIDTH") or source.get("frame_width"),
+            int(DEFAULT_VIDEO_ANALYSIS["frame_width"]),
+            160,
+        ),
+        "vision_model": str(
+            os.getenv("VIDEO_ANALYSIS_VISION_MODEL")
+            or os.getenv("GMKRAW_VIDEO_ANALYSIS_VISION_MODEL")
+            or source.get("vision_model")
+            or DEFAULT_VIDEO_ANALYSIS["vision_model"]
+        ).strip() or str(DEFAULT_VIDEO_ANALYSIS["vision_model"]),
+        "asr_enabled": _normalize_bool(
+            (
+                os.getenv("VIDEO_ANALYSIS_ASR_ENABLED")
+                if os.getenv("VIDEO_ANALYSIS_ASR_ENABLED") is not None
+                else os.getenv("GMKRAW_VIDEO_ANALYSIS_ASR_ENABLED")
+            )
+            if (os.getenv("VIDEO_ANALYSIS_ASR_ENABLED") is not None or os.getenv("GMKRAW_VIDEO_ANALYSIS_ASR_ENABLED") is not None)
+            else source.get("asr_enabled"),
+            bool(DEFAULT_VIDEO_ANALYSIS["asr_enabled"]),
+        ),
+        "asr_model": str(
+            os.getenv("VIDEO_ANALYSIS_ASR_MODEL")
+            or os.getenv("GMKRAW_VIDEO_ANALYSIS_ASR_MODEL")
+            or source.get("asr_model")
+            or DEFAULT_VIDEO_ANALYSIS["asr_model"]
+        ).strip() or str(DEFAULT_VIDEO_ANALYSIS["asr_model"]),
+        "audio_max_mb": _normalize_positive_int(
+            os.getenv("VIDEO_ANALYSIS_AUDIO_MAX_MB") or source.get("audio_max_mb"),
+            int(DEFAULT_VIDEO_ANALYSIS["audio_max_mb"]),
+            1,
+        ),
+        "auto_enqueue_on_upload": _normalize_bool(
+            (
+                os.getenv("VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD")
+                if os.getenv("VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD") is not None
+                else os.getenv("GMKRAW_VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD")
+            )
+            if (
+                os.getenv("VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD") is not None
+                or os.getenv("GMKRAW_VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD") is not None
+            )
+            else source.get("auto_enqueue_on_upload"),
+            bool(DEFAULT_VIDEO_ANALYSIS["auto_enqueue_on_upload"]),
+        ),
+        "queue_enabled": _normalize_bool(
+            queue_enabled_env if queue_enabled_env is not None else source.get("queue_enabled"),
+            bool(DEFAULT_VIDEO_ANALYSIS["queue_enabled"]),
+        ),
+        "redis_url": str(
+            redis_url_env
+            or source.get("redis_url")
+            or default_redis_url
+        ).strip() or default_redis_url,
+        "queue_name": str(
+            os.getenv("VIDEO_PARSE_QUEUE_NAME")
+            or os.getenv("GMKRAW_VIDEO_PARSE_QUEUE_NAME")
+            or source.get("queue_name")
+            or DEFAULT_VIDEO_ANALYSIS["queue_name"]
+        ).strip() or str(DEFAULT_VIDEO_ANALYSIS["queue_name"]),
+        "worker_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_WORKER_CONCURRENCY") or source.get("worker_concurrency"),
+            int(DEFAULT_VIDEO_ANALYSIS["worker_concurrency"]),
+            1,
+        ),
+        "total_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_TOTAL_CONCURRENCY") or source.get("total_concurrency"),
+            int(DEFAULT_VIDEO_ANALYSIS["total_concurrency"]),
+            1,
+        ),
+        "owner_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_OWNER_CONCURRENCY") or source.get("owner_concurrency"),
+            int(DEFAULT_VIDEO_ANALYSIS["owner_concurrency"]),
+            1,
+        ),
+        "owner_pending_limit": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_OWNER_PENDING_LIMIT") or source.get("owner_pending_limit"),
+            int(DEFAULT_VIDEO_ANALYSIS["owner_pending_limit"]),
+            1,
+        ),
+        "slot_lease_secs": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_SLOT_LEASE_SECS") or source.get("slot_lease_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["slot_lease_secs"]),
+            60,
+        ),
+        "job_retention_secs": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_JOB_RETENTION_SECS") or source.get("job_retention_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["job_retention_secs"]),
+            3600,
+        ),
+        "max_retries": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_MAX_RETRIES") or source.get("max_retries"),
+            int(DEFAULT_VIDEO_ANALYSIS["max_retries"]),
+            0,
+        ),
+        "retry_base_delay_secs": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_RETRY_BASE_DELAY_SECS") or source.get("retry_base_delay_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["retry_base_delay_secs"]),
+            1,
+        ),
+        "retry_max_delay_secs": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_RETRY_MAX_DELAY_SECS") or source.get("retry_max_delay_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["retry_max_delay_secs"]),
+            1,
+        ),
+        "dead_letter_retention_secs": _normalize_positive_int(
+            os.getenv("VIDEO_PARSE_DEAD_LETTER_RETENTION_SECS") or source.get("dead_letter_retention_secs"),
+            int(DEFAULT_VIDEO_ANALYSIS["dead_letter_retention_secs"]),
+            3600,
+        ),
+    }
+
+
+def _normalize_video_generation_settings(value: object, queue_reference: dict[str, object] | None = None) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    image_queue = queue_reference or {}
+    enabled_env = os.getenv("VIDEO_GENERATION_ENABLED") or os.getenv("GMKRAW_VIDEO_GENERATION_ENABLED")
+    queue_enabled_env = os.getenv("VIDEO_GENERATION_QUEUE_ENABLED") or os.getenv("GMKRAW_VIDEO_GENERATION_QUEUE_ENABLED")
+    redis_url_env = os.getenv("VIDEO_GENERATION_REDIS_URL") or os.getenv("GMKRAW_VIDEO_GENERATION_REDIS_URL")
+    default_redis_url = str(image_queue.get("redis_url") or DEFAULT_VIDEO_GENERATION["redis_url"])
+    api_key_env = os.getenv("VIDEO_GENERATION_API_KEY") or os.getenv("GMKRAW_VIDEO_GENERATION_API_KEY")
+    api_keys_env = os.getenv("VIDEO_GENERATION_API_KEYS") or os.getenv("GMKRAW_VIDEO_GENERATION_API_KEYS")
+    return {
+        "enabled": _normalize_bool(
+            enabled_env if enabled_env is not None else source.get("enabled"),
+            bool(DEFAULT_VIDEO_GENERATION["enabled"]),
+        ),
+        "base_url": str(
+            os.getenv("VIDEO_GENERATION_BASE_URL")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_BASE_URL")
+            or source.get("base_url")
+            or ""
+        ).strip().rstrip("/"),
+        "api_key": str(api_key_env or source.get("api_key") or "").strip(),
+        "api_keys": _normalize_string_list(api_keys_env if api_keys_env is not None else source.get("api_keys")),
+        "submit_path": str(
+            os.getenv("VIDEO_GENERATION_SUBMIT_PATH")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_SUBMIT_PATH")
+            or source.get("submit_path")
+            or DEFAULT_VIDEO_GENERATION["submit_path"]
+        ).strip() or str(DEFAULT_VIDEO_GENERATION["submit_path"]),
+        "status_path": str(
+            os.getenv("VIDEO_GENERATION_STATUS_PATH")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_STATUS_PATH")
+            or source.get("status_path")
+            or DEFAULT_VIDEO_GENERATION["status_path"]
+        ).strip() or str(DEFAULT_VIDEO_GENERATION["status_path"]),
+        "download_results": _normalize_bool(
+            os.getenv("VIDEO_GENERATION_DOWNLOAD_RESULTS") or source.get("download_results"),
+            bool(DEFAULT_VIDEO_GENERATION["download_results"]),
+        ),
+        "result_storage_prefix": str(
+            os.getenv("VIDEO_GENERATION_RESULT_STORAGE_PREFIX")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_RESULT_STORAGE_PREFIX")
+            or source.get("result_storage_prefix")
+            or DEFAULT_VIDEO_GENERATION["result_storage_prefix"]
+        ).strip().strip("/"),
+        "poll_interval_secs": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_POLL_INTERVAL_SECS") or source.get("poll_interval_secs"),
+            int(DEFAULT_VIDEO_GENERATION["poll_interval_secs"]),
+            1,
+        ),
+        "poll_timeout_secs": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_POLL_TIMEOUT_SECS") or source.get("poll_timeout_secs"),
+            int(DEFAULT_VIDEO_GENERATION["poll_timeout_secs"]),
+            30,
+        ),
+        "queue_enabled": _normalize_bool(
+            queue_enabled_env if queue_enabled_env is not None else source.get("queue_enabled"),
+            bool(DEFAULT_VIDEO_GENERATION["queue_enabled"]),
+        ),
+        "redis_url": str(
+            redis_url_env
+            or source.get("redis_url")
+            or default_redis_url
+        ).strip() or default_redis_url,
+        "queue_name": str(
+            os.getenv("VIDEO_GENERATION_QUEUE_NAME")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_QUEUE_NAME")
+            or source.get("queue_name")
+            or DEFAULT_VIDEO_GENERATION["queue_name"]
+        ).strip() or str(DEFAULT_VIDEO_GENERATION["queue_name"]),
+        "database_url": str(
+            os.getenv("VIDEO_GENERATION_DATABASE_URL")
+            or os.getenv("GMKRAW_VIDEO_GENERATION_DATABASE_URL")
+            or source.get("database_url")
+            or ""
+        ).strip(),
+        "max_retries": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_MAX_RETRIES") or source.get("max_retries"),
+            int(DEFAULT_VIDEO_GENERATION["max_retries"]),
+            0,
+        ),
+        "worker_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_WORKER_CONCURRENCY") or source.get("worker_concurrency"),
+            int(DEFAULT_VIDEO_GENERATION["worker_concurrency"]),
+            1,
+        ),
+        "total_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_TOTAL_CONCURRENCY") or source.get("total_concurrency"),
+            int(DEFAULT_VIDEO_GENERATION["total_concurrency"]),
+            1,
+        ),
+        "owner_concurrency": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_OWNER_CONCURRENCY") or source.get("owner_concurrency"),
+            int(DEFAULT_VIDEO_GENERATION["owner_concurrency"]),
+            1,
+        ),
+        "owner_pending_limit": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_OWNER_PENDING_LIMIT") or source.get("owner_pending_limit"),
+            int(DEFAULT_VIDEO_GENERATION["owner_pending_limit"]),
+            1,
+        ),
+        "slot_lease_secs": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_SLOT_LEASE_SECS") or source.get("slot_lease_secs"),
+            int(DEFAULT_VIDEO_GENERATION["slot_lease_secs"]),
+            60,
+        ),
+        "stale_running_timeout_secs": _normalize_positive_int(
+            os.getenv("VIDEO_GENERATION_STALE_RUNNING_TIMEOUT_SECS") or source.get("stale_running_timeout_secs"),
+            int(DEFAULT_VIDEO_GENERATION["stale_running_timeout_secs"]),
+            60,
         ),
     }
 
@@ -1163,6 +1611,9 @@ class ConfigStore:
         data["backup"] = self.get_public_backup_settings()
         data["image_storage"] = self.get_public_image_storage_settings()
         data["image_reference_upload"] = self.get_public_image_reference_upload_settings()
+        data["video_upload"] = self.get_public_video_upload_settings()
+        data["video_analysis"] = self.get_public_video_analysis_settings()
+        data["video_generation"] = self.get_public_video_generation_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data["openai_relay"] = self.get_public_openai_relay_settings()
@@ -1212,6 +1663,68 @@ class ConfigStore:
         settings["has_oss_secret_key"] = bool(oss_secret_key)
         return settings
 
+    def get_video_upload_settings(self) -> dict[str, object]:
+        return _normalize_video_upload_settings(
+            self.data.get("video_upload"),
+            self.get_image_reference_upload_settings(),
+        )
+
+    def get_public_video_upload_settings(self) -> dict[str, object]:
+        settings = dict(self.get_video_upload_settings())
+        oss_access_key = str(settings.get("oss_access_key") or "").strip()
+        oss_secret_key = str(settings.get("oss_secret_key") or "").strip()
+        settings["oss_access_key"] = ""
+        settings["oss_secret_key"] = ""
+        settings["has_oss_access_key"] = bool(oss_access_key)
+        settings["has_oss_secret_key"] = bool(oss_secret_key)
+        return settings
+
+    def get_video_analysis_settings(self) -> dict[str, object]:
+        return _normalize_video_analysis_settings(
+            self.data.get("video_analysis"),
+            self.get_image_task_queue_settings(),
+        )
+
+    def get_public_video_analysis_settings(self) -> dict[str, object]:
+        settings = dict(self.get_video_analysis_settings())
+        settings["redis_url"] = _mask_url_password(str(settings.get("redis_url") or ""))
+        return settings
+
+    def get_video_generation_settings(self) -> dict[str, object]:
+        settings = _normalize_video_generation_settings(
+            self.data.get("video_generation"),
+            self.get_image_task_queue_settings(),
+        )
+        relay = self.get_openai_relay_settings()
+        if not str(settings.get("base_url") or "").strip() and str(relay.get("base_url") or "").strip():
+            settings["base_url"] = str(relay.get("base_url") or "").strip().rstrip("/")
+            settings["credential_source"] = "openai_relay"
+        api_key = str(settings.get("api_key") or "").strip()
+        api_keys = _normalize_string_list(settings.get("api_keys"))
+        if not api_key and not api_keys:
+            relay_api_key = str(relay.get("api_key") or "").strip()
+            relay_api_keys = _normalize_string_list(relay.get("api_keys"))
+            if relay_api_key:
+                settings["api_key"] = relay_api_key
+            if relay_api_keys:
+                settings["api_keys"] = relay_api_keys
+            if relay_api_key or relay_api_keys:
+                settings["credential_source"] = "openai_relay"
+        settings["credential_source"] = str(settings.get("credential_source") or "video_generation")
+        return settings
+
+    def get_public_video_generation_settings(self) -> dict[str, object]:
+        settings = dict(self.get_video_generation_settings())
+        api_key = str(settings.get("api_key") or "").strip()
+        api_keys = _normalize_string_list(settings.get("api_keys"))
+        settings["api_key"] = ""
+        settings["api_keys"] = []
+        settings["has_api_key"] = bool({key for key in [api_key, *api_keys] if key})
+        settings["api_key_count"] = len({key for key in [api_key, *api_keys] if key})
+        settings["redis_url"] = _mask_url_password(str(settings.get("redis_url") or ""))
+        settings["database_url"] = _mask_url_password(str(settings.get("database_url") or ""))
+        return settings
+
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
@@ -1249,6 +1762,21 @@ class ConfigStore:
         if "image_reference_upload" in next_data:
             next_data["image_reference_upload"] = _normalize_image_reference_upload_settings(
                 next_data.get("image_reference_upload")
+            )
+        if "video_upload" in next_data:
+            next_data["video_upload"] = _normalize_video_upload_settings(
+                next_data.get("video_upload"),
+                _normalize_image_reference_upload_settings(next_data.get("image_reference_upload")),
+            )
+        if "video_analysis" in next_data:
+            next_data["video_analysis"] = _normalize_video_analysis_settings(
+                next_data.get("video_analysis"),
+                _normalize_image_task_queue_settings(next_data.get("image_task_queue")),
+            )
+        if "video_generation" in next_data:
+            next_data["video_generation"] = _normalize_video_generation_settings(
+                next_data.get("video_generation"),
+                _normalize_image_task_queue_settings(next_data.get("image_task_queue")),
             )
         if "ai_review" in next_data:
             next_data["ai_review"] = _normalize_ai_review_settings(next_data.get("ai_review"))

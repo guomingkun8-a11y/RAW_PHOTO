@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { Archive, Brain, Check, ChevronRight, CircleHelp, Clock3, Copy, Download, Edit3, Image, Lightbulb, LoaderCircle, MessageSquareText, RefreshCw, Sparkles, Trash2, Undo2, XCircle } from "@lucide/vue";
+import { Archive, Brain, Check, ChevronRight, CircleHelp, Clock3, Copy, Download, Edit3, Image, Lightbulb, LoaderCircle, MessageSquareText, RefreshCw, Sparkles, Trash2, Undo2, Video, XCircle } from "@lucide/vue";
 import { computed, ref, watch } from "vue";
 import { toast } from "vue-sonner";
 
 import { deleteAgentMemory, downloadImageTaskZip } from "@/lib/api";
 import { formatImageModel } from "@/lib/image-models";
-import type { ImageConversation, ImageTurn, StoredImage, StoredReferenceImage } from "@/stores/image-conversations";
+import { extractUserDisplayPrompt } from "@/lib/prompt-display";
+import type { ImageConversation, ImageTurn, StoredAgentVideo, StoredImage, StoredReferenceImage } from "@/stores/image-conversations";
 import AgentMessageContent from "@/components/image/AgentMessageContent.vue";
 import AgentProgressPanel from "@/components/image/AgentProgressPanel.vue";
 import ImageGenerationOverlay from "@/components/image/ImageGenerationOverlay.vue";
@@ -79,6 +80,20 @@ function referenceItems(turn: ImageTurn) {
   return turn.referenceImages
     .map((image, index) => ({ id: `reference-${turn.id}-${index}`, src: referenceSrc(image), name: image.name || `reference-${index + 1}.png` }))
     .filter((item) => item.src);
+}
+function formatVideoSize(bytes: number) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${Math.ceil(value / 1024)} KB`;
+  return `${value} B`;
+}
+function videoStatusLabel(video: StoredAgentVideo) {
+  if (video.analysisStatus === "ready" || video.status === "ready") return "已解析";
+  if (video.analysisStatus === "failed" || video.status === "failed") return "解析失败";
+  if (video.analysisStatus === "queued" || video.status === "queued") return "排队中";
+  if (video.analysisStatus === "processing" || video.status === "processing") return "解析中";
+  return "待解析";
 }
 function openReferenceLightbox(turn: ImageTurn, index: number) {
   const items = referenceItems(turn);
@@ -207,6 +222,23 @@ function collapsedSummary(turn: ImageTurn) {
   if (!hasImageActivity(turn)) return isAgentTurn(turn) ? statusLabel(turn) : "无图片结果";
   return `${statusLabel(turn)} · ${successImages(turn).length}/${turn.images.length} 张`;
 }
+function turnCost(turn: ImageTurn) {
+  let hasCost = false;
+  const total = turn.images.reduce((sum, image) => {
+    if (typeof image.cost !== "number" || !Number.isFinite(image.cost)) return sum;
+    hasCost = true;
+    return sum + image.cost;
+  }, 0);
+  return hasCost ? total : undefined;
+}
+function formatCost(value: number) {
+  const formatted = Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  return `￥${formatted}`;
+}
+function costLabel(turn: ImageTurn) {
+  const cost = turnCost(turn);
+  return typeof cost === "number" ? `费用 ${formatCost(cost)}` : "";
+}
 function repeatActionLabel(turn: ImageTurn) {
   if (hasImageActivity(turn)) return "重新生成";
   if (hasAgentProposal(turn)) return "重新规划";
@@ -228,7 +260,7 @@ function modelLabel(model: string) {
   return formatImageModel(model);
 }
 function displayPrompt(turn: ImageTurn) {
-  return turn.sourcePrompt || turn.prompt;
+  return turn.sourcePrompt || extractUserDisplayPrompt(turn.prompt) || turn.prompt;
 }
 function displaySceneName(sceneName: string) {
   return sceneName
@@ -328,11 +360,22 @@ function copyPrompt(prompt: string) {
               <img :src="referenceSrc(image)" alt="参考图" class="h-full w-full cursor-zoom-in object-cover transition duration-200 group-hover/reference:scale-[1.04]" loading="lazy" decoding="async" />
             </button>
           </div>
+          <div v-if="turn.agentVideos?.length" class="mt-3 flex flex-wrap gap-2">
+            <div
+              v-for="(video, index) in turn.agentVideos"
+              :key="video.videoId || `${video.name}-${index}`"
+              class="inline-flex min-w-0 max-w-full items-center gap-2 rounded-lg bg-white/10 px-2.5 py-2 text-[11px] text-white/75 dark:bg-slate-950/10 dark:text-slate-500"
+            >
+              <Video class="size-3.5 shrink-0" />
+              <span class="min-w-0 truncate font-semibold" :title="video.name">{{ video.name }}</span>
+              <span class="shrink-0 text-white/50 dark:text-slate-500" :title="video.analysisError || ''">{{ formatVideoSize(video.size) }} · {{ videoStatusLabel(video) }}</span>
+            </div>
+          </div>
           <div class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2 text-[11px] text-white/60 dark:border-slate-900/10 dark:text-slate-500">
             <span v-if="hasImageActivity(turn) || !isAgentTurn(turn)">{{ turn.mode === 'edit' ? '图生图' : '文生图' }} · {{ modelLabel(turn.model) }} · {{ turn.count }} 张 · {{ turn.size }}</span>
             <span v-else>智能体对话</span>
             <span class="flex items-center gap-1">
-              <button type="button" class="chat-icon-action inline-flex size-9 items-center justify-center rounded-lg hover:bg-white/10 dark:hover:bg-slate-950/10" title="复制内容" aria-label="复制内容" @click="copyPrompt(turn.prompt)">
+              <button type="button" class="chat-icon-action inline-flex size-9 items-center justify-center rounded-lg hover:bg-white/10 dark:hover:bg-slate-950/10" title="复制内容" aria-label="复制内容" @click="copyPrompt(displayPrompt(turn))">
                 <Copy class="size-3.5" />
               </button>
               <button type="button" class="chat-icon-action inline-flex size-9 items-center justify-center rounded-lg hover:bg-white/10 dark:hover:bg-slate-950/10" title="复用内容" aria-label="复用内容" @click="emit('reuseTurnConfig', turn.id)">
@@ -372,6 +415,7 @@ function copyPrompt(prompt: string) {
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="flex flex-wrap items-center gap-2">
               <span class="rounded-full px-2.5 py-1 text-[11px] font-semibold" :class="statusClass(turn)">{{ statusLabel(turn) }}</span>
+              <span v-if="costLabel(turn)" class="rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-600 dark:bg-white/[0.08] dark:text-stone-300">{{ costLabel(turn) }}</span>
               <span class="inline-flex items-center gap-1 text-xs text-slate-500 dark:text-stone-400">
                 <Clock3 class="size-3.5" />
                 {{ statusDetail(turn) }}

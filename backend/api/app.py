@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import ai, business, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system
+from api import ai, business, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system, video_generation
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
 from services.platform.config import config
@@ -56,6 +56,7 @@ def create_app() -> FastAPI:
     app.include_router(ai.create_router())
     app.include_router(business.create_router())
     app.include_router(image_tasks.create_router())
+    app.include_router(video_generation.create_router())
     app.include_router(image_uploads.create_router())
     app.include_router(image_conversations.create_router())
     app.include_router(image_library.create_router())

@@ -14,6 +14,7 @@ import {
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
+  ReceiptText,
   Sparkles,
   Sun,
   UserRound,
@@ -26,7 +27,7 @@ import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
-import { changePassword, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, uploadAvatar, type SystemAnnouncement } from "@/lib/api";
+import { changePassword, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, updateCurrentUserProfile, uploadAvatar, type SystemAnnouncement } from "@/lib/api";
 import { clearStoredAuthSession, setStoredAuthSession } from "@/stores/auth";
 import { listImageConversations } from "@/stores/image-conversations";
 import { sessionState, setSession } from "@/stores/session";
@@ -50,6 +51,10 @@ const passwordNextInput = ref<HTMLInputElement | null>(null);
 const passwordConfirmInput = ref<HTMLInputElement | null>(null);
 const passwordReadonly = ref(true);
 const passwordSaving = ref(false);
+const profileOpen = ref(false);
+const profileUsername = ref("");
+const profileName = ref("");
+const profileSaving = ref(false);
 const avatarInput = ref<HTMLInputElement | null>(null);
 const avatarUploading = ref(false);
 let taskTimer = 0;
@@ -66,6 +71,7 @@ const navItems = [
   { href: "/prompt-templates", label: "模板中心", detail: "提示词资产", icon: Sparkles },
   { href: "/image-library", label: "历史图库", detail: "瀑布流资产", icon: Library },
   { href: "/monitoring", label: "监控看板", detail: "运行状态", icon: Activity, adminOnly: true },
+  { href: "/costs", label: "费用记录", detail: "模型与用户费用", icon: ReceiptText, adminOnly: true },
   { href: "/users", label: "成员权限", detail: "团队管理", icon: Users, adminOnly: true },
   { href: "/image?history=1", activePath: "/image", activeQuery: { history: "1" }, label: "生成历史记录", detail: "全部生成任务", icon: History },
 ];
@@ -244,6 +250,61 @@ async function handleAvatarFile(event: Event) {
   }
 }
 
+function openProfileModal() {
+  if (!sessionState.session) return;
+  showUserMenu.value = false;
+  profileUsername.value = sessionState.session.username || "";
+  profileName.value = sessionState.session.name || sessionState.session.username || "";
+  profileOpen.value = true;
+}
+
+function closeProfileModal() {
+  if (profileSaving.value) return;
+  profileOpen.value = false;
+}
+
+async function submitProfileUpdate() {
+  if (!sessionState.session) return;
+  const username = profileUsername.value.trim();
+  const name = profileName.value.trim();
+  if (!username) {
+    toast.error("请输入用户名");
+    return;
+  }
+  if (!name) {
+    toast.error("请输入真实姓名");
+    return;
+  }
+  if (
+    username === String(sessionState.session.username || "").trim()
+    && name === String(sessionState.session.name || "").trim()
+  ) {
+    profileOpen.value = false;
+    return;
+  }
+
+  profileSaving.value = true;
+  try {
+    const current = await updateCurrentUserProfile({ username, name });
+    const nextSession = {
+      ...sessionState.session,
+      role: current.role,
+      subjectId: current.subject_id,
+      username: current.username || username,
+      name: current.name || name,
+      avatarUrl: current.avatar_url || sessionState.session.avatarUrl || "",
+    };
+    await setStoredAuthSession(nextSession);
+    setSession(nextSession);
+    profileOpen.value = false;
+    toast.success("资料已更新");
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : "资料保存失败");
+  } finally {
+    profileSaving.value = false;
+  }
+}
+
 function closePasswordModal() {
   if (passwordSaving.value) return;
   passwordOpen.value = false;
@@ -392,6 +453,10 @@ onBeforeUnmount(() => {
               <Camera v-else class="size-4" />
               {{ avatarUploading ? '上传中' : '上传头像' }}
             </button>
+            <button type="button" class="mb-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-100 disabled:cursor-wait disabled:opacity-60 dark:text-stone-200 dark:hover:bg-white/[0.08]" :disabled="!sessionState.session" @click="openProfileModal">
+              <UserRound class="size-4" />
+              修改资料
+            </button>
             <div class="my-1 h-px bg-slate-200 dark:bg-white/10" />
             <RouterLink to="/image" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-slate-700 hover:bg-slate-100 dark:text-stone-200 dark:hover:bg-white/[0.08]"><ImageIcon class="size-4" />创作工作台</RouterLink>
             <button type="button" class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-stone-200 dark:hover:bg-white/[0.08]" @click="openPasswordModal"><KeyRound class="size-4" />修改密码</button>
@@ -437,6 +502,27 @@ onBeforeUnmount(() => {
           <button type="submit" class="studio-button inline-flex min-w-[100px] items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-slate-950" :disabled="passwordSaving">
             <LoaderCircle v-if="passwordSaving" class="size-4 animate-spin" />
             {{ passwordSaving ? '保存中' : '确认修改' }}
+          </button>
+        </div>
+      </form>
+    </BaseModal>
+
+    <BaseModal :open="profileOpen" title="修改资料" description="用户名用于登录，姓名用于团队识别和历史记录显示。" width-class="max-w-[420px]" :show-close="!profileSaving" @close="closeProfileModal">
+      <form class="space-y-4 p-5" @submit.prevent="submitProfileUpdate">
+        <label class="block">
+          <span class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-stone-200">用户名</span>
+          <input v-model="profileUsername" name="gmkraw_profile_username" autocomplete="username" class="studio-input h-11 px-3" placeholder="请输入用户名" :disabled="profileSaving" />
+        </label>
+        <label class="block">
+          <span class="mb-1.5 block text-sm font-medium text-slate-700 dark:text-stone-200">姓名</span>
+          <input v-model="profileName" name="gmkraw_profile_name" autocomplete="name" class="studio-input h-11 px-3" placeholder="请填写真实姓名" :disabled="profileSaving" />
+        </label>
+        <p class="text-xs leading-5 text-slate-500 dark:text-stone-400">用户名修改后，下次登录需要使用新的用户名。</p>
+        <div class="flex justify-end gap-2 pt-1">
+          <button type="button" class="studio-button rounded-xl border border-black/[0.08] px-4 py-2 text-sm text-slate-700 disabled:opacity-60 dark:border-white/10 dark:text-stone-200" :disabled="profileSaving" @click="closeProfileModal">取消</button>
+          <button type="submit" class="studio-button inline-flex min-w-[100px] items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-wait disabled:opacity-70 dark:bg-white dark:text-slate-950" :disabled="profileSaving">
+            <LoaderCircle v-if="profileSaving" class="size-4 animate-spin" />
+            {{ profileSaving ? '保存中' : '保存' }}
           </button>
         </div>
       </form>

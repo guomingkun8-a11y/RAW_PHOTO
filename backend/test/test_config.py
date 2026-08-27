@@ -100,9 +100,126 @@ class ConfigLoadingTests(unittest.TestCase):
         ):
             storage = module._normalize_image_storage_settings({"enabled": True, "mode": "minio"})
             reference = module._normalize_image_reference_upload_settings({})
+            video = module._normalize_video_upload_settings({}, reference)
 
         self.assertEqual(storage["minio_root_path"], "raw-photo/task-assets")
         self.assertEqual(reference["oss_prefix"], "raw-photo/reference")
+        self.assertEqual(video["oss_prefix"], "raw-photo/video-inputs")
+
+    def test_video_upload_reuses_reference_oss_credentials(self) -> None:
+        module = self.config_module
+        reference = {
+            "enabled": True,
+            "oss_endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+            "oss_access_key": "ak",
+            "oss_secret_key": "sk",
+            "oss_bucket": "raw-photo",
+            "oss_region": "oss-cn-hangzhou",
+            "oss_secure": True,
+            "public_base_url": "https://cdn.example.test",
+        }
+        with mock.patch.dict(module.os.environ, {"GMKRAW_OSS_VIDEO_PREFIX": "raw-photo/videos"}, clear=True):
+            video = module._normalize_video_upload_settings({}, reference)
+
+        self.assertTrue(video["enabled"])
+        self.assertEqual(video["provider"], "oss")
+        self.assertEqual(video["oss_endpoint"], reference["oss_endpoint"])
+        self.assertEqual(video["oss_access_key"], "ak")
+        self.assertEqual(video["oss_secret_key"], "sk")
+        self.assertEqual(video["oss_bucket"], "raw-photo")
+        self.assertEqual(video["oss_prefix"], "raw-photo/videos")
+
+    def test_video_analysis_reuses_image_queue_redis_and_reads_env(self) -> None:
+        module = self.config_module
+        image_queue = {"redis_url": "redis://image-redis:6379/0"}
+        with mock.patch.dict(
+            module.os.environ,
+            {
+                "VIDEO_ANALYSIS_MAX_FRAMES": "16",
+                "VIDEO_ANALYSIS_VISION_MODEL": "gpt-5.6-sol",
+                "VIDEO_PARSE_QUEUE_NAME": "video-jobs",
+                "VIDEO_PARSE_WORKER_CONCURRENCY": "6",
+            },
+            clear=True,
+        ):
+            settings = module._normalize_video_analysis_settings({}, image_queue)
+
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["redis_url"], "redis://image-redis:6379/0")
+        self.assertEqual(settings["max_frames"], 16)
+        self.assertEqual(settings["vision_model"], "gpt-5.6-sol")
+        self.assertEqual(settings["queue_name"], "video-jobs")
+        self.assertEqual(settings["worker_concurrency"], 6)
+        self.assertFalse(settings["auto_enqueue_on_upload"])
+
+    def test_video_analysis_auto_enqueue_upload_switch_reads_env(self) -> None:
+        module = self.config_module
+        with mock.patch.dict(
+            module.os.environ,
+            {"VIDEO_ANALYSIS_AUTO_ENQUEUE_ON_UPLOAD": "true"},
+            clear=True,
+        ):
+            settings = module._normalize_video_analysis_settings({}, {})
+
+        self.assertTrue(settings["auto_enqueue_on_upload"])
+
+    def test_video_generation_settings_read_env_and_mask_public_secrets(self) -> None:
+        module = self.config_module
+        with mock.patch.dict(
+            module.os.environ,
+            {
+                "GMKRAW_AUTH_KEY": "test-auth",
+                "VIDEO_GENERATION_ENABLED": "true",
+                "VIDEO_GENERATION_BASE_URL": "https://api.example.test/v1",
+                "VIDEO_GENERATION_API_KEYS": "key-one,key-two",
+                "VIDEO_GENERATION_QUEUE_NAME": "video-generation-jobs",
+                "VIDEO_GENERATION_WORKER_CONCURRENCY": "3",
+            },
+            clear=True,
+        ), tempfile.TemporaryDirectory() as tmp_dir:
+            store = module.ConfigStore(Path(tmp_dir) / "config.json")
+            settings = store.get_video_generation_settings()
+            public = store.get_public_video_generation_settings()
+
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["base_url"], "https://api.example.test/v1")
+        self.assertEqual(settings["api_keys"], ["key-one", "key-two"])
+        self.assertEqual(settings["queue_name"], "video-generation-jobs")
+        self.assertEqual(settings["worker_concurrency"], 3)
+        self.assertEqual(public["api_keys"], [])
+        self.assertEqual(public["api_key_count"], 2)
+        self.assertTrue(public["has_api_key"])
+
+    def test_video_generation_can_reuse_openai_relay_credentials(self) -> None:
+        module = self.config_module
+        with mock.patch.dict(
+            module.os.environ,
+            {"GMKRAW_AUTH_KEY": "test-auth"},
+            clear=True,
+        ), tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "auth-key": "test-auth",
+                        "video_generation": {"enabled": True},
+                        "openai_relay": {
+                            "enabled": True,
+                            "base_url": "https://relay.example.test/v1",
+                            "api_key": "relay-key",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = module.ConfigStore(path)
+            settings = store.get_video_generation_settings()
+            public = store.get_public_video_generation_settings()
+
+        self.assertEqual(settings["base_url"], "https://relay.example.test/v1")
+        self.assertEqual(settings["api_key"], "relay-key")
+        self.assertEqual(settings["credential_source"], "openai_relay")
+        self.assertTrue(public["has_api_key"])
 
     def test_reference_upload_normalizes_legacy_provider_config_to_oss_only(self) -> None:
         module = self.config_module

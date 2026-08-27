@@ -26,7 +26,26 @@ export type StoredReferenceImage = {
   type: string;
   dataUrl?: string;
   url?: string;
-  role?: "working_canvas" | "product_anchor" | "reference";
+  role?: "working_canvas" | "product_anchor" | "target_product" | "template_reference" | "style_reference" | "composition_reference" | "reference";
+};
+
+export type StoredAgentVideo = {
+  videoId: string;
+  conversationId?: string;
+  name: string;
+  type: string;
+  size: number;
+  url: string;
+  sha256?: string;
+  status?: string;
+  analysisStatus?: string;
+  analysisError?: string;
+  analysis?: Record<string, unknown>;
+  analysisStartedAt?: string;
+  analysisFinishedAt?: string;
+  analysisVersion?: number;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 export type StoredImageQualityCheck = {
@@ -53,6 +72,8 @@ export type StoredImage = {
   elapsedSecs?: number;
   elapsedUpdatedAt?: number;
   durationMs?: number;
+  cost?: number;
+  upstreamTaskId?: string;
   width?: number;
   height?: number;
   requestedSize?: string;
@@ -98,6 +119,7 @@ export type ImageTurn = {
   model: ImageModel;
   mode: ImageConversationMode;
   referenceImages: StoredReferenceImage[];
+  agentVideos?: StoredAgentVideo[];
   folderId?: string;
   batchReplace?: ImageBatchReplacePlan;
   batchFolder?: ImageBatchFolderPlan;
@@ -200,6 +222,8 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
     elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
     durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
+    cost: typeof image.cost === "number" ? image.cost : undefined,
+    upstreamTaskId: typeof image.upstreamTaskId === "string" && image.upstreamTaskId ? image.upstreamTaskId : undefined,
     width: typeof image.width === "number" && image.width > 0 ? image.width : undefined,
     height: typeof image.height === "number" && image.height > 0 ? image.height : undefined,
     requestedSize: typeof image.requestedSize === "string" && image.requestedSize ? image.requestedSize : undefined,
@@ -225,13 +249,54 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
 }
 
 function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceImage {
+  const supportedRoles = new Set([
+    "working_canvas",
+    "product_anchor",
+    "target_product",
+    "template_reference",
+    "style_reference",
+    "composition_reference",
+    "reference",
+  ]);
   return {
     name: image.name || "reference.png",
     type: image.type || "image/png",
     dataUrl: typeof image.dataUrl === "string" && image.dataUrl ? image.dataUrl : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
-    role: image.role === "working_canvas" || image.role === "product_anchor" || image.role === "reference" ? image.role : undefined,
+    role: image.role && supportedRoles.has(image.role) ? image.role : undefined,
   };
+}
+
+function normalizeAgentVideo(video: StoredAgentVideo): StoredAgentVideo {
+  return {
+    videoId: String(video.videoId || ""),
+    conversationId: typeof video.conversationId === "string" && video.conversationId ? video.conversationId : undefined,
+    name: String(video.name || "video.mp4"),
+    type: String(video.type || "video/mp4"),
+    size: Math.max(0, Number(video.size || 0)),
+    url: String(video.url || ""),
+    sha256: typeof video.sha256 === "string" && video.sha256 ? video.sha256 : undefined,
+    status: typeof video.status === "string" && video.status ? video.status : "uploaded",
+    analysisStatus: typeof video.analysisStatus === "string" && video.analysisStatus ? video.analysisStatus : "pending",
+    analysisError: typeof video.analysisError === "string" && video.analysisError ? video.analysisError : undefined,
+    analysis: video.analysis && typeof video.analysis === "object" ? video.analysis : undefined,
+    analysisStartedAt: typeof video.analysisStartedAt === "string" && video.analysisStartedAt ? video.analysisStartedAt : undefined,
+    analysisFinishedAt: typeof video.analysisFinishedAt === "string" && video.analysisFinishedAt ? video.analysisFinishedAt : undefined,
+    analysisVersion: typeof video.analysisVersion === "number" && video.analysisVersion > 0 ? video.analysisVersion : undefined,
+    createdAt: typeof video.createdAt === "string" && video.createdAt ? video.createdAt : undefined,
+    updatedAt: typeof video.updatedAt === "string" && video.updatedAt ? video.updatedAt : undefined,
+  };
+}
+
+function getLegacyAgentVideos(source: Record<string, unknown>): StoredAgentVideo[] {
+  if (!Array.isArray(source.agentVideos)) return [];
+  return source.agentVideos
+    .filter((video): video is StoredAgentVideo => {
+      if (!video || typeof video !== "object") return false;
+      const candidate = video as StoredAgentVideo;
+      return typeof candidate.videoId === "string" && candidate.videoId.length > 0 && typeof candidate.url === "string" && candidate.url.length > 0;
+    })
+    .map(normalizeAgentVideo);
 }
 
 function normalizeAgentRun(value: unknown): AgentRun | undefined {
@@ -376,6 +441,7 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     model: (turn.model as ImageModel) || "gpt-image-2",
     mode: turn.mode === "edit" ? "edit" : "generate",
     referenceImages: getLegacyReferenceImages(turn),
+    agentVideos: getLegacyAgentVideos(turn),
     folderId: typeof turn.folderId === "string" && turn.folderId ? turn.folderId : undefined,
     batchReplace: normalizeBatchReplacePlan(turn.batchReplace),
     batchFolder: normalizeBatchFolderPlan(turn.batchFolder),
@@ -589,6 +655,34 @@ function mergeReferenceImages(
   return merged;
 }
 
+function mergeAgentVideos(
+  previous: StoredAgentVideo[] | undefined,
+  latest: StoredAgentVideo[] | undefined,
+): StoredAgentVideo[] {
+  const merged = new Map<string, StoredAgentVideo>();
+  for (const item of previous || []) {
+    const normalized = normalizeAgentVideo(item);
+    if (normalized.videoId && normalized.url) merged.set(normalized.videoId, normalized);
+  }
+  for (const item of latest || []) {
+    const normalized = normalizeAgentVideo(item);
+    if (normalized.videoId && normalized.url) {
+      const previous = merged.get(normalized.videoId);
+      merged.set(normalized.videoId, {
+        ...previous,
+        ...normalized,
+        analysis: normalized.analysis || previous?.analysis,
+        analysisError: normalized.analysisError || previous?.analysisError,
+        analysisStartedAt: normalized.analysisStartedAt || previous?.analysisStartedAt,
+        analysisFinishedAt: normalized.analysisFinishedAt || previous?.analysisFinishedAt,
+        createdAt: previous?.createdAt || normalized.createdAt,
+        updatedAt: normalized.updatedAt || previous?.updatedAt,
+      });
+    }
+  }
+  return [...merged.values()];
+}
+
 function mergeBatchFolderPlan(
   previous: ImageBatchFolderPlan | undefined,
   latest: ImageBatchFolderPlan | undefined,
@@ -614,17 +708,19 @@ function preserveReferenceInputs(previous: ImageConversation, latest: ImageConve
     const previousTurn = previousTurns.get(turn.id);
     if (!previousTurn) return turn;
     const referenceImages = mergeReferenceImages(previousTurn.referenceImages, turn.referenceImages);
+    const agentVideos = mergeAgentVideos(previousTurn.agentVideos, turn.agentVideos);
     const batchReplace = mergeBatchReplacePlan(previousTurn.batchReplace, turn.batchReplace);
     const batchFolder = mergeBatchFolderPlan(previousTurn.batchFolder, turn.batchFolder);
     if (
       referenceImages === turn.referenceImages
+      && agentVideos === turn.agentVideos
       && batchReplace === turn.batchReplace
       && batchFolder === turn.batchFolder
     ) {
       return turn;
     }
     changed = true;
-    return { ...turn, referenceImages, batchReplace, batchFolder };
+    return { ...turn, referenceImages, agentVideos, batchReplace, batchFolder };
   });
   return changed ? { ...latest, turns } : latest;
 }
@@ -775,15 +871,21 @@ async function syncRemoteConversations(conversations: ImageConversation[]) {
   );
 }
 
-export async function listImageConversations(): Promise<ImageConversation[]> {
-  const localItems = sortImageConversations(await readStoredImageConversations());
+export async function listLocalImageConversations(): Promise<ImageConversation[]> {
+  return sortImageConversations(await readStoredImageConversations());
+}
+
+export async function refreshImageConversationsRemote(
+  localItems?: ImageConversation[],
+): Promise<ImageConversation[]> {
+  const baseLocalItems = sortImageConversations((localItems || await readStoredImageConversations()).map(normalizeConversation));
   try {
     const remote = await fetchImageConversationsRemote();
     const remoteItems = sortImageConversations(
       remote.items.map((item) => normalizeConversation(item as ImageConversation & Record<string, unknown>)),
     );
     if (remoteItems.length) {
-      const conversationMap = new Map(localItems.map((item) => [item.id, item]));
+      const conversationMap = new Map(baseLocalItems.map((item) => [item.id, item]));
       for (const conversation of remoteItems) {
         const current = conversationMap.get(conversation.id);
         conversationMap.set(conversation.id, current ? pickLatestConversation(current, conversation) : conversation);
@@ -792,14 +894,18 @@ export async function listImageConversations(): Promise<ImageConversation[]> {
       await writeStoredImageConversations(mergedItems);
       return mergedItems;
     }
-    if (localItems.length) {
-      void syncRemoteConversations(localItems);
-      return localItems;
+    if (baseLocalItems.length) {
+      void syncRemoteConversations(baseLocalItems);
+      return baseLocalItems;
     }
     return [];
   } catch {
-    return localItems;
+    return baseLocalItems;
   }
+}
+
+export async function listImageConversations(): Promise<ImageConversation[]> {
+  return refreshImageConversationsRemote(await listLocalImageConversations());
 }
 
 export async function saveImageConversations(

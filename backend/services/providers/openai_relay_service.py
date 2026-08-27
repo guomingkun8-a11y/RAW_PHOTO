@@ -14,14 +14,20 @@ from services.image.image_prompt_compliance import ensure_image_prompt_engineere
 from services.providers.openai_relay_pool import RelaySubmittedHTTPException, current_relay_account, run_with_relay_pool
 from services.platform.proxy_service import proxy_settings
 from services.image import reference_image_uploader
+from utils.log import logger
 
 
 STREAM_TIMEOUT_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 300
+MEDIA_IMAGE_MODEL_ALIASES = {
+    "gemini-3.1-flash-image-preview": "banana-2",
+    "gpt-image-2": "tt-image-2",
+}
 MEDIA_IMAGE_MODELS = {
-    "gemini-3.1-flash-image-preview",
+    "banana-2",
     "mj_imagine",
     "qwen-image",
+    "tt-image-2",
     "wan2.6-image",
     "wan2.7-image",
 }
@@ -29,6 +35,10 @@ MEDIA_IMAGE_MODEL_PREFIXES = (
     "doubao-seedream-",
     "kling-",
     "vidu-image-",
+)
+MEDIA_STATUS_PATHS = (
+    "/v1/media/status",
+    "/v1/skills/task-status",
 )
 MEDIA_IMAGE_ASPECT_RATIOS = {
     "1:1": 1,
@@ -196,7 +206,8 @@ def image_generations(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[st
         )
         if _is_media_image_model(str(payload.get("model") or "")):
             return _media_image_generation({**body, "prompt": payload["prompt"]})
-        return _json_post("/v1/images/generations", payload)
+        result = _json_post("/v1/images/generations", payload)
+        return _with_response_cost(result) if isinstance(result, dict) else result
 
     return run_with_relay_pool(settings(), "image_generations", execute)
 
@@ -207,7 +218,17 @@ def _image_bytes_to_data_url(image_data: bytes, mime_type: str | None) -> str:
 
 def _is_media_image_model(model: str) -> bool:
     normalized = model.strip().lower()
-    return normalized in MEDIA_IMAGE_MODELS or normalized.startswith(MEDIA_IMAGE_MODEL_PREFIXES)
+    return (
+        normalized in MEDIA_IMAGE_MODEL_ALIASES
+        or normalized in MEDIA_IMAGE_MODELS
+        or normalized.startswith(MEDIA_IMAGE_MODEL_PREFIXES)
+    )
+
+
+def _upstream_media_model(model: object) -> str:
+    value = str(model or "").strip()
+    normalized = value.lower()
+    return MEDIA_IMAGE_MODEL_ALIASES.get(normalized, value)
 
 
 def _reference_image_urls(body: dict[str, Any]) -> list[str]:
@@ -288,6 +309,95 @@ def _media_status_payload(data: dict[str, Any]) -> dict[str, Any]:
     return nested if isinstance(nested, dict) else data
 
 
+def _normalize_media_cost(value: object) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        matched = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not matched:
+            return None
+        try:
+            number = float(matched.group(0))
+        except ValueError:
+            return None
+        return int(number) if number.is_integer() else number
+    return None
+
+
+def _iter_cost_candidates(value: object) -> Iterator[object]:
+    if not isinstance(value, (dict, list)):
+        return
+    if isinstance(value, dict):
+        if "cost" in value:
+            yield value.get("cost")
+        for key in ("data", "result", "usage", "meta", "metadata", "billing"):
+            nested = value.get(key)
+            if nested is value:
+                continue
+            yield from _iter_cost_candidates(nested)
+        return
+    for item in value:
+        yield from _iter_cost_candidates(item)
+
+
+def _media_cost(data: dict[str, Any]) -> int | float | None:
+    payload = _media_status_payload(data)
+    for candidate in _iter_cost_candidates(payload):
+        cost = _normalize_media_cost(candidate)
+        if cost is not None:
+            return cost
+    if payload is not data:
+        for candidate in _iter_cost_candidates(data):
+            cost = _normalize_media_cost(candidate)
+            if cost is not None:
+                return cost
+    return None
+
+
+def _dict_keys(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(key) for key in value.keys())
+
+
+def _has_nested_key(value: object, key_name: str) -> bool:
+    if isinstance(value, dict):
+        return any(str(key) == key_name or _has_nested_key(item, key_name) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_has_nested_key(item, key_name) for item in value)
+    return False
+
+
+def _log_missing_media_cost(task_id: str, data: dict[str, Any]) -> None:
+    payload = _media_status_payload(data)
+    result = payload.get("result") if isinstance(payload, dict) else None
+    logger.warning({
+        "event": "media_status_cost_missing",
+        "task_id": task_id,
+        "status": str(payload.get("status") or payload.get("state") or "") if isinstance(payload, dict) else "",
+        "top_level_keys": _dict_keys(data),
+        "payload_keys": _dict_keys(payload),
+        "result_keys": _dict_keys(result),
+        "has_any_cost_key": _has_nested_key(data, "cost"),
+    })
+
+
+def _with_response_cost(data: dict[str, Any]) -> dict[str, Any]:
+    if data.get("cost") is not None:
+        return data
+    cost = _media_cost(data)
+    if cost is None:
+        return data
+    return {**data, "cost": cost}
+
+
 def _media_result_url(data: dict[str, Any]) -> str:
     payload = _media_status_payload(data)
     for key in ("result_url", "resultUrl", "output_url", "url"):
@@ -340,32 +450,44 @@ def _media_task_failed(data: dict[str, Any]) -> bool:
     return any(marker in status for marker in ("failed", "fail", "error", "失败"))
 
 
-def _poll_media_image_task(task_id: str) -> str:
-    deadline = time.time() + REQUEST_TIMEOUT_SECONDS
-    last_status: dict[str, Any] = {}
-    while time.time() <= deadline:
+def _get_media_status(task_id: str) -> dict[str, Any]:
+    for index, path in enumerate(MEDIA_STATUS_PATHS):
         response = requests.get(
-            _url("/v1/skills/task-status"),
+            _url(path),
             headers=_headers(),
             params={"task_id": task_id},
             timeout=30,
             **proxy_settings.build_session_kwargs(),
         )
+        if response.status_code in {404, 405} and index < len(MEDIA_STATUS_PATHS) - 1:
+            continue
         _raise_for_status(response)
-        data = _response_json_object(response)
+        return _response_json_object(response)
+    raise HTTPException(status_code=502, detail={"error": "media status endpoint is unavailable"})
+
+
+def _poll_media_image_task(task_id: str) -> dict[str, Any]:
+    deadline = time.time() + REQUEST_TIMEOUT_SECONDS
+    last_status: dict[str, Any] = {}
+    while time.time() <= deadline:
+        data = _get_media_status(task_id)
         last_status = data
         if not _media_task_finished(data):
             time.sleep(2)
             continue
         result_url = _media_result_url(data)
         if result_url and not _media_task_failed(data):
-            return result_url
+            cost = _media_cost(data)
+            if cost is None:
+                _log_missing_media_cost(task_id, data)
+            return {"result_url": result_url, "cost": cost}
         raise HTTPException(status_code=502, detail={"error": f"media generation failed: {_media_error_text(data)}"})
     raise HTTPException(status_code=504, detail={"error": f"media generation timed out: {_media_error_text(last_status)}"})
 
 
 def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
     model = str(body.get("model") or "").strip()
+    upstream_model = _upstream_media_model(model)
     reference_urls = _reference_image_urls(body)
     prompt = ensure_image_prompt_engineered(
         str(body.get("prompt") or "").strip(),
@@ -376,16 +498,20 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
     )
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    requested_size = str(body.get("size") or "auto").strip() or "auto"
     params: dict[str, Any] = {
-        "aspectRatio": _aspect_ratio_from_size(body.get("size")),
-        "imageSize": _image_size_tier_from_size(body.get("size")),
+        "aspectRatio": _aspect_ratio_from_size(requested_size),
+        "imageSize": _image_size_tier_from_size(requested_size),
+        "n": body.get("n") or 1,
+        "quality": str(body.get("quality") or "auto").strip() or "auto",
+        "size": requested_size,
     }
     if reference_urls:
         params["images"] = reference_urls
     response = requests.post(
         _url("/v1/media/generate"),
         headers=_headers({"Content-Type": "application/json"}),
-        json={"model": model, "prompt": prompt, "params": params},
+        json={"model": upstream_model, "prompt": prompt, "params": params},
         timeout=REQUEST_TIMEOUT_SECONDS,
         **proxy_settings.build_session_kwargs(),
     )
@@ -395,10 +521,17 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
     if callable(progress_callback):
         progress_callback("image_stream_resolve_start")
     try:
-        result_url = _poll_media_image_task(task_id)
+        media_result = _poll_media_image_task(task_id)
     except HTTPException as exc:
         raise RelaySubmittedHTTPException(status_code=exc.status_code, detail=exc.detail) from exc
-    return {"created": int(time.time()), "data": [{"url": result_url}], "_media_task_id": task_id}
+    result = {
+        "created": int(time.time()),
+        "data": [{"url": media_result.get("result_url")}],
+        "_media_task_id": task_id,
+    }
+    if media_result.get("cost") is not None:
+        result["cost"] = media_result.get("cost")
+    return result
 
 
 def _image_generations_with_reference_images(
@@ -451,7 +584,8 @@ def _image_generations_with_reference_images(
             detail={"error": "this relay requires public http(s) image_url references for image edits; configure image_reference_upload"},
         )
     payload["images"] = images
-    return _json_post("/v1/images/generations", payload)
+    result = _json_post("/v1/images/generations", payload)
+    return _with_response_cost(result) if isinstance(result, dict) else result
 
 
 def _image_edit_should_fallback(exc: HTTPException) -> bool:
@@ -520,7 +654,7 @@ def _image_edits_multipart(
     _raise_for_status(response)
     if stream:
         return _iter_openai_sse(response)
-    return _response_json_object(response)
+    return _with_response_cost(_response_json_object(response))
 
 
 def image_edits(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:

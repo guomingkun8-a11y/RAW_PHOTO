@@ -233,7 +233,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.addCleanup(cow_tools.reset_extended_tool_services)
 
     @staticmethod
-    def _run(*, owner: str = "cow-user", conversation: str = "conversation-1", turn: str = "turn-1", images=None):
+    def _run(*, owner: str = "cow-user", conversation: str = "conversation-1", turn: str = "turn-1", images=None, videos=None):
         return AgentRun(
             run_id=f"cow-run-{owner}-{turn}",
             agent_name=cow_runtime.COW_AGENT_NAME,
@@ -246,6 +246,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
                 "count": 1,
                 "mode": "generate",
                 "images": list(images or []),
+                "videos": list(videos or []),
             },
             metadata={
                 "ownerId": owner,
@@ -319,6 +320,44 @@ class CowAgentRuntimeTests(unittest.TestCase):
             unrelated_runtime.save_attachments()
         self.assertEqual([], unrelated_runtime.attachments)
 
+    def test_video_analysis_is_requested_when_agent_run_starts(self):
+        pending_video = {
+            "videoId": "video-1",
+            "name": "demo.mp4",
+            "type": "video/mp4",
+            "size": 1024,
+            "url": "https://cdn.example.test/demo.mp4",
+            "analysisStatus": "pending",
+        }
+        ready_video = {
+            **pending_video,
+            "analysisStatus": "ready",
+            "analysis": {"summary": "视频里展示了商品使用场景"},
+        }
+        video_service = SimpleNamespace(
+            get_video=mock.Mock(side_effect=[pending_video, pending_video, ready_video]),
+            request_analysis=mock.Mock(return_value={**pending_video, "analysisStatus": "queued"}),
+        )
+        run = self._run(videos=[pending_video])
+        with (
+            mock.patch.object(cow_runtime, "professional_video_asset_service", video_service),
+            mock.patch.object(cow_runtime.config, "get_video_analysis_settings", return_value={
+                "enabled": True,
+                "queue_enabled": True,
+                "max_duration_secs": 300,
+                "slot_lease_secs": 1800,
+            }),
+        ):
+            runtime = cow_runtime.CowAgentRunRuntime(run)
+            runtime.save_attachments()
+            video_service.request_analysis.assert_not_called()
+
+            runtime._ensure_video_analysis_ready()
+
+        video_service.request_analysis.assert_called_once_with("video-1", owner_id="cow-user")
+        self.assertEqual("ready", runtime._video_context()[0]["analysisStatus"])
+        self.assertEqual("视频里展示了商品使用场景", runtime._video_context()[0]["analysis"]["summary"])
+
     def test_remote_reference_url_is_downloaded_for_edit_task(self):
         payload = b"remote-product-reference"
         run = self._run(
@@ -358,6 +397,68 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual(payload, edit_request["images"][0][0])
         self.assertEqual("url-01-product.png", edit_request["images"][0][1])
         self.assertEqual(["https://example.test/product.png"], edit_request["image_urls"])
+
+    @staticmethod
+    def _finalized_reference_policy(
+        *,
+        user_message: str,
+        roles: list[str],
+        inherited: bool = False,
+        model_policy: str = "auto",
+        generation_base: str = "auto",
+        should_generate: bool = True,
+    ):
+        dummy = SimpleNamespace(
+            user_message=user_message,
+            reference_images_inherited=inherited,
+        )
+        dummy._reference_context = lambda: [
+            {"role": role, "name": f"{role}-{index}.png"}
+            for index, role in enumerate(roles, start=1)
+        ]
+        return cow_runtime.CowAgentRunRuntime._finalize_reference_policy(
+            dummy,
+            {
+                "shouldGenerate": should_generate,
+                "imageSourcePolicy": model_policy,
+                "generationBase": generation_base,
+                "hardConstraints": {},
+            },
+        )
+
+    def test_reference_policy_current_uploads_override_available_previous_canvas(self):
+        decision = self._finalized_reference_policy(
+            user_message="Use my product image and the uploaded main-image template to generate a new main image",
+            roles=["working_canvas", "product_anchor", "reference", "reference"],
+        )
+
+        self.assertEqual("new_upload", decision["imageSourcePolicy"])
+        self.assertEqual("current_uploads", decision["generationBase"])
+        self.assertFalse(decision["hardConstraints"]["inheritPrevious"])
+
+    def test_reference_policy_can_continue_previous_when_model_decides_so(self):
+        decision = self._finalized_reference_policy(
+            user_message="Add a red ribbon and keep the rest unchanged",
+            roles=["working_canvas", "product_anchor"],
+            model_policy="latest_generated",
+            generation_base="continue_previous",
+        )
+
+        self.assertEqual("latest_generated", decision["imageSourcePolicy"])
+        self.assertEqual("continue_previous", decision["generationBase"])
+        self.assertTrue(decision["hardConstraints"]["inheritPrevious"])
+
+    def test_reference_policy_can_start_fresh_from_product_anchor(self):
+        decision = self._finalized_reference_policy(
+            user_message="Regenerate a new version for this product, do not reuse the last layout",
+            roles=["working_canvas", "product_anchor"],
+            model_policy="original_upload",
+            generation_base="fresh_from_product",
+        )
+
+        self.assertEqual("original_upload", decision["imageSourcePolicy"])
+        self.assertEqual("fresh_from_product", decision["generationBase"])
+        self.assertFalse(decision["hardConstraints"]["inheritPrevious"])
 
     def test_raw_vision_accepts_current_reference_url(self):
         payload = b"remote-product-reference"
@@ -650,7 +751,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual("browser", cow_runtime._required_web_tool("打开官网看看"))
 
     def test_dialogue_model_forces_requested_tool_once(self):
-        model = cow_runtime.RawCowLLMModel("gpt-4o", lambda _query: "")
+        model = cow_runtime.RawCowLLMModel("gpt-5.6-sol", lambda _query: "")
         model.force_next_tool("web_search")
         request = cow_runtime.LLMRequest(
             messages=[{"role": "user", "content": "搜索家可美"}],
@@ -680,8 +781,35 @@ class CowAgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual("auto", payloads[1]["tool_choice"])
 
+    def test_dialogue_model_streams_without_usage_options(self):
+        model = cow_runtime.RawCowLLMModel("gpt-5.6-sol", lambda _query: "")
+        request = cow_runtime.LLMRequest(messages=[{"role": "user", "content": "hello"}])
+        payloads = []
+
+        def open_chunks(payload, _base_url, _api_key):
+            payloads.append(dict(payload))
+            return iter([
+                {"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]},
+            ])
+
+        with (
+            mock.patch.object(cow_runtime, "_active_relay", return_value=("https://relay.test/v1", "key")),
+            mock.patch.object(cow_runtime, "_open_sse_chunks", side_effect=open_chunks),
+            mock.patch.object(cow_runtime, "run_with_relay_pool", side_effect=lambda _settings, _operation, action: action()),
+        ):
+            list(model.call_stream(request))
+
+        self.assertNotIn("stream_options", payloads[0])
+        summary = model.usage_summary()
+        self.assertEqual(summary["dialogueCalls"], 1)
+        self.assertEqual(summary["totalCalls"], 1)
+        self.assertEqual(summary["imageGenerationCalls"], 0)
+        self.assertNotIn("inputTokens", summary)
+        self.assertNotIn("outputTokens", summary)
+        self.assertNotIn("totalTokens", summary)
+
     def test_dialogue_model_enforces_research_tool_minimums_after_old_history(self):
-        model = cow_runtime.RawCowLLMModel("gpt-4o", lambda _query: "")
+        model = cow_runtime.RawCowLLMModel("gpt-5.6-sol", lambda _query: "")
         model.require_additional_tool_calls({"web_search": 1, "web_fetch": 2})
         tool_schemas = [
             {"name": name, "description": name, "input_schema": {"type": "object", "properties": {}}}
@@ -1141,10 +1269,74 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual("original_upload", run.result["decisionTrace"]["referenceSelection"]["policy"])
         self.assertIn("overlay_text_forbidden", run.result["decisionTrace"]["generationPreflight"]["repairs"])
         prompt = task_service.submit_edit.call_args.kwargs["prompt"]
-        self.assertIn("画面不得新增标题、文案、卖点", prompt)
+        self.assertIn("不得新增标题、文案、卖点", prompt)
         self.assertNotIn("红色大标题", prompt)
         self.assertNotIn("添加文案新品上市", prompt)
         self.assertNotIn(cow_runtime.MARKETING_STRATEGY_PROMPT_MARKER, prompt)
+        self.assertIn("words, text, typography", run.result["promptPlan"]["negativePrompt"])
+        task_service.submit_edit.assert_called_once()
+
+    def test_no_text_followup_suppresses_working_canvas_reference_text(self):
+        run = self._run(
+            turn="no-text-working-canvas",
+            images=[
+                {"name": "working-canvas.png", "type": "image/png", "role": "working_canvas", "data_url": "data:image/png;base64,d29ya2luZw=="},
+                {"name": "product-anchor.png", "type": "image/png", "role": "product_anchor", "data_url": "data:image/png;base64,cHJvZHVjdA=="},
+                {"name": "composition-reference.png", "type": "image/png", "role": "composition_reference", "data_url": "data:image/png;base64,Y29tcA=="},
+            ],
+        )
+        run.request.update({
+            "prompt": "继续改上一张，不要文字",
+            "mode": "edit",
+        })
+        task_service = SimpleNamespace(
+            submit_generation=mock.Mock(),
+            submit_edit=mock.Mock(return_value={
+                "id": "no-text-working-task",
+                "status": "success",
+                "data": [{"url": "https://example.test/no-text-working.png", "width": 1024, "height": 1024}],
+            }),
+        )
+        with (
+            mock.patch.object(cow_runtime.CowAgentRunRuntime, "_build_memory_manager", return_value=_MemoryManager()),
+            mock.patch.object(cow_runtime, "image_task_service", task_service),
+        ):
+            runtime = cow_runtime.CowAgentRunRuntime(run)
+            runtime.add_long_term = mock.Mock()
+            runtime.model.analyze_image = mock.Mock(return_value="上一版有红色标题和卖点文字，产品在右侧。")
+
+            def route_then_plan(request):
+                runtime.model.dialogue_calls += 1
+                if "Agent router" in request.system:
+                    return {"choices": [{"message": {"role": "assistant", "content": (
+                        '{"intent":"execute","confidence":0.99,"shouldGenerate":true,'
+                        '"requiredTools":["raw_vision","raw_marketing_strategy","raw_generate_image"],'
+                        '"imageSourcePolicy":"latest_generated","hardConstraints":{"textAllowed":true},'
+                        '"reason":"用户要求继续编辑上一版。"}'
+                    )}}]}
+                return {"choices": [{"message": {"role": "assistant", "content": (
+                    '{"finalPrompt":"延续上一版红色大标题和卖点文案，产品右侧，生活空间背景",'
+                    '"negativePrompt":"","needsTypography":true,'
+                    '"pages":[{"title":"延续文字版式","purpose":"继续编辑",'
+                    '"prompt":"延续上一版红色大标题和卖点文案，产品右侧，生活空间背景"}]}'
+                )}}]}
+
+            runtime.model.call = mock.Mock(side_effect=route_then_plan)
+            runtime.execute()
+
+        self.assertEqual(AgentRunStatus.COMPLETED, run.status, run.error)
+        self.assertFalse(run.result["promptPlan"]["needsTypography"])
+        self.assertFalse(run.result["marketingStrategy"]["shouldUse"])
+        self.assertEqual("latest_generated", run.result["decisionTrace"]["referenceSelection"]["policy"])
+        prompt = task_service.submit_edit.call_args.kwargs["prompt"]
+        self.assertIn("必须移除或压制上一版中的标题、文案、卖点", prompt)
+        self.assertIn("不得新增标题、文案、卖点", prompt)
+        self.assertIn("不得复制文字位置、文字层级", prompt)
+        self.assertNotIn("只学习版式、留白、文字位置和视觉层级", prompt)
+        self.assertNotIn("红色大标题", prompt)
+        self.assertNotIn("卖点文案", prompt)
+        self.assertNotIn(cow_runtime.MARKETING_STRATEGY_PROMPT_MARKER, prompt)
+        self.assertIn("words, text, typography", run.result["promptPlan"]["negativePrompt"])
         task_service.submit_edit.assert_called_once()
         task_service.submit_generation.assert_not_called()
 
@@ -1291,11 +1483,188 @@ class CowAgentRuntimeTests(unittest.TestCase):
         execution_messages = (
             "换一个背景和文字排版",
             "把背景改成浅灰并调整文字排版",
+            "图二按照图一的文字排版风格出一张图，要突出商品主题",
+            "按这张模板给这个商品生成主图",
             "replace the background and edit the typography",
         )
         for message in execution_messages:
             with self.subTest(message=message):
                 self.assertTrue(cow_runtime._is_current_turn_generation_request(message))
+
+    def test_executable_image_output_phrase_overrides_model_propose(self):
+        run = self._run(turn="output-phrase-execute")
+        run.request.update({
+            "prompt": "图二按照图一的文字排版风格出一张图，要突出商品主题",
+            "mode": "edit",
+            "images": [
+                {"name": "template.png", "type": "image/png", "data_url": "data:image/png;base64,aW1hZ2Ux"},
+                {"name": "product.png", "type": "image/png", "data_url": "data:image/png;base64,aW1hZ2Uy"},
+            ],
+        })
+        task_service = SimpleNamespace(
+            submit_generation=mock.Mock(),
+            submit_edit=mock.Mock(return_value={
+                "id": "output-phrase-edit-task",
+                "status": "success",
+                "data": [{"url": "https://example.test/output-phrase.png", "width": 1024, "height": 1024}],
+            }),
+        )
+        with (
+            mock.patch.object(cow_runtime.CowAgentRunRuntime, "_build_memory_manager", return_value=_MemoryManager()),
+            mock.patch.object(cow_runtime, "image_task_service", task_service),
+        ):
+            runtime = cow_runtime.CowAgentRunRuntime(run)
+            runtime.add_long_term = mock.Mock()
+            runtime.model.analyze_image = mock.Mock(return_value="图一是文字排版模板，图二是洁厕液商品主体。")
+
+            def propose_then_plan(request):
+                runtime.model.dialogue_calls += 1
+                if "intent router" in request.system:
+                    return {"choices": [{"message": {"role": "assistant", "content": (
+                        '{"intent":"propose","confidence":0.95,"shouldGenerate":false,'
+                        '"needClarification":false,"requiredTools":["raw_vision","raw_marketing_strategy"],'
+                        '"imageSourcePolicy":"new_upload","generationBase":"current_uploads",'
+                        '"hardConstraints":{"textAllowed":true},'
+                        '"reason":"先分析参考图。"}'
+                    )}}]}
+                return {"choices": [{"message": {"role": "assistant", "content": (
+                    '{"finalPrompt":"图二商品作为主体，学习图一的大字红黄描边和主图排版，突出洁厕液商品主题",'
+                    '"negativePrompt":"","needsTypography":true,'
+                    '"pages":[{"title":"主题主图","purpose":"电商展示",'
+                    '"prompt":"图二商品作为主体，学习图一的大字红黄描边和主图排版，突出洁厕液商品主题"}]}'
+                )}}]}
+
+            runtime.model.call = mock.Mock(side_effect=propose_then_plan)
+            runtime.execute()
+
+        self.assertEqual(AgentRunStatus.COMPLETED, run.status, run.error)
+        self.assertEqual("execute", run.result["turnIntent"]["intent"])
+        self.assertTrue(run.result["turnIntent"]["shouldGenerate"])
+        self.assertEqual("confirmed_generation", run.result["optimizationRoute"])
+        self.assertEqual(["target_product", "template_reference"], runtime.attachment_roles)
+        edit_prompt = task_service.submit_edit.call_args.kwargs["prompt"]
+        self.assertIn("Reference 1: 目标商品身份来源", edit_prompt)
+        self.assertIn("Reference 2: 模板/排版参考", edit_prompt)
+        self.assertIn("用户原话", edit_prompt)
+        first_file = task_service.submit_edit.call_args.kwargs["images"][0]
+        self.assertIn("product", first_file[1])
+        task_service.submit_edit.assert_called_once()
+        task_service.submit_generation.assert_not_called()
+
+    def test_template_main_image_without_text_does_not_default_to_typography(self):
+        run = self._run(turn="template-main-no-default-text")
+        run.request.update({
+            "prompt": "按这张模板给这个商品生成主图",
+            "mode": "edit",
+            "images": [
+                {"name": "product.png", "type": "image/png", "role": "target_product", "data_url": "data:image/png;base64,cHJvZHVjdA=="},
+                {"name": "template.png", "type": "image/png", "role": "template_reference", "data_url": "data:image/png;base64,dGVtcGxhdGU="},
+            ],
+        })
+        task_service = SimpleNamespace(
+            submit_generation=mock.Mock(),
+            submit_edit=mock.Mock(return_value={
+                "id": "template-main-no-text-task",
+                "status": "success",
+                "data": [{"url": "https://example.test/template-main-no-text.png", "width": 1024, "height": 1024}],
+            }),
+        )
+        with (
+            mock.patch.object(cow_runtime.CowAgentRunRuntime, "_build_memory_manager", return_value=_MemoryManager()),
+            mock.patch.object(cow_runtime, "image_task_service", task_service),
+        ):
+            runtime = cow_runtime.CowAgentRunRuntime(run)
+            runtime.add_long_term = mock.Mock()
+            runtime.model.analyze_image = mock.Mock(return_value="模板有商品主图区块和明亮背景。")
+
+            def route_then_plan(request):
+                runtime.model.dialogue_calls += 1
+                if "intent router" in request.system:
+                    return {"choices": [{"message": {"role": "assistant", "content": (
+                        '{"intent":"execute","confidence":0.99,"shouldGenerate":true,'
+                        '"requiredTools":["raw_vision","raw_marketing_strategy","raw_generate_image"],'
+                        '"imageSourcePolicy":"new_upload","generationBase":"current_uploads",'
+                        '"hardConstraints":{"textAllowed":null},'
+                        '"reason":"用户要求按模板生成主图。"}'
+                    )}}]}
+                return {"choices": [{"message": {"role": "assistant", "content": (
+                    '{"finalPrompt":"目标商品置于模板主图区块，保留明亮背景、光影和商品展示节奏",'
+                    '"negativePrompt":"","needsTypography":false,'
+                    '"pages":[{"title":"商品主图","purpose":"展示",'
+                    '"prompt":"目标商品置于模板主图区块，保留明亮背景、光影和商品展示节奏"}]}'
+                )}}]}
+
+            runtime.model.call = mock.Mock(side_effect=route_then_plan)
+            runtime.execute()
+
+        self.assertEqual(AgentRunStatus.COMPLETED, run.status, run.error)
+        self.assertFalse(run.result["promptPlan"]["needsTypography"])
+        self.assertFalse(run.result["marketingStrategy"].get("shouldUse", False))
+        self.assertNotIn("raw_marketing_strategy", run.result["turnIntent"]["requiredTools"])
+        prompt = task_service.submit_edit.call_args.kwargs["prompt"]
+        self.assertIn("模板/构图参考，只学习非文字构图", prompt)
+        self.assertNotIn("文字层级和视觉节奏", prompt)
+        self.assertNotIn(cow_runtime.MARKETING_STRATEGY_PROMPT_MARKER, prompt)
+        task_service.submit_edit.assert_called_once()
+        task_service.submit_generation.assert_not_called()
+
+    def test_template_product_roles_are_preserved_when_planner_returns_generic_prompt(self):
+        run = self._run(turn="template-product-role-lock")
+        run.request.update({
+            "prompt": "图二按照图一的文字排版风格出一张图，要突出商品主题",
+            "mode": "edit",
+            "images": [
+                {"name": "template.png", "type": "image/png", "data_url": "data:image/png;base64,aW1hZ2Ux"},
+                {"name": "product.png", "type": "image/png", "data_url": "data:image/png;base64,aW1hZ2Uy"},
+            ],
+        })
+        task_service = SimpleNamespace(
+            submit_generation=mock.Mock(),
+            submit_edit=mock.Mock(return_value={
+                "id": "role-lock-edit-task",
+                "status": "success",
+                "data": [{"url": "https://example.test/role-lock.png", "width": 1024, "height": 1024}],
+            }),
+        )
+        with (
+            mock.patch.object(cow_runtime.CowAgentRunRuntime, "_build_memory_manager", return_value=_MemoryManager()),
+            mock.patch.object(cow_runtime, "image_task_service", task_service),
+        ):
+            runtime = cow_runtime.CowAgentRunRuntime(run)
+            runtime.add_long_term = mock.Mock()
+            runtime.model.analyze_image = mock.Mock(return_value="可见绿色洁厕液商品或主图排版参考。")
+
+            def route_then_bad_plan(request):
+                runtime.model.dialogue_calls += 1
+                if "intent router" in request.system:
+                    return {"choices": [{"message": {"role": "assistant", "content": (
+                        '{"intent":"execute","confidence":0.99,"shouldGenerate":true,'
+                        '"requiredTools":["raw_vision","raw_generate_image"],'
+                        '"imageSourcePolicy":"new_upload","generationBase":"current_uploads",'
+                        '"hardConstraints":{"textAllowed":true},'
+                        '"reason":"用户明确要求出图。"}'
+                    )}}]}
+                return {"choices": [{"message": {"role": "assistant", "content": (
+                    '{"finalPrompt":"A 1024x1024 high-quality ecommerce image of a generic cleaning product bucket",'
+                    '"negativePrompt":"","needsTypography":true,'
+                    '"pages":[{"title":"Generic","purpose":"Display",'
+                    '"prompt":"A 1024x1024 high-quality ecommerce image of a generic cleaning product bucket"}]}'
+                )}}]}
+
+            runtime.model.call = mock.Mock(side_effect=route_then_bad_plan)
+            runtime.execute()
+
+        self.assertEqual(AgentRunStatus.COMPLETED, run.status, run.error)
+        self.assertEqual(["target_product", "template_reference"], runtime.attachment_roles)
+        prompt = task_service.submit_edit.call_args.kwargs["prompt"]
+        self.assertIn("Reference 1: 目标商品身份来源", prompt)
+        self.assertIn("Reference 2: 模板/排版参考", prompt)
+        self.assertIn("目标商品图是商品来源", prompt)
+        self.assertIn("图二按照图一的文字排版风格出一张图，要突出商品主题", prompt)
+        first_file = task_service.submit_edit.call_args.kwargs["images"][0]
+        self.assertIn("product", first_file[1])
+        task_service.submit_edit.assert_called_once()
+        task_service.submit_generation.assert_not_called()
 
     def test_confirmation_only_uses_the_latest_assistant_plan(self):
         plan = {
@@ -1608,7 +1977,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual("1024x1536", run.request["size"])
         self.assertEqual("1024x1536", run.result["promptPlan"]["resolvedSize"])
         self.assertEqual("1024x1536", run.result["images"][0]["requestedSize"])
-        self.assertIn("覆盖历史方案和界面旧比例", task_service.submit_generation.call_args.kwargs["prompt"])
+        self.assertIn("本轮最新指令覆盖历史", task_service.submit_generation.call_args.kwargs["prompt"])
 
     def test_ratio_parser_honors_explicit_orientation_and_dimensions(self):
         self.assertEqual("1024x1536", cow_runtime._resolve_user_image_size("不要1:1，换其他比例", "1024x1024"))

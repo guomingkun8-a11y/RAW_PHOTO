@@ -193,6 +193,7 @@ def _list_image_library(
     include_deleted: bool,
     all_owners: bool,
     owner_id: str,
+    include_references: bool,
 ):
     image_task_service.sync_successful_library_results(identity, base_url)
     return image_library_service.list_images(
@@ -209,6 +210,7 @@ def _list_image_library(
         include_deleted=include_deleted,
         include_all_owners=all_owners,
         owner_id_filter=owner_id,
+        include_references=include_references,
     )
 
 
@@ -229,6 +231,7 @@ def create_router() -> APIRouter:
         include_deleted: bool = Query(default=False),
         all_owners: bool = Query(default=False),
         owner_id: str = Query(default=""),
+        include_references: bool = Query(default=False, alias="includeReferences"),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
@@ -248,6 +251,7 @@ def create_router() -> APIRouter:
             include_deleted,
             all_owners,
             owner_id,
+            include_references,
         )
 
     @router.patch("/api/image-library/{image_id}")

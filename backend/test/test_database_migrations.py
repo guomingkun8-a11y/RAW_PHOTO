@@ -38,6 +38,11 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "016_professional_memory_review_governance",
                 "017_chatgpt_style_memory_scopes",
                 "018_professional_agent_operational_indexes",
+                "019_generation_cost_monitoring",
+                "021_remove_model_token_monitoring",
+                "022_professional_agent_videos",
+                "023_professional_agent_video_analysis",
+                "024_video_generation_tasks",
             ])
             self.assertEqual(second["applied_now"], [])
             self.assertEqual(status["pending"], [])
@@ -64,13 +69,30 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertIn("professional_agent_folder_items", tables)
                 self.assertIn("professional_agent_batch_plans", tables)
                 self.assertIn("professional_agent_batch_plan_items", tables)
+                self.assertIn("professional_agent_video_assets", tables)
+                self.assertIn("video_generation_tasks", tables)
                 self.assertIn("professional_knowledge_documents", tables)
                 self.assertIn("professional_knowledge_chunks", tables)
+                self.assertNotIn("model_cost_events", tables)
                 image_task_indexes = {
                     item["name"]
                     for item in inspect(engine).get_indexes("image_tasks")
                 }
                 self.assertIn("idx_image_tasks_owner_status_key", image_task_indexes)
+                video_columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("professional_agent_video_assets")
+                }
+                self.assertIn("analysis_error", video_columns)
+                self.assertIn("analysis_started_at", video_columns)
+                self.assertIn("analysis_finished_at", video_columns)
+                self.assertIn("analysis_version", video_columns)
+                video_generation_columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("video_generation_tasks")
+                }
+                self.assertIn("upstream_task_id", video_generation_columns)
+                self.assertIn("task_json", video_generation_columns)
             finally:
                 engine.dispose()
 

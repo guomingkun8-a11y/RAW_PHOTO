@@ -15,6 +15,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.platform.cache_utils import TTLCache
 from services.platform.config import config
+from services.image.image_task_assets import IMAGE_REF_MARKER, LEGACY_IMAGE_MARKER
 from services.image.image_service import thumbnail_url
 from services.image.image_storage_service import image_storage_service
 from services.platform.proxy_service import proxy_settings
@@ -192,6 +193,116 @@ def _store_result_image(item: dict[str, Any], base_url: str) -> tuple[str, str, 
         return stored.rel, stored.url, stored.storage, width, height, stored.size
     except Exception:
         return "", url, "remote", None, None, None
+
+
+def _reference_preview_item(item: object, *, index: int, base_url: str) -> dict[str, str] | None:
+    if isinstance(item, str):
+        preview_url = _clean(item)
+        if not preview_url:
+            return None
+        return {
+            "preview_url": preview_url,
+            "filename": f"reference-{index}",
+            "mime_type": "image/png",
+            "role": "",
+            "kind": "data" if preview_url.startswith("data:") else "url",
+            "rel": "",
+        }
+    if not isinstance(item, dict):
+        return None
+
+    role = _clean(item.get("role"))
+    filename = _clean(item.get("filename") or item.get("name") or f"reference-{index}")
+    mime_type = _clean(item.get("mime_type") or item.get("mimeType"), "image/png")
+    rel = _clean(item.get("rel") or item.get("storage_rel"))
+    preview_url = _clean(item.get("preview_url") or item.get("url") or item.get("data_url") or item.get("dataUrl"))
+    kind = "url"
+
+    if item.get(IMAGE_REF_MARKER) == "1" or rel:
+        if rel:
+            try:
+                preview_url = image_storage_service._public_url(rel, base_url)
+            except Exception:
+                pass
+        kind = "upload"
+    elif item.get(LEGACY_IMAGE_MARKER) == "1":
+        raw_data = _clean(item.get("data"))
+        if raw_data:
+            preview_url = f"data:{mime_type};base64,{raw_data}"
+            kind = "legacy"
+    elif preview_url.startswith("data:"):
+        kind = "data"
+
+    if not preview_url:
+        return None
+    return {
+        "preview_url": preview_url,
+        "filename": filename,
+        "mime_type": mime_type,
+        "role": role,
+        "kind": kind,
+        "rel": rel,
+    }
+
+
+def _task_reference_images(task: dict[str, Any], *, base_url: str) -> list[dict[str, str]]:
+    payload = task.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    candidates: list[dict[str, str]] = []
+    raw_images = payload.get("images")
+    if isinstance(raw_images, list):
+        for index, item in enumerate(raw_images, start=1):
+            preview = _reference_preview_item(item, index=index, base_url=base_url)
+            if preview:
+                candidates.append(preview)
+    raw_urls = payload.get("image_urls")
+    if not candidates and isinstance(raw_urls, list):
+        offset = len(candidates)
+        for index, item in enumerate(raw_urls, start=1):
+            preview = _reference_preview_item(item, index=offset + index, base_url=base_url)
+            if preview:
+                candidates.append(preview)
+    deduped: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in candidates:
+        preview_url = item.get("preview_url", "")
+        if not preview_url or preview_url in seen_urls:
+            continue
+        seen_urls.add(preview_url)
+        deduped.append(item)
+    return deduped
+
+
+def _reference_images_for_library_items(items: list[dict[str, Any]], *, base_url: str) -> dict[tuple[str, str], list[dict[str, str]]]:
+    owner_task_ids: dict[str, set[str]] = {}
+    for item in items:
+        owner_id = _clean(item.get("owner_id"))
+        task_id = _clean(item.get("task_id"))
+        if owner_id and task_id:
+            owner_task_ids.setdefault(owner_id, set()).add(task_id)
+    if not owner_task_ids:
+        return {}
+
+    try:
+        from services.image.image_task_service import image_task_service
+    except Exception:
+        return {}
+    store = getattr(image_task_service, "task_store", None)
+    if store is None or not hasattr(store, "list_tasks"):
+        return {}
+
+    result: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for owner_id, task_ids in owner_task_ids.items():
+        try:
+            tasks = store.list_tasks(owner_id, sorted(task_ids))
+        except Exception:
+            continue
+        for task in tasks:
+            task_id = _clean(task.get("id"))
+            if task_id:
+                result[(owner_id, task_id)] = _task_reference_images(task, base_url=base_url)
+    return result
 
 
 class ImageLibraryService:
@@ -409,6 +520,7 @@ class ImageLibraryService:
         include_deleted: bool = False,
         include_all_owners: bool = False,
         owner_id_filter: str = "",
+        include_references: bool = False,
     ) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "local-admin"
         is_admin = _clean(identity.get("role")) == "admin"
@@ -467,6 +579,13 @@ class ImageLibraryService:
             has_more = len(rows) > page_limit
             visible_rows = rows[:page_limit]
             items = [self._public_item(row, base_url) for row in visible_rows]
+            if include_references:
+                references = _reference_images_for_library_items(items, base_url=base_url)
+                for item in items:
+                    item["reference_images"] = references.get(
+                        (_clean(item.get("owner_id")), _clean(item.get("task_id"))),
+                        [],
+                    )
             next_cursor = None
             if has_more and visible_rows:
                 last = visible_rows[-1]

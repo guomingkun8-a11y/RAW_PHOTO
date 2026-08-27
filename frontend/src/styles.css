@@ -175,6 +175,10 @@
     transform: none;
   }
 
+  .costs-page .studio-card:hover {
+    transform: none;
+  }
+
   .image-single-page .studio-button:hover,
   .image-single-page [class*="hover:scale"]:hover,
   .image-single-page [class*="hover:-translate-y"]:hover {
@@ -225,6 +229,31 @@
   .dark .studio-skeleton::after {
     background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.1), transparent);
   }
+
+  .studio-page-enter > * {
+    animation: studio-surface-in 220ms var(--studio-ease) both;
+  }
+
+  .studio-page-enter > :nth-child(2) {
+    animation-delay: 35ms;
+  }
+
+  .studio-page-enter > :nth-child(3) {
+    animation-delay: 70ms;
+  }
+
+  .studio-page-enter > :nth-child(4) {
+    animation-delay: 105ms;
+  }
+
+  .studio-page-enter > :nth-child(5) {
+    animation-delay: 140ms;
+  }
+
+  .studio-row-enter {
+    animation: studio-row-in 180ms var(--studio-ease) both;
+    animation-delay: calc(var(--studio-row-index, 0) * 12ms);
+  }
 }
 
 @layer components {
@@ -259,6 +288,30 @@
 @keyframes studio-shimmer {
   100% {
     transform: translateX(100%);
+  }
+}
+
+@keyframes studio-surface-in {
+  from {
+    opacity: 0.96;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes studio-row-in {
+  from {
+    opacity: 0.96;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 

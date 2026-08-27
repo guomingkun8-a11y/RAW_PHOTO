@@ -62,15 +62,12 @@ GENERIC_NEGATIVE_PROMPT = (
     "医疗/消杀/抗菌/病毒相关宣传、主体被道具或特效遮挡、拼图、分屏、多面板、明显 AI 生成痕迹"
 )
 AESTHETIC_DIRECTION_PROMPT = (
-    "把画面当作可投放的高点击商业广告摄影来完成，而不是合规说明图。"
-    "必须给出一个清晰的视觉记忆点：有设计感的背景、可信的空间深度、细腻的材质表面、"
-    "柔和但有方向的主光、真实接触阴影、干净的高光边缘和克制的道具层级。"
-    "整体应有品牌大片质感，画面高级、鲜活、耐看，避免模板化、平铺、呆板和普通棚拍。"
+    "按用户目标和商品证据决定画面；可补充必要的背景、光线、材质、接触阴影和空间层次，"
+    "但不强制品牌大片、高级感或固定电商模板。"
 )
 TYPOGRAPHY_AESTHETIC_PROMPT = (
-    "文字主图应先服务商品定位和购买决策，再决定信息密度。"
-    "模型可以根据品类、包装、卖点、用户痛点和平台气质，自主判断何时用大标题吸引注意、"
-    "何时用克制留白建立质感，以及采用左文右图、右文左图、上下结构、环绕标签或杂志式留白。"
+    "文字排版只在用户需要时启用；文案和布局按当前商品证据、用户要求和参考图决定，"
+    "不套固定左右分区或默认营销模板。"
 )
 CATEGORY_ART_DIRECTION = {
     "汽车": "保持车身比例、漆面颜色、轮毂和灯组结构；在可信道路、现代建筑、专业影棚或真实用车场景中选择一种，确保轮胎接地、透视和漆面反射真实。",
@@ -380,31 +377,23 @@ def _typography_plan(
                     break
     typography["sellingPointLabels"] = labels
     if not typography.get("placement"):
-        typography["placement"] = (
-            "由模型根据商品定位和投放目标自主选择版式：可以采用左文右图、右文左图、上下结构、"
-            "居中主视觉加边侧标签、杂志式留白或局部角标，但必须保持商品完整、文字清晰且不遮挡包装关键信息"
-        )
+        typography["placement"] = "按用户要求和参考图决定版式；保持商品完整、文字清晰，不遮挡包装关键信息"
     if not typography.get("hierarchy"):
-        typography["hierarchy"] = (
-            "根据卖点强弱决定层级：需要快速抓注意时使用一个短主标题作为最大视觉锚点；"
-            "需要高级感时减少文字密度、扩大留白；副标题和卖点保持短句、分组清晰，避免堆满画面"
-        )
+        typography["hierarchy"] = "标题、副标题和标签保持短句、分组清楚，避免堆满画面"
     if not typography.get("fontDirection"):
-        typography["fontDirection"] = "现代无衬线中文字体，字重有层级，字距舒展，避免书法体、卡通体和细到不可读的字体"
+        typography["fontDirection"] = "中文字体清晰可读，字重有层级，避免细到不可读"
     if not typography.get("colorDirection"):
-        typography["colorDirection"] = "文字与背景保持高对比；根据产品包装色、背景材质和品牌气质选择深浅搭配，避免复杂渐变填字和影响阅读的花背景"
+        typography["colorDirection"] = "文字与背景保持高对比，避免影响阅读的复杂花背景"
     if not typography.get("safeArea"):
-        typography["safeArea"] = "文字、商品、Logo 和包装关键信息之间保留清晰净空，四周留出安全边距，确保缩略图仍可读"
+        typography["safeArea"] = "文字、商品、Logo 和包装关键信息之间保留净空，四周留安全边距"
     typography["textLanguage"] = text_language
     typography["platform"] = platform
     if text_language == "英文":
         typography["renderPolicy"] = "用户已明确要求英文排版；英文逐字准确；不新增价格、折扣、认证、Logo、参数、百分比或未提供的功效承诺"
     else:
         typography["renderPolicy"] = (
-            "排版语言默认为简体中文；除用户逐字提供的英文原文、品牌名或必须保留的 Logo/包装文字外，"
-            "不得自动生成英文标题、英文卖点、英文角标或英文徽章；"
-            "可基于商品画像、包装可见信息、用户提示和中性卖点自主提炼短中文文案；"
-            "不新增价格、折扣、认证、Logo、参数、销量、百分比或未提供的功效承诺"
+            "排版语言默认简体中文；除用户提供英文原文、品牌名或包装原文外不新增英文；"
+            "不新增价格、折扣、认证、Logo、参数、销量、百分比或未提供功效"
         )
     return typography
 
@@ -589,7 +578,7 @@ def compose_professional_prompt(
     )
     text_strategy = creative_plan.get("textStrategy") or "除用户明确要求外，不新增营销文字或标识"
     composition = creative_plan.get("composition") or clean_text(scene_template.get("composition"), limit=500)
-    visual_direction = creative_plan.get("visualDirection") or "高级、克制、真实，商品为唯一视觉主角"
+    visual_direction = creative_plan.get("visualDirection") or "按用户提示、商品证据和参考图决定视觉方向"
     background_strategy = _background_strategy(
         user_prompt=user_prompt,
         scene_template=scene_template,
@@ -605,23 +594,16 @@ def compose_professional_prompt(
     aesthetic_direction = _aesthetic_direction(needs_typography=needs_typography)
     canvas_requirement = _canvas_requirement(output_size)
     if typography:
-        visual_direction = (
-            "可直接投放的电商文字主图设计稿，需要呈现清晰信息层级、商品卖点和高点击商业广告审美，"
-            "不得退化为白底抠图或无文案场景图"
-        )
+        visual_direction = "按用户要求生成带文字排版的电商图，信息层级清晰，商品完整可辨"
         if not composition:
-            composition = (
-                "由模型自主选择最适合本商品的图文结构；可以左文右图、右文左图、上下结构、"
-                "居中主视觉加侧边标签或杂志式留白。商品必须完整可辨，文字必须清晰可读，"
-                "二者保留净空并共享同一套背景、光影和色彩系统。"
-            )
+            composition = "由模型按用户要求、商品形态和参考图选择图文结构；商品完整可辨，文字清晰可读。"
         text_strategy = (
             f"电商文字排版策略：{_format_typography(typography)}。"
-            "新增排版可根据商品定位自主布局，不覆盖商品、Logo 或包装关键信息；画面必须同时看见主标题层级和完整商品。"
+            "新增排版不覆盖商品、Logo 或包装关键信息。"
         )
 
     sections: list[tuple[str, str]] = [
-        ("专业 Prompt 引擎", "已完成商品理解与视觉规划；严格执行以下结构化方案，不得简化为普通商品摆拍"),
+        ("专业 Prompt 引擎", "执行以下结构化方案；用户目标优先，不套固定模板"),
         ("用户目标", clean_text(user_prompt, limit=4000) or "基于参考商品生成高质量电商视觉"),
         ("本轮执行意图", edit_intent),
         ("商品修改策略", _subject_negative_guard(subject_mutation_policy, changed_attributes)),
@@ -709,28 +691,17 @@ def _analysis_request(
             "luxury_atmosphere",
         ],
         "rules": [
-            "只描述图片中真实可见或 productContext/currentPrompt 明确提供的信息。",
-            "无法确认的材质、功能、文字或品牌必须留空，不得猜测，不得虚构功效和认证。",
-            "多张参考图按同一商品的不同角度综合分析；记录商品身份和必须保持的结构。",
-            "先判断 editIntent：用户说换背景/场景时只改场景，用户说改摄影或视觉风格时只改画面表现，用户明确说改包装/颜色/材质/形状时允许修改对应商品属性，用户明确替换商品时使用指定或最新商品；无法判断时返回 ambiguous，不要擅自套用淘宝模板。",
-            "subjectMutationPolicy 必须与 editIntent 一致；changedAttributes 只填写用户明确要求修改的属性。",
-            "referenceRoles 要区分 target_product、scene_reference 和 composition_reference；最新商品不能被旧商品画像覆盖。",
-            "recommendedSceneType 必须来自 sceneTypeEnum；若用户指定了非 auto 场景，优先服从；只有用户明确需要淘宝/天猫主图、车图、标题或文字排版时才令 needsTypography=true。",
-            "背景/空间是创意计划中的自主变量：除非 currentPrompt 明确要求白底、纯白、white background、catalog 或 packshot，不要把普通商品主图、淘宝文字主图或高级感图片规划成纯白空背景；应选择与商品、卖点和平台匹配的颜色、材质、光影、空间层次或克制道具。",
-            "结合 recentConversationContext 理解短追问和沿用关系；currentPrompt 与历史冲突时以 currentPrompt 为准，不得把旧方案当成本轮硬约束。",
-            "对于宽泛需求，像视觉总监一样自主决定默认平台、图片数量、场景、背景、镜头、光线、色彩、构图和视觉记忆点，不要把这些创意选择反问给用户。",
-            "用户说‘你自己生成’‘你来决定’‘自由发挥’‘按你的专业判断’时，表示授权你自主补全所有非事实型视觉选择，不得因为缺少平台、风格、背景、镜头、构图或卖点表达而追问。",
-            "如果用户明确授权自主创作且所有上下文都没有商品主体，可以提出一个无品牌、无参数、无功效承诺的通用生活方式商品视觉概念；这是 Agent 自拟方案，不得伪装成用户真实商品。",
-            "只有以下情况才 needsClarification=true：没有参考图且无法从 currentPrompt、productContext、persistentContext 或 recentConversationContext 确定商品主体；参考图编辑会改变商品本体但修改范围相互冲突；用户明确要求渲染指定文字但所有上下文都没有可用原文。一次只追问最关键的一个问题。",
-            "先为本轮建立一个具体创意概念和一个可见视觉记忆点，再扩展场景、构图、光线、镜头、材质与色彩；记忆点必须来自画面设计，不得虚构商品卖点。",
-            "中文电商语境中的‘车图’通常指商品轮播图/主图创意，不等于汽车图片；只有商品信息或参考图明确是车辆时才按汽车品类导演。",
-            "按商品品类采用真实导演逻辑：汽车重视车身几何、接地和漆面反射；服装重视版型垂坠；美妆重视容器与内容物材质；食品重视纹理温度和食用情境；电子重视结构与真实使用；家居重视尺度功能；珠宝重视精确高光。",
-            "创意计划使用简洁中文，避免空泛的高级、完美、震撼等堆词。",
-            "当 needsTypography=true 时，不要套固定左右分区模板；根据商品定位、包装视觉重心、卖点强弱和用户痛点自主规划 typography.placement、hierarchy、fontDirection、colorDirection 和 safeArea。",
-            "当用户没有逐字提供文案但明确需要文字排版时，可以基于 productContext、referenceImages 中可见包装信息、productProfile.sellingPoints、currentPrompt 和专业电商常识提炼简短中文标题/副标题/卖点；表达必须中性可证，不得新增价格、折扣、销量、排名、认证、参数、医疗/消杀功效或百分比承诺。",
-            "画面新增排版文字默认使用简体中文；只有 currentPrompt 明确要求英文/English/英文文案/英文标题/英文排版，或用户逐字给出英文原文时，才使用英文。",
-            "如果 typographyLanguagePreference 是简体中文，typography.headline、subheadline、sellingPointLabels、badge 必须用中文表达；不要默认输出英文标题、英文卖点、英文角标或英文徽章。",
-            "商品包装和 Logo 上原有英文只作为参考图保真内容，不要扩写成新的英文卖点；如果用户需要画面文字，typography 中的每一条字符串必须来自用户提示词、商品包装可见文字、productContext、productProfile.sellingPoints 或对用户痛点的中性概括；不得凭空编造价格、折扣、认证、参数或绝对化功效。",
+            "只使用 currentPrompt、productContext、参考图和最近对话中的可见/明确事实；不确定就留空。",
+            "currentPrompt 优先；历史、记忆和旧方案不能覆盖本轮要求。",
+            "先判断 editIntent；只修改用户明确要求修改的商品属性，替换商品时使用指定或最新商品。",
+            "subjectMutationPolicy 必须与 editIntent 一致；changedAttributes 只填写用户明确要求。",
+            "referenceRoles 要区分目标商品、模板、风格和构图参考；模板/风格图不得替代目标商品。",
+            "recommendedSceneType 必须来自 sceneTypeEnum；用户指定场景时优先服从。",
+            "只有明确需要文字、标题、卖点或排版时才令 needsTypography=true；不要为普通生图强行加营销文案。",
+            "除非明确要求白底、纯白、catalog 或 packshot，不要强制纯白空背景。",
+            "needsClarification 只在商品主体、编辑目标或必须渲染的指定文案确实缺失/冲突时为 true。",
+            "新增文字默认简体中文；只有用户明确要求英文或给出英文原文时才使用英文。",
+            "不要新增价格、折扣、销量、排名、认证、参数、医疗/消杀功效、百分比或绝对化承诺。",
             "只返回严格 JSON，不输出 Markdown 或解释。",
         ],
         "jsonSchema": {
@@ -892,9 +863,8 @@ def build_professional_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
         {
             "type": "text",
             "text": (
-                "你是 RAW 创意图片智能体，工作方式像一位能主动做决定的资深视觉总监。"
-                "先结合当前要求、最近对话和参考图建立真实商品画像，再选择一个具体创意概念、场景和视觉记忆点，最后给出可执行摄影计划。"
-                "不要用空泛形容词替代场景、光线、材质、镜头和构图决定。\n\n"
+                "你是 RAW 图片任务分析器。按当前要求、最近对话和参考图返回可执行结构化方案；"
+                "用户原话优先，不套固定模板，不虚构商品事实。\n\n"
                 f"{json.dumps(request_data, ensure_ascii=False)}"
             ),
         }
@@ -905,10 +875,9 @@ def build_professional_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
     parsed = request_json_completion(
         model=model,
         system_prompt=(
-            "你是模型驱动的电商视觉创意智能体。理解真实意图后主动做专业画面决策，只返回严格 JSON。"
-            "除非用户明确要求白底、纯白、catalog 或 packshot，否则必须设计具体可见背景。"
-            "可以基于商品画像、包装、卖点和用户痛点提炼中性中文画面文案；"
-            "不得虚构未看见的商品事实、参数、功效、认证、价格、销量或百分比承诺，也不要输出隐藏思维过程。"
+            "你是 RAW 图片任务分析器，只返回严格 JSON。"
+            "当前用户指令和参考图证据优先；只有用户需要文字排版时才规划文案。"
+            "不得虚构未看见的商品事实、参数、功效、认证、价格、销量或百分比承诺。"
         ),
         content=content,
         max_tokens=PROFESSIONAL_PROMPT_MAX_TOKENS,

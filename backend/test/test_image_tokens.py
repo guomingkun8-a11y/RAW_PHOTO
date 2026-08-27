@@ -16,7 +16,7 @@ class ImageTokenTests(unittest.TestCase):
     def test_image_input_tokens_force_gpt_54_mini(self):
         expected = count_image_input_tokens(1024, 1024, "gpt-5.4-mini", "low")
         self.assertEqual(expected, 415)
-        self.assertEqual(count_image_input_tokens(1024, 1024, "gpt-4o", "low"), expected)
+        self.assertEqual(count_image_input_tokens(1024, 1024, "gpt-5.6-sol", "low"), expected)
         self.assertEqual(count_image_input_tokens(1024, 1024, "gpt-image-2", "low"), expected)
 
     def test_image_output_tokens_scale_by_count_and_size(self):

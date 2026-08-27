@@ -26,6 +26,13 @@ class SecurityConfigTests(unittest.TestCase):
                         "oss_access_key": "legacy-oss-access",
                         "oss_secret_key": "legacy-oss-secret",
                     },
+                    "video_upload": {
+                        "oss_access_key": "legacy-video-access",
+                        "oss_secret_key": "legacy-video-secret",
+                    },
+                    "video_analysis": {
+                        "redis_url": "redis://user:password@redis:6379/0",
+                    },
                     "image_storage": {
                         "enabled": True,
                         "mode": "webdav",
@@ -68,6 +75,11 @@ class SecurityConfigTests(unittest.TestCase):
             self.assertEqual(public["image_reference_upload"]["oss_secret_key"], "")
             self.assertTrue(public["image_reference_upload"]["has_oss_access_key"])
             self.assertTrue(public["image_reference_upload"]["has_oss_secret_key"])
+            self.assertEqual(public["video_upload"]["oss_access_key"], "")
+            self.assertEqual(public["video_upload"]["oss_secret_key"], "")
+            self.assertTrue(public["video_upload"]["has_oss_access_key"])
+            self.assertTrue(public["video_upload"]["has_oss_secret_key"])
+            self.assertNotIn("password", public["video_analysis"]["redis_url"])
             self.assertEqual(public["image_storage"]["webdav_password"], "")
             self.assertNotIn("password", public["image_storage"]["webdav_url"])
             self.assertEqual(public["openai_relay"]["api_key"], "")
@@ -82,13 +94,27 @@ class SecurityConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
             path.write_text(
-                json.dumps({"auth-key": "", "openai_relay": {}, "image_task_queue": {}}),
+                json.dumps({
+                    "auth-key": "",
+                    "openai_relay": {},
+                    "image_task_queue": {},
+                    "video_upload": {
+                        "oss_access_key": "persisted-video-access",
+                        "oss_secret_key": "persisted-video-secret",
+                    },
+                    "video_analysis": {
+                        "redis_url": "redis://user:password@redis:6379/0",
+                    },
+                }),
                 encoding="utf-8",
             )
             environment = {
                 "GMKRAW_AUTH_KEY": "env-auth",
                 "GMKRAW_OPENAI_RELAY_API_KEY": "env-relay",
+                "GMKRAW_OSS_VIDEO_ACCESS_KEY_ID": "env-video-access",
+                "GMKRAW_OSS_VIDEO_ACCESS_KEY_SECRET": "env-video-secret",
                 "IMAGE_TASK_DATABASE_URL": "mysql+pymysql://user:password@db/test",
+                "VIDEO_PARSE_REDIS_URL": "redis://:video-password@redis:6379/0",
             }
             with patch.dict(os.environ, environment, clear=False):
                 store = ConfigStore(path)
@@ -99,6 +125,9 @@ class SecurityConfigTests(unittest.TestCase):
             self.assertEqual(persisted["auth-key"], "")
             self.assertEqual(persisted["openai_relay"]["api_key"], "")
             self.assertEqual(persisted["image_task_queue"]["database_url"], "")
+            self.assertEqual(persisted["video_upload"]["oss_access_key"], "")
+            self.assertEqual(persisted["video_upload"]["oss_secret_key"], "")
+            self.assertEqual(persisted["video_analysis"]["redis_url"], "redis://127.0.0.1:6379/0")
 
     def test_strict_mode_rejects_embedded_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -117,12 +146,17 @@ class SecurityConfigTests(unittest.TestCase):
             {
                 "openai_relay": {"api_key": "do-not-print", "api_keys": ["do-not-print-either"]},
                 "image_task_queue": {"redis_url": "redis://user:password@redis:6379/0"},
+                "video_upload": {"oss_access_key": "do-not-print-video", "oss_secret_key": "do-not-print-video-secret"},
+                "video_analysis": {"redis_url": "redis://user:password@redis:6379/1"},
             }
         )
         output = " ".join(findings)
         self.assertIn("openai_relay.api_key", output)
         self.assertIn("openai_relay.api_keys", output)
         self.assertIn("image_task_queue.redis_url", output)
+        self.assertIn("video_upload.oss_access_key", output)
+        self.assertIn("video_upload.oss_secret_key", output)
+        self.assertIn("video_analysis.redis_url", output)
         self.assertNotIn("do-not-print", output)
         self.assertNotIn("password@", output)
 

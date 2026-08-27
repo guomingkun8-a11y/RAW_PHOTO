@@ -57,7 +57,7 @@ class AgentQueueSettings:
 def agent_queue_settings() -> AgentQueueSettings:
     image_queue = config.get_image_task_queue_settings()
     enabled_default = bool(image_queue.get("enabled"))
-    worker_concurrency = _positive_int("AGENT_WORKER_CONCURRENCY", 4)
+    worker_concurrency = _positive_int("AGENT_WORKER_CONCURRENCY", 12)
     return AgentQueueSettings(
         enabled=_bool_env("AGENT_QUEUE_ENABLED", enabled_default),
         redis_url=_clean(
@@ -66,7 +66,7 @@ def agent_queue_settings() -> AgentQueueSettings:
         ),
         queue_name=_clean(os.getenv("AGENT_QUEUE_NAME"), "professional_agent_jobs"),
         worker_concurrency=worker_concurrency,
-        total_concurrency=_positive_int("AGENT_TOTAL_CONCURRENCY", worker_concurrency),
+        total_concurrency=_positive_int("AGENT_TOTAL_CONCURRENCY", 12),
         owner_concurrency=_positive_int("AGENT_OWNER_CONCURRENCY", 1),
         owner_pending_limit=_positive_int("AGENT_OWNER_PENDING_LIMIT", 10),
         slot_lease_secs=_positive_int("AGENT_SLOT_LEASE_SECS", 900, 60),

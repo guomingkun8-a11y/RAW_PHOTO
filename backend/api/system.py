@@ -34,6 +34,11 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=6, max_length=128)
 
 
+class ProfileUpdateRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=1, max_length=191)
+    name: str | None = Field(default=None, min_length=1, max_length=191)
+
+
 class UserCreateRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=191)
     password: str = Field(..., min_length=6, max_length=128)
@@ -43,6 +48,7 @@ class UserCreateRequest(BaseModel):
 
 
 class UserUpdateRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=1, max_length=191)
     name: str | None = Field(default=None, max_length=191)
     password: str | None = Field(default=None, min_length=6, max_length=128)
     role: str | None = None
@@ -141,6 +147,8 @@ def _create_user_detail(user: dict[str, object]) -> str:
 def _update_user_detail(before: dict[str, object] | None, after: dict[str, object], updates: dict[str, object]) -> str:
     changes: list[str] = []
     if before:
+        if before.get("username") != after.get("username"):
+            changes.append(f"用户名：{before.get('username') or '-'} -> {after.get('username') or '-'}")
         if before.get("name") != after.get("name"):
             changes.append(f"姓名：{before.get('name') or '-'} -> {after.get('name') or '-'}")
         if before.get("role") != after.get("role"):
@@ -195,6 +203,41 @@ def create_router(app_version: str) -> APIRouter:
             "username": identity.get("username"),
             "name": identity.get("name"),
             "avatar_url": identity.get("avatar_url"),
+        }
+
+    @router.patch("/api/auth/profile")
+    async def update_profile(body: ProfileUpdateRequest, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        updates = body.model_dump(exclude_unset=True)
+        if "username" in updates:
+            username = str(updates.get("username") or "").strip()
+            if not username:
+                raise HTTPException(status_code=400, detail={"error": "用户名不能为空"})
+            updates["username"] = username
+        if "name" in updates:
+            name = str(updates.get("name") or "").strip()
+            if not name:
+                raise HTTPException(status_code=400, detail={"error": "姓名不能为空"})
+            updates["name"] = name
+        if not updates:
+            raise HTTPException(status_code=400, detail={"error": "没有需要更新的资料"})
+        try:
+            updated = await run_in_threadpool(
+                user_service.update_user,
+                str(identity.get("id") or ""),
+                updates,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail={"error": "user not found"})
+        return {
+            "ok": True,
+            "role": updated.get("role"),
+            "subject_id": updated.get("id"),
+            "username": updated.get("username"),
+            "name": updated.get("name"),
+            "avatar_url": updated.get("avatar_url"),
         }
 
     @router.post("/api/auth/avatar")

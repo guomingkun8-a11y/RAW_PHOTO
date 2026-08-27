@@ -17,6 +17,14 @@ from services.ecommerce.professional_folder_service import (
     FOLDER_MAX_TOTAL_BYTES,
     professional_folder_asset_service,
 )
+from services.ecommerce.professional_video_service import (
+    VIDEO_MAX_FILE_BYTES,
+    VIDEO_MAX_ITEMS,
+    VIDEO_MAX_TOTAL_BYTES,
+    ProfessionalVideoUploadError,
+    professional_video_asset_service,
+)
+from services.platform.config import config
 
 
 class ImageAgentReference(BaseModel):
@@ -30,12 +38,40 @@ class ImageAgentReference(BaseModel):
         populate_by_name = True
 
 
+class ImageAgentVideo(BaseModel):
+    video_id: str = Field(default="", alias="videoId", max_length=191)
+    name: str = Field(default="video.mp4", max_length=191)
+    type: str = Field(default="video/mp4", max_length=120)
+    url: str = Field(default="", max_length=2000)
+    size: int = Field(default=0, ge=0)
+    sha256: str = Field(default="", max_length=64)
+    status: str = Field(default="uploaded", max_length=32)
+    analysis_status: str = Field(default="pending", alias="analysisStatus", max_length=32)
+    analysis_error: str = Field(default="", alias="analysisError", max_length=4000)
+    analysis: dict[str, object] | None = None
+
+    class Config:
+        populate_by_name = True
+
+
+class ImageAgentVideoStatusRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=50)
+
+
 def _usable_agent_images(images: list[ImageAgentReference]) -> list[ImageAgentReference]:
     return [
         image
         for image in images
         if image.data_url.strip() or image.url.strip()
     ]
+
+
+def _usable_agent_videos(videos: list[ImageAgentVideo]) -> list[ImageAgentVideo]:
+    return [
+        video
+        for video in videos
+        if video.video_id.strip() and video.url.strip()
+    ][:VIDEO_MAX_ITEMS]
 
 
 class ImageAgentConversationContext(BaseModel):
@@ -73,6 +109,7 @@ class ImageAgentRequest(BaseModel):
     use_long_term_memory: bool = Field(default=True, alias="useLongTermMemory")
     product: PromptAnalysisProduct | None = None
     images: list[ImageAgentReference] = Field(default_factory=list, max_length=4)
+    videos: list[ImageAgentVideo] = Field(default_factory=list, max_length=VIDEO_MAX_ITEMS)
     conversation_context: list[ImageAgentConversationContext] = Field(default_factory=list, alias="conversationContext", max_length=6)
 
     class Config:
@@ -82,6 +119,7 @@ class ImageAgentRequest(BaseModel):
 class ImageAgentResumeRequest(BaseModel):
     message: str = Field(default="", max_length=4000)
     images: list[ImageAgentReference] = Field(default_factory=list, max_length=4)
+    videos: list[ImageAgentVideo] = Field(default_factory=list, max_length=VIDEO_MAX_ITEMS)
     folder_id: str = Field(default="", alias="folderId", max_length=191)
 
     class Config:
@@ -130,8 +168,9 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         usable_images = _usable_agent_images(body.images)
-        if not body.prompt.strip() and not usable_images and not body.folder_id.strip():
-            raise HTTPException(status_code=400, detail={"error": "prompt or reference image is required"})
+        usable_videos = _usable_agent_videos(body.videos)
+        if not body.prompt.strip() and not usable_images and not usable_videos and not body.folder_id.strip():
+            raise HTTPException(status_code=400, detail={"error": "prompt, reference image, video, or folder asset is required"})
         if (
             body.mode == "edit"
             and not usable_images
@@ -151,6 +190,7 @@ def create_router() -> APIRouter:
                 raise HTTPException(status_code=404, detail={"error": "folder asset not found"})
         payload = body.model_dump(mode="python", by_alias=False)
         payload["images"] = [image.model_dump(mode="python", by_alias=False) for image in usable_images]
+        payload["videos"] = [video.model_dump(mode="python", by_alias=False) for video in usable_videos]
         payload["conversation_context"] = [item.model_dump(mode="python", by_alias=False) for item in body.conversation_context]
         try:
             return await run_in_threadpool(
@@ -181,6 +221,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         usable_images = _usable_agent_images(body.images)
+        usable_videos = _usable_agent_videos(body.videos)
         try:
             resumed = await run_in_threadpool(
                 resume_cow_agent_run,
@@ -188,6 +229,7 @@ def create_router() -> APIRouter:
                 body.message,
                 identity=identity,
                 images=[image.model_dump(mode="python", by_alias=False) for image in usable_images],
+                videos=[video.model_dump(mode="python", by_alias=False) for video in usable_videos],
                 folder_id=body.folder_id,
                 base_url=resolve_image_base_url(request),
             )
@@ -202,6 +244,120 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-agent/videos")
+    async def upload_agent_videos(
+        request: Request,
+        videos: list[UploadFile] = File(...),
+        conversation_id: str = Form(default=""),
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        if not videos or len(videos) > VIDEO_MAX_ITEMS:
+            raise HTTPException(status_code=400, detail={"error": f"video count must be between 1 and {VIDEO_MAX_ITEMS}"})
+        payloads: list[tuple[bytes, str, str]] = []
+        total_bytes = 0
+        try:
+            for index, item in enumerate(videos, start=1):
+                payload = await item.read()
+                filename = str(item.filename or f"video-{index}.mp4").strip() or f"video-{index}.mp4"
+                mime_type = str(item.content_type or "video/mp4").strip() or "video/mp4"
+                if not payload:
+                    raise HTTPException(status_code=400, detail={"error": f"{filename} is empty"})
+                if len(payload) > VIDEO_MAX_FILE_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": f"{filename} exceeds the 300MB file limit"})
+                total_bytes += len(payload)
+                if total_bytes > VIDEO_MAX_TOTAL_BYTES:
+                    raise HTTPException(status_code=400, detail={"error": "video batch exceeds the 600MB total size limit"})
+                payloads.append((payload, filename, mime_type))
+        finally:
+            for item in videos:
+                await item.close()
+        try:
+            owner_id = str(identity.get("id") or identity.get("username") or "anonymous")
+            results = await run_in_threadpool(
+                professional_video_asset_service.upload_many,
+                owner_id=owner_id,
+                conversation_id=conversation_id,
+                videos=payloads,
+            )
+        except ProfessionalVideoUploadError as exc:
+            message = str(exc)
+            validation_markers = ("not a supported video file", "is empty", "exceeds", "video count", "batch exceeds")
+            status_code = 400 if any(marker in message for marker in validation_markers) else 502
+            raise HTTPException(status_code=status_code, detail={"error": message}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": f"video upload failed: {exc}"}) from exc
+        items: list[dict[str, object]] = []
+        queue_errors: list[dict[str, str]] = []
+        auto_enqueue = bool(config.get_video_analysis_settings().get("auto_enqueue_on_upload"))
+        for item in results:
+            public_item = item.to_public()
+            if auto_enqueue:
+                try:
+                    queued_item = await run_in_threadpool(
+                        professional_video_asset_service.request_analysis,
+                        item.video_id,
+                        owner_id=owner_id,
+                    )
+                    if queued_item is not None:
+                        public_item = queued_item
+                except Exception as exc:
+                    refreshed = await run_in_threadpool(
+                        professional_video_asset_service.get_video,
+                        item.video_id,
+                        owner_id=owner_id,
+                    )
+                    if refreshed is not None:
+                        public_item = refreshed
+                    queue_errors.append({"videoId": item.video_id, "error": str(exc)[:500]})
+            items.append(public_item)
+        return {
+            "items": items,
+            "total": len(results),
+            "uploaded": sum(1 for item in results if not item.cached),
+            "cache_hits": sum(1 for item in results if item.cached),
+            "analysisQueueErrors": queue_errors,
+        }
+
+    @router.post("/api/image-agent/videos/status")
+    async def get_agent_video_statuses(
+        body: ImageAgentVideoStatusRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        owner_id = str(identity.get("id") or identity.get("username") or "anonymous")
+        ids = [str(item or "").strip() for item in body.ids if str(item or "").strip()]
+        items = await run_in_threadpool(
+            professional_video_asset_service.list_videos,
+            ids,
+            owner_id=owner_id,
+        )
+        found = {str(item.get("videoId") or "") for item in items}
+        return {
+            "items": items,
+            "missing": [video_id for video_id in ids if video_id not in found],
+        }
+
+    @router.post("/api/image-agent/videos/{video_id}/retry-analysis")
+    async def retry_agent_video_analysis(
+        video_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        owner_id = str(identity.get("id") or identity.get("username") or "anonymous")
+        try:
+            item = await run_in_threadpool(
+                professional_video_asset_service.request_analysis,
+                video_id,
+                owner_id=owner_id,
+                force=True,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "video asset not found"})
+        return {"item": item}
 
     @router.post("/api/image-agent/folders")
     async def upload_agent_folder(

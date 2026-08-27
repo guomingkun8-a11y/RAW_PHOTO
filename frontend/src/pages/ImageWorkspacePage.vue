@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ArrowDown } from "@lucide/vue";
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import BaseModal from "@/components/BaseModal.vue";
@@ -27,6 +27,7 @@ const {
   imageModel,
   imageModels,
   referenceImages,
+  agentVideos,
   batchProductImage,
   batchFolderImages,
   agentFolder,
@@ -37,6 +38,7 @@ const {
   conversations,
   selectedConversationId,
   isSubmitting,
+  isUploadingAgentVideo,
   isLoadingHistory,
   availableQuota,
   historyOpen,
@@ -61,6 +63,65 @@ const hasActiveConversation = computed(() => Boolean(selectedConversation.value)
 const currentUserName = computed(() => sessionState.session?.name || sessionState.session?.username || "用户");
 const currentUserInitial = computed(() => currentUserName.value.trim().slice(0, 1).toUpperCase() || "U");
 const currentUserAvatarUrl = computed(() => resolveApiAssetUrl(sessionState.session?.avatarUrl));
+const standardIdleTitlePool = [
+  "今天想生成什么图片？",
+  "描述画面，我来生成图片。",
+  "上传参考图，开始创作。",
+  "想把图片改成什么样？",
+  "这次要生成哪种风格？",
+  "给我一个画面想法。",
+  "想做一张什么图？",
+  "输入提示词，开始生成。",
+  "想换背景、改风格，还是重新生成？",
+  "从一句描述开始出图。",
+  "需要几张不同版本？",
+  "参考图准备好了吗？",
+] as const;
+const agentIdleTitlePool = [
+  "今天想让智能体帮你做什么？",
+  "想先分析，还是直接出图？",
+  "上传参考图，我来拆解视觉方向。",
+  "想做主图、详情页，还是优化上一张？",
+  "描述目标，我来规划生成方案。",
+  "想学习哪张图的风格？",
+  "这次要提升哪种商品表现？",
+  "把商品图做得更好，从一个需求开始。",
+  "给我商品和目标，我来出图。",
+  "需要我帮你拆解参考图吗？",
+] as const;
+function pickIdleTitle(items: readonly string[]) {
+  return items[Math.floor(Math.random() * items.length)] ?? items[0] ?? "";
+}
+const standardIdleTitle = ref(pickIdleTitle(standardIdleTitlePool));
+const agentIdleTitle = ref(pickIdleTitle(agentIdleTitlePool));
+const idleTitle = computed(() => promptEngineMode.value === "professional" ? agentIdleTitle.value : standardIdleTitle.value);
+const idleTitleChars = computed(() => idleTitle.value.split(""));
+const idleTitleVisibleChars = ref<boolean[]>([]);
+const prefersReducedMotion = ref(window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+let idleTitleTimers: number[] = [];
+
+function clearIdleTitleAnimation() {
+  for (const timer of idleTitleTimers) window.clearTimeout(timer);
+  idleTitleTimers = [];
+}
+
+function playIdleTitleAnimation() {
+  clearIdleTitleAnimation();
+  const chars = idleTitleChars.value;
+  idleTitleVisibleChars.value = chars.map(() => false);
+  if (prefersReducedMotion.value) {
+    idleTitleVisibleChars.value = chars.map(() => true);
+    return;
+  }
+  chars.forEach((_, index) => {
+    const timer = window.setTimeout(() => {
+      const next = [...idleTitleVisibleChars.value];
+      next[index] = true;
+      idleTitleVisibleChars.value = next;
+    }, index * 60);
+    idleTitleTimers.push(timer);
+  });
+}
 
 async function closeHistory() {
   historyOpen.value = false;
@@ -91,6 +152,17 @@ watch([() => selectedConversation.value?.updatedAt, () => selectedConversation.v
 watch(() => route.query.history, (value) => {
   if (value === "1") historyOpen.value = true;
 }, { immediate: true });
+
+watch([idleTitle, hasActiveConversation], ([, active]) => {
+  if (active) {
+    clearIdleTitleAnimation();
+    idleTitleVisibleChars.value = [];
+    return;
+  }
+  playIdleTitleAnimation();
+}, { immediate: true });
+
+onBeforeUnmount(clearIdleTitleAnimation);
 </script>
 
 <template>
@@ -98,7 +170,20 @@ watch(() => route.query.history, (value) => {
     <div class="image-chat-page mx-auto w-full max-w-[1120px]" :class="hasActiveConversation ? 'is-active' : 'is-idle'">
       <div class="image-chat-content min-h-0">
         <Transition name="image-chat-content">
-          <div v-if="hasActiveConversation" class="image-chat-results relative min-h-0">
+          <div v-if="!hasActiveConversation" key="idle-title" class="image-empty-intro" aria-live="polite">
+            <h1 :aria-label="idleTitle">
+              <span
+                v-for="(char, index) in idleTitleChars"
+                :key="`${idleTitle}-${index}`"
+                class="image-empty-title-char"
+                :class="{ 'is-visible': idleTitleVisibleChars[index] }"
+                aria-hidden="true"
+              >
+                {{ char === ' ' ? '\u00A0' : char }}
+              </span>
+            </h1>
+          </div>
+          <div v-else key="results" class="image-chat-results relative min-h-0">
             <div ref="resultsViewport" class="hide-scrollbar h-full min-h-0 overscroll-contain overflow-y-auto px-2 py-4 sm:px-4" @scroll="onResultsScroll">
               <ImageResults
                 :conversation="selectedConversation"
@@ -149,6 +234,7 @@ watch(() => route.query.history, (value) => {
           :available-quota="availableQuota"
           :active-task-count="activeTaskCount"
           :reference-images="referenceImages"
+          :agent-videos="agentVideos"
           :batch-product-image="batchProductImage"
           :batch-folder-images="batchFolderImages"
           :agent-folder="agentFolder"
@@ -156,11 +242,14 @@ watch(() => route.query.history, (value) => {
           :long-term-memory-enabled="longTermMemoryEnabled"
           :memory-count="memoryCount"
           :is-submitting="isSubmitting"
+          :is-uploading-agent-video="isUploadingAgentVideo"
           :submit-phase="submitPhase"
           @submit="workspace.submit"
           @create-draft="workspace.createDraft"
           @reference-files="workspace.appendReferenceFiles"
+          @video-files="workspace.appendAgentVideoFiles"
           @remove-reference="workspace.removeReference"
+          @remove-video="workspace.removeAgentVideo"
           @pick-batch-product="workspace.pickBatchProduct"
           @pick-batch-folder="workspace.pickBatchFolder"
           @clear-batch="workspace.clearBatch"
@@ -237,6 +326,45 @@ watch(() => route.query.history, (value) => {
   align-self: stretch;
 }
 
+.image-empty-intro {
+  display: grid;
+  place-items: center;
+  width: min(640px, 100%);
+  min-height: 48px;
+  margin: 0 auto;
+  padding: 0 16px 4px;
+  text-align: center;
+}
+
+.image-empty-intro h1 {
+  margin: 0;
+  color: rgb(15 23 42);
+  font-size: 1.875rem;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.dark .image-empty-intro h1 {
+  color: rgb(248 250 252);
+}
+
+.image-empty-title-char {
+  display: inline-block;
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity 0.4s ease,
+    transform 0.4s ease;
+  will-change: opacity, transform;
+}
+
+.image-empty-title-char.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .image-chat-results {
   position: relative;
   height: 100%;
@@ -294,14 +422,34 @@ watch(() => route.query.history, (value) => {
   .image-chat-page.is-active {
     grid-template-rows: minmax(0, 1fr) auto 0px;
   }
+
+  .image-empty-intro {
+    min-height: 40px;
+    padding-inline: 8px;
+  }
+
+  .image-empty-intro h1 {
+    font-size: 1.375rem;
+    line-height: 1.35;
+  }
+
+  .image-empty-title-char {
+    display: inline-block;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .image-chat-page,
   .image-chat-composer,
   .image-chat-content-enter-active,
-  .image-chat-content-leave-active {
+  .image-chat-content-leave-active,
+  .image-empty-title-char {
     transition: none;
+  }
+
+  .image-empty-title-char {
+    opacity: 1;
+    transform: none;
   }
 }
 </style>

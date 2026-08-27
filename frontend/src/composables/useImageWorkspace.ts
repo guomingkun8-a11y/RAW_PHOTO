@@ -7,6 +7,7 @@ import {
   createImageEditTask,
   createImageGenerationTask,
   fetchAgentRun,
+  fetchAgentVideoStatuses,
   fetchImageTasks,
   fetchModels,
   fetchSettingsConfig,
@@ -17,6 +18,8 @@ import {
   startImageAgentRun,
   streamAgentRunEvents,
   uploadAgentFolder,
+  uploadAgentVideos,
+  type AgentVideoAsset,
   type AgentEvent,
   type AgentFolderAsset,
   type AgentRun,
@@ -33,7 +36,8 @@ import {
   deleteImageConversation,
   deleteImageConversations,
   getImageConversationStats,
-  listImageConversations,
+  listLocalImageConversations,
+  refreshImageConversationsRemote,
   renameImageConversation,
   saveImageConversation,
   saveImageConversations,
@@ -44,6 +48,7 @@ import {
   type ImagePromptEngineMetadata,
   type ImageTurn,
   type StoredImage,
+  type StoredAgentVideo,
   type StoredReferenceImage,
 } from "@/stores/image-conversations";
 import { sessionState } from "@/stores/session";
@@ -87,11 +92,15 @@ const HIGH_RISK_CLAIM_REPLACEMENTS: Array<[RegExp, string]> = [
 const IMAGE_PROMPT_COMPLIANCE_GUARD = "合规约束：画面文字可以围绕商品信息、包装特征、卖点和用户痛点做中性电商表达；不要生成百分百、100%、99%、百分之九十九等绝对化或百分比承诺，不要生成医疗、消杀、抗微生物、病毒相关、等级背书、认证标识或虚假承诺徽章。";
 const IMAGE_PROMPT_COMPLIANCE_MARKER = "合规约束：";
 const IMAGE_LAYOUT_GUARD_PREFIX = "画面结构约束：";
+const BATCH_SINGLE_IMAGE_MARKER = "批量单图执行：";
 const IMAGE_SINGLE_LAYOUT_GUARD = `${IMAGE_LAYOUT_GUARD_PREFIX}只生成一张完整独立图片，只展示一个主场景，不要拼图、不要分屏、不要九宫格、不要多面板，不要把多个场景或多张成品图合在同一张画布里。`;
 const IMAGE_MULTI_COUNT_DEFAULT = 4;
 const IMAGE_MULTI_COUNT_MAX = 8;
 const AGENT_IMAGE_COUNT_MAX = 20;
 const AGENT_FOLDER_IMAGE_COUNT_MAX = 300;
+const AGENT_VIDEO_MAX_ITEMS = 4;
+const VIDEO_ANALYSIS_POLL_INTERVAL_MS = 3000;
+const VIDEO_ANALYSIS_ACTIVE_STATUSES = new Set(["pending", "queued", "processing"]);
 
 const activeImageTurnQueueIds = new Set<string>();
 const activeImageAgentIds = new Set<string>();
@@ -101,6 +110,12 @@ const reportedFailureTaskIds = new Set<string>();
 const submittedImageTaskIds = new Set<string>();
 const conversationTaskPersistedAt = new Map<string, number>();
 type AgentReferencePayloadItem = { name: string; type: string; dataUrl?: string; url?: string; role?: "working_canvas" | "product_anchor" | "reference" | string };
+type AgentVideoPayloadItem = AgentVideoAsset;
+const CHINESE_PROMPT_NUMBERS: Record<string, number> = { 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+const BATCH_MULTI_IMAGE_QUANTITY_RE = /(?<verb>设计|生成|制作|产出|做|出|来|给我|为[^，。！？；;:\n]{1,80}?设计出)\s*(?<count>[2-9]|1\d|[二两三四五六七八九十])\s*(?<unit>张|幅|款|版|组|个)(?<tail>[^，。！？；;:\n]{0,80})/gi;
+const BATCH_MULTI_IMAGE_INTENT_RE = /多张|几张|多幅|几幅|多款|几款|多个版本|多种场景|不同场景|不同卖点|不同版本|不同风格/;
+const BATCH_VARIATION_LINE_RE = /^\s*(?<number>[1-9]\d?|[一二两三四五六七八九十])[\.\、\)）]\s*(?<body>.+?)\s*$/;
+const BATCH_VARIATION_BODY_RE = /^(?:场景|设计|方案|版本|风格|卖点|图片|主图|详情)\s*[一二两三四五六七八九十0-9]*\s*[：:]?/i;
 
 type DeleteConfirm =
   | { type: "one"; id: string }
@@ -251,6 +266,7 @@ function isAgentImageTurn(turn?: ImageTurn) {
 function buildAgentConversationContext(conversation: ImageConversation | null) {
   if (!conversation) return [];
   return conversation.turns
+    .filter((turn) => isAgentImageTurn(turn))
     .filter((turn) => Boolean(turn.sourcePrompt || turn.prompt))
     .slice(-6)
     .map((turn) => ({
@@ -267,7 +283,9 @@ function buildAgentConversationContext(conversation: ImageConversation | null) {
 function latestConversationReferences(conversation: ImageConversation | null) {
   if (!conversation) return [];
   for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
-    const references = conversation.turns[index].referenceImages.filter(hasUsableReference);
+    const turn = conversation.turns[index];
+    if (!isAgentImageTurn(turn)) continue;
+    const references = turn.referenceImages.filter(hasUsableReference);
     if (references.length) return references.slice(-4);
   }
   return [];
@@ -302,6 +320,65 @@ function stripExistingPromptGuards(prompt: string) {
     .filter((position) => position >= 0);
   return positions.length ? cleaned.slice(0, Math.min(...positions)).trim() : cleaned;
 }
+function promptNumberValue(value: string) {
+  const trimmed = String(value || "").trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  return CHINESE_PROMPT_NUMBERS[trimmed] || 0;
+}
+function singularImageUnit(unit: string) {
+  return ["张", "幅", "款", "版"].includes(unit) ? unit : "张";
+}
+function variationBody(text: string) {
+  return text.replace(BATCH_VARIATION_BODY_RE, "").trim() || text.trim();
+}
+function isBatchVariationBody(text: string) {
+  return BATCH_VARIATION_BODY_RE.test(text.trim());
+}
+function selectBatchVariation(prompt: string, imageIndex: number, imageCount: number) {
+  const total = Math.max(1, Math.floor(Number(imageCount) || 1));
+  const current = Math.min(total, Math.max(1, Math.floor(Number(imageIndex) || 0) + 1));
+  const lines = prompt.split(/\r?\n/);
+  const entries: Array<{ lineIndex: number; number: number; body: string }> = [];
+  lines.forEach((line, lineIndex) => {
+    const match = BATCH_VARIATION_LINE_RE.exec(line);
+    if (!match?.groups) return;
+    const body = match.groups.body || "";
+    if (!isBatchVariationBody(body)) return;
+    const number = promptNumberValue(match.groups.number || "");
+    if (number >= 1 && number <= Math.max(total, 20)) entries.push({ lineIndex, number, body: variationBody(body) });
+  });
+  if (entries.length < 2) return { prompt, selected: "" };
+  const selectedEntry = entries.find((entry) => entry.number === current) || entries[(current - 1) % entries.length];
+  const numberedLines = new Set(entries.map((entry) => entry.lineIndex));
+  const stripped = lines.filter((_, lineIndex) => !numberedLines.has(lineIndex)).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { prompt: stripped, selected: selectedEntry?.body || "" };
+}
+function collapseBatchPromptToSingleImage(prompt: string, imageIndex: number, imageCount: number) {
+  const total = Math.max(1, Math.floor(Number(imageCount) || 1));
+  if (total <= 1) return prompt.trim();
+  const current = Math.min(total, Math.max(1, Math.floor(Number(imageIndex) || 0) + 1));
+  const cleaned = prompt.trim();
+  if (cleaned.includes(BATCH_SINGLE_IMAGE_MARKER)) return cleaned;
+  let rewritten = cleaned.replace(BATCH_MULTI_IMAGE_QUANTITY_RE, (...args) => {
+    const groups = args[args.length - 1] as { verb?: string; unit?: string; tail?: string } | undefined;
+    const verb = groups?.verb || "";
+    const unit = singularImageUnit(groups?.unit || "张");
+    return `${verb}一${unit}${groups?.tail || ""}（当前这一${unit}独立成品图）`;
+  });
+  rewritten = rewritten.replace(
+    /(?<verb>设计|生成|制作|产出|做|出|来|给我)\s*(?:多张|几张|多幅|几幅|多款|几款|多个版本|多种场景|不同场景|不同卖点|不同版本|不同风格)/gi,
+    "$<verb>当前这一张独立",
+  );
+  const selection = selectBatchVariation(rewritten, imageIndex, total);
+  rewritten = selection.prompt;
+  const hasBatchConflict = rewritten !== cleaned || Boolean(selection.selected) || BATCH_MULTI_IMAGE_INTENT_RE.test(cleaned);
+  if (!hasBatchConflict) return cleaned;
+  return [
+    `${BATCH_SINGLE_IMAGE_MARKER}本请求已拆分为 ${total} 个独立任务；当前是第 ${current}/${total} 张。忽略原文中的多张、多款、多场景或完整清单要求，只输出当前这一张独立完整成品图，不要合集、拼图或分屏。`,
+    selection.selected ? `当前这一张的具体方向：${selection.selected}` : "",
+    rewritten,
+  ].filter(Boolean).join("\n\n").trim();
+}
 function appendPromptGuard(prompt: string, guard: string, marker: string) {
   const cleaned = prompt.trim();
   if (cleaned.includes(marker)) return cleaned;
@@ -317,13 +394,12 @@ function buildImageLayoutGuard(imageIndex: number, imageCount: number, batchRepl
   return `${IMAGE_LAYOUT_GUARD_PREFIX}这是第 ${current}/${total} 张独立成品图；本次只生成这一张图，可以选择一个不同场景或卖点表达，但不要拼图、不要分屏、不要九宫格、不要多面板，不要把其他编号或其他场景放进同一张画布里，画面中也不要写“第${current}张”。`;
 }
 function buildCompliantImagePrompt(prompt: string, imageIndex = 0, imageCount = 1, batchReplace = false) {
-  const cleaned = stripHighRiskClaims(stripExistingPromptGuards(prompt));
+  const cleaned = collapseBatchPromptToSingleImage(stripHighRiskClaims(stripExistingPromptGuards(prompt)), imageIndex, imageCount);
   const withLayoutGuard = appendPromptGuard(cleaned, buildImageLayoutGuard(imageIndex, imageCount, batchReplace), IMAGE_LAYOUT_GUARD_PREFIX);
   return appendPromptGuard(withLayoutGuard, IMAGE_PROMPT_COMPLIANCE_GUARD, IMAGE_PROMPT_COMPLIANCE_MARKER);
 }
 function chineseCount(value: string) {
-  const digits: Record<string, number> = { 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
-  return digits[value] || 0;
+  return CHINESE_PROMPT_NUMBERS[value] || 0;
 }
 function parseRequestedImageCount(prompt: string) {
   const arabic = prompt.match(/(?:生成|出|做|来|给我|变|制作|设计|产出|拆成|分成)?\s*([2-9]|1\d|[2-9]\d)\s*(?:张|幅)(?:图|图片|场景|版本|方案)?/);
@@ -480,23 +556,28 @@ function referenceRole(image: StoredReferenceImage) {
   const name = String(image.name || "").toLowerCase();
   if (name.includes("working-canvas")) return "working_canvas";
   if (name.includes("product-anchor")) return "product_anchor";
+  if (name.includes("target-product")) return "target_product";
+  if (name.includes("template-reference")) return "template_reference";
+  if (name.includes("style-reference")) return "style_reference";
+  if (name.includes("composition-reference")) return "composition_reference";
   return "reference";
 }
 
-function markReferenceRole(image: StoredReferenceImage, role: "working_canvas" | "product_anchor" | "reference", namePrefix: string) {
+function markReferenceRole(image: StoredReferenceImage, role: NonNullable<StoredReferenceImage["role"]>, namePrefix: string) {
   const extension = image.name?.match(/\.[a-z0-9]+$/i)?.[0] || (image.type === "image/jpeg" ? ".jpg" : image.type === "image/webp" ? ".webp" : ".png");
   const baseName = image.name && image.name.includes(namePrefix) ? image.name : `${namePrefix}${extension}`;
   return { ...image, name: baseName, role };
 }
 
 function shouldUseOriginalProductAnchor(prompt: string) {
-  return /从原图|基于原图|回到原图|不要上一版|不用上一版|重新做|重新生成一个方向|从最初|原始产品图|original/i.test(prompt);
+  return /从原图|基于原图|回到原图|不要上一版|不用上一版|不要上一张|不用上一张|重新做|重新生成一个方向|从最初|原始产品图|original/i.test(prompt);
 }
 
 function latestWorkingCanvasReference(conversation: ImageConversation | null) {
   if (!conversation) return null;
   for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
     const turn = conversation.turns[index];
+    if (!isAgentImageTurn(turn)) continue;
     if (turn.resultsDeleted) continue;
     const successful = turn.images.filter((image) => image.status === "success" && (image.b64_json || image.url));
     if (!successful.length) continue;
@@ -509,19 +590,49 @@ function latestWorkingCanvasReference(conversation: ImageConversation | null) {
 
 function productAnchorReferences(conversation: ImageConversation | null) {
   if (!conversation) return [];
+  const isProductIdentityRole = (image: StoredReferenceImage) => {
+    const role = referenceRole(image);
+    return role === "product_anchor" || role === "target_product";
+  };
   for (let index = conversation.turns.length - 1; index >= 0; index -= 1) {
-    const anchors = conversation.turns[index].referenceImages
-      .filter((image) => hasUsableReference(image) && referenceRole(image) === "product_anchor")
+    const turn = conversation.turns[index];
+    if (!isAgentImageTurn(turn)) continue;
+    const anchors = turn.referenceImages
+      .filter((image) => hasUsableReference(image) && isProductIdentityRole(image))
       .map((image, anchorIndex) => markReferenceRole(image, "product_anchor", `product-anchor-${anchorIndex + 1}`));
     if (anchors.length) return anchors.slice(0, 3);
   }
   for (const turn of conversation.turns) {
+    if (!isAgentImageTurn(turn)) continue;
     const references = turn.referenceImages
       .filter((image) => hasUsableReference(image) && referenceRole(image) !== "working_canvas")
       .map((image, anchorIndex) => markReferenceRole(image, "product_anchor", `product-anchor-${anchorIndex + 1}`));
     if (references.length) return references.slice(0, 3);
   }
   return [];
+}
+
+function shouldContinuePreviousAgentResult(prompt: string) {
+  if (shouldUseOriginalProductAnchor(prompt)) return false;
+  const text = prompt.toLowerCase().replace(/\s+/g, "");
+  const markers = [
+    "\u7ee7\u7eed\u6539\u4e0a\u4e00\u5f20",
+    "\u7ee7\u7eed\u6539\u521a\u624d\u90a3\u5f20",
+    "\u7ee7\u7eed\u6539\u4e0a\u4e00\u7248",
+    "\u57fa\u4e8e\u4e0a\u4e00\u5f20",
+    "\u57fa\u4e8e\u521a\u624d\u90a3\u5f20",
+    "\u57fa\u4e8e\u4e0a\u4e00\u7248",
+    "\u5728\u4e0a\u4e00\u5f20\u57fa\u7840\u4e0a",
+    "\u5728\u521a\u624d\u90a3\u5f20\u57fa\u7840\u4e0a",
+    "\u5728\u4e0a\u4e00\u7248\u57fa\u7840\u4e0a",
+    "\u4fee\u6539\u4e0a\u4e00\u5f20",
+    "\u4fee\u6539\u521a\u624d\u90a3\u5f20",
+    "\u4fee\u6539\u4e0a\u4e00\u7248",
+    "\u6309\u4e0a\u4e00\u5f20",
+    "\u6309\u521a\u624d\u90a3\u5f20",
+    "\u6309\u4e0a\u4e00\u7248",
+  ];
+  return markers.some((marker) => text.includes(marker)) || /(?:continueprevious|editprevious|editlast|basedonprevious|basedonlast)/i.test(text);
 }
 
 function continuationAgentReferences(conversation: ImageConversation | null, prompt: string) {
@@ -550,7 +661,7 @@ function shouldUseUploadedReferencesOnly(prompt: string) {
 
 function normalizeUploadedAgentReference(image: StoredReferenceImage): StoredReferenceImage {
   const role = referenceRole(image);
-  if (role === "working_canvas" || role === "product_anchor") return image;
+  if (role === "working_canvas" || role === "product_anchor" || role === "target_product" || role === "template_reference" || role === "style_reference" || role === "composition_reference") return image;
   return { ...image, role: "reference" as const };
 }
 
@@ -570,15 +681,12 @@ function agentReferencesForPrompt(
 ) {
   const uploads = uploadedReferences.filter(hasUsableReference).map(normalizeUploadedAgentReference);
   if (!uploads.length) return continuationAgentReferences(conversation, prompt);
-  if (!conversation || shouldUseUploadedReferencesOnly(prompt)) return uploads.slice(-4);
-  const baseReferences = shouldUseOriginalProductAnchor(prompt)
-    ? productAnchorReferences(conversation)
-    : continuationAgentReferences(conversation, prompt);
+  if (!conversation || shouldUseUploadedReferencesOnly(prompt) || !shouldContinuePreviousAgentResult(prompt)) return uploads.slice(-4);
+  const workingCanvas = latestWorkingCanvasReference(conversation);
+  if (!workingCanvas) return uploads.slice(-4);
   const merged: StoredReferenceImage[] = [];
-  for (const image of baseReferences.filter((item) => referenceRole(item) === "working_canvas").slice(-1)) pushUniqueReference(merged, image);
-  for (const image of baseReferences.filter((item) => referenceRole(item) === "product_anchor").slice(0, 2)) pushUniqueReference(merged, image);
+  pushUniqueReference(merged, workingCanvas);
   for (const image of uploads) pushUniqueReference(merged, image);
-  for (const image of baseReferences.filter((item) => referenceRole(item) === "reference")) pushUniqueReference(merged, image);
   return merged.length ? merged : uploads.slice(-4);
 }
 
@@ -623,6 +731,27 @@ function agentReferencePayload(images: StoredReferenceImage[]) {
     }));
 }
 
+function agentVideoPayload(videos: StoredAgentVideo[]): AgentVideoPayloadItem[] {
+  return videos
+    .filter((video) => video.videoId && video.url)
+    .slice(-AGENT_VIDEO_MAX_ITEMS)
+    .map((video) => ({
+      videoId: video.videoId,
+      name: video.name,
+      type: video.type,
+      size: video.size,
+      url: video.url,
+      sha256: video.sha256,
+      status: video.status || "uploaded",
+      analysisStatus: video.analysisStatus || "pending",
+      analysisError: video.analysisError,
+      analysis: video.analysis,
+      analysisStartedAt: video.analysisStartedAt,
+      analysisFinishedAt: video.analysisFinishedAt,
+      analysisVersion: video.analysisVersion,
+    }));
+}
+
 function hasUsableReference(image: StoredReferenceImage) {
   return Boolean(String(image.dataUrl || "").trim() || String(image.url || "").trim());
 }
@@ -662,6 +791,61 @@ async function prepareAgentReferencePayload(
     return { name: image.name, type: image.type, dataUrl, role };
   }));
   return items.filter((item): item is AgentReferencePayloadItem => Boolean(item?.dataUrl || item?.url));
+}
+
+function referenceWithPreparedUrl(
+  image: StoredReferenceImage,
+  preparedReferences: Map<string, ReferenceUploadItem>,
+): StoredReferenceImage {
+  const publicUrl = String(image.url || "").trim();
+  if (publicUrl && isPublicUrl(publicUrl)) return image;
+  const dataUrl = String(image.dataUrl || "").trim();
+  const prepared = dataUrl ? preparedReferences.get(dataUrl) : undefined;
+  if (!prepared?.url) return image;
+  return {
+    ...image,
+    name: image.name || prepared.filename || "reference.png",
+    type: image.type || prepared.mime_type || "image/png",
+    url: prepared.url,
+  };
+}
+
+async function preuploadReferencesForHistory(
+  images: StoredReferenceImage[],
+  turnId: string,
+  preparedReferences: Map<string, ReferenceUploadItem> = new Map(),
+) {
+  const plans: Array<{ dataUrl: string; file: File }> = [];
+  const seen = new Set<string>();
+  for (const [index, image] of images.entries()) {
+    const publicUrl = String(image.url || "").trim();
+    const dataUrl = String(image.dataUrl || "").trim();
+    if (!dataUrl || (publicUrl && isPublicUrl(publicUrl)) || preparedReferences.has(dataUrl) || seen.has(dataUrl)) continue;
+    seen.add(dataUrl);
+    try {
+      plans.push({
+        dataUrl,
+        file: dataUrlToFile(dataUrl, image.name || `${turnId}-${index + 1}.png`, image.type),
+      });
+    } catch {
+      // Keep the original reference if a browser data URL cannot be converted.
+    }
+  }
+  if (plans.length) {
+    await runWithConcurrency(plans, REFERENCE_UPLOAD_CONCURRENCY, async (plan) => {
+      try {
+        const response = await preuploadImageReferences([plan.file]);
+        const item = response.items[0];
+        if (item?.url) preparedReferences.set(plan.dataUrl, item);
+      } catch {
+        // Task submission can still fall back to direct multipart upload.
+      }
+    });
+  }
+  return {
+    references: images.map((image) => referenceWithPreparedUrl(image, preparedReferences)),
+    preparedReferences,
+  };
 }
 
 function mergeStoredReferences(existing: StoredReferenceImage[], additions: StoredReferenceImage[]) {
@@ -734,6 +918,8 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       aspectRatioCorrected: first.aspect_ratio_corrected,
       error: undefined,
       durationMs: task.duration_ms,
+      cost: task.cost,
+      upstreamTaskId: task.upstream_task_id,
     };
   }
   if (task.status === "error") return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: friendlyImageError(task.error) || "生成失败", durationMs: task.duration_ms };
@@ -839,6 +1025,65 @@ function pickImageFiles(options: { directory?: boolean; multiple?: boolean }) {
   });
 }
 
+function isVideoFile(file: File) {
+  return file.type.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi|mkv)$/i.test(file.name);
+}
+
+function agentVideoFromAsset(asset: AgentVideoAsset): StoredAgentVideo {
+  return {
+    videoId: asset.videoId,
+    conversationId: asset.conversationId,
+    name: asset.name || asset.filename || "video.mp4",
+    type: asset.type || asset.mimeType || "video/mp4",
+    size: Number(asset.size || asset.fileSize || 0),
+    url: asset.url,
+    sha256: asset.sha256,
+    status: asset.status || "uploaded",
+    analysisStatus: asset.analysisStatus || "pending",
+    analysisError: asset.analysisError || undefined,
+    analysis: asset.analysis,
+    analysisStartedAt: asset.analysisStartedAt,
+    analysisFinishedAt: asset.analysisFinishedAt,
+    analysisVersion: asset.analysisVersion,
+    createdAt: asset.createdAt || new Date().toISOString(),
+    updatedAt: asset.updatedAt,
+  };
+}
+
+function videoAnalysisStatus(video: StoredAgentVideo) {
+  return String(video.analysisStatus || video.status || "pending").toLowerCase();
+}
+
+function shouldPollAgentVideo(video: StoredAgentVideo) {
+  return Boolean(video.videoId && video.url && VIDEO_ANALYSIS_ACTIVE_STATUSES.has(videoAnalysisStatus(video)));
+}
+
+function mergeAgentVideoStatus(current: StoredAgentVideo, asset: AgentVideoAsset): StoredAgentVideo {
+  const next = agentVideoFromAsset(asset);
+  return {
+    ...current,
+    ...next,
+    createdAt: current.createdAt || next.createdAt,
+    updatedAt: next.updatedAt || current.updatedAt,
+    analysis: next.analysis || current.analysis,
+    analysisError: next.analysisError || current.analysisError,
+    analysisStartedAt: next.analysisStartedAt || current.analysisStartedAt,
+    analysisFinishedAt: next.analysisFinishedAt || current.analysisFinishedAt,
+  };
+}
+
+function mergeAgentVideoStatuses(videos: StoredAgentVideo[], updates: Map<string, AgentVideoAsset>) {
+  let changed = false;
+  const next = videos.map((video) => {
+    const update = updates.get(video.videoId);
+    if (!update) return video;
+    const merged = mergeAgentVideoStatus(video, update);
+    if (JSON.stringify(merged) !== JSON.stringify(video)) changed = true;
+    return merged;
+  });
+  return { videos: next, changed };
+}
+
 export function useImageWorkspace(isAdmin: boolean) {
   const settingsConfig = ref<SettingsConfig | null>(null);
   const imagePrompt = ref("");
@@ -851,6 +1096,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   const imageModel = ref<ImageModel>("gpt-image-2");
   const imageModels = ref<ImageModel[]>([...BUILTIN_IMAGE_MODELS]);
   const referenceImages = ref<StoredReferenceImage[]>([]);
+  const agentVideos = ref<StoredAgentVideo[]>([]);
   const batchProductImage = ref<StoredReferenceImage | null>(null);
   const batchFolderImages = ref<StoredReferenceImage[]>([]);
   const agentFolder = ref<AgentFolderAsset | null>(null);
@@ -858,6 +1104,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   const promptEngineMode = ref<PromptEngineMode>("standard");
   const longTermMemoryEnabled = ref(true);
   const submitPhase = ref("");
+  const isUploadingAgentVideo = ref(false);
   const conversations = ref<ImageConversation[]>([]);
   const selectedConversationId = ref<string | null>(null);
   const appendToSelectedConversation = ref(false);
@@ -872,6 +1119,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   const lightboxImages = ref<Array<{ id: string; src: string; name?: string }>>([]);
   let unmounted = false;
   let suppressSelectionAppend = false;
+  let videoAnalysisPollTimer: ReturnType<typeof setTimeout> | null = null;
 
   function resolveAllowedImageModel(model?: ImageModel | string): ImageModel {
     const candidate = String(model || "").trim();
@@ -942,6 +1190,70 @@ export function useImageWorkspace(isAdmin: boolean) {
     if (persist) {
       await saveImageConversation(next);
       conversationTaskPersistedAt.set(conversationId, Date.now());
+    }
+  }
+
+  function collectActiveAgentVideoIds(extraIds: string[] = []) {
+    const ids = new Set(extraIds.map((id) => String(id || "").trim()).filter(Boolean));
+    agentVideos.value.filter(shouldPollAgentVideo).forEach((video) => ids.add(video.videoId));
+    for (const conversation of conversations.value) {
+      for (const turn of conversation.turns) {
+        (turn.agentVideos || []).filter(shouldPollAgentVideo).forEach((video) => ids.add(video.videoId));
+      }
+    }
+    return Array.from(ids).slice(0, 50);
+  }
+
+  function scheduleVideoAnalysisPolling(delay = VIDEO_ANALYSIS_POLL_INTERVAL_MS) {
+    if (videoAnalysisPollTimer) clearTimeout(videoAnalysisPollTimer);
+    const ids = collectActiveAgentVideoIds();
+    if (!ids.length || unmounted) {
+      videoAnalysisPollTimer = null;
+      return;
+    }
+    videoAnalysisPollTimer = setTimeout(() => {
+      videoAnalysisPollTimer = null;
+      void pollAgentVideoStatuses();
+    }, Math.max(500, delay));
+  }
+
+  async function pollAgentVideoStatuses(extraIds: string[] = []) {
+    const ids = collectActiveAgentVideoIds(extraIds);
+    if (!ids.length || unmounted) return;
+    try {
+      const response = await fetchAgentVideoStatuses(ids);
+      const updates = new Map(response.items.filter((item) => item.videoId).map((item) => [item.videoId, item]));
+      if (!updates.size) return;
+
+      const composerMerge = mergeAgentVideoStatuses(agentVideos.value, updates);
+      if (composerMerge.changed) {
+        agentVideos.value = composerMerge.videos;
+      }
+
+      let conversationsChanged = false;
+      const nextConversations = conversations.value.map((conversation) => {
+        let turnsChanged = false;
+        const turns = conversation.turns.map((turn) => {
+          if (!turn.agentVideos?.length) return turn;
+          const merged = mergeAgentVideoStatuses(turn.agentVideos, updates);
+          if (!merged.changed) return turn;
+          turnsChanged = true;
+          return { ...turn, agentVideos: merged.videos };
+        });
+        if (!turnsChanged) return conversation;
+        conversationsChanged = true;
+        return { ...conversation, turns };
+      });
+      if (conversationsChanged) {
+        conversations.value = sortConversations(nextConversations);
+        await saveImageConversations(nextConversations);
+      }
+    } catch {
+      // Polling is advisory; upload and conversation flows must remain usable offline.
+    } finally {
+      if (!unmounted && collectActiveAgentVideoIds().length) {
+        scheduleVideoAnalysisPolling();
+      }
     }
   }
 
@@ -1200,6 +1512,7 @@ export function useImageWorkspace(isAdmin: boolean) {
       turnId: turn.id,
       folderId: turn.folderId,
       images: agentImages,
+      videos: agentVideoPayload(turn.agentVideos || []),
       conversationContext: buildAgentConversationContext(conversation),
     });
     const turnKey = imageTurnQueueKey(conversationId, turn.id);
@@ -1222,6 +1535,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         updatedAt: new Date().toISOString(),
       };
     });
+    void pollAgentVideoStatuses((turn.agentVideos || []).map((item) => item.videoId));
     void watchImageAgent(conversationId, turn.id, response.agentRun.runId);
   }
 
@@ -1274,6 +1588,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   function clearComposer() {
     imagePrompt.value = "";
     referenceImages.value = [];
+    agentVideos.value = [];
     batchProductImage.value = null;
     batchFolderImages.value = [];
     agentFolder.value = null;
@@ -1299,6 +1614,20 @@ export function useImageWorkspace(isAdmin: boolean) {
   }
   async function loadQuota() { availableQuota.value = isAdmin ? (isOpenAIRelayEnabled.value ? "中转站" : "API") : "--"; }
 
+  function applyHistoryItems(items: ImageConversation[], restoreStoredSelection: boolean) {
+    const sortedItems = sortConversations(items);
+    conversations.value = sortedItems;
+    const currentConversationId = selectedConversationId.value;
+    const storedConversationId = restoreStoredSelection ? localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) : null;
+    const activeConversationId = currentConversationId && sortedItems.some((item) => item.id === currentConversationId)
+      ? currentConversationId
+      : storedConversationId && sortedItems.some((item) => item.id === storedConversationId)
+        ? storedConversationId
+        : null;
+    if (activeConversationId) syncModeFromConversation(sortedItems.find((item) => item.id === activeConversationId));
+    setSelectedConversationId(activeConversationId, Boolean(activeConversationId));
+  }
+
   async function loadHistory() {
     try {
       const storedCount = localStorage.getItem(IMAGE_COUNT_STORAGE_KEY);
@@ -1315,15 +1644,21 @@ export function useImageWorkspace(isAdmin: boolean) {
       promptEngineMode.value = localStorage.getItem(PROMPT_ENGINE_MODE_STORAGE_KEY) === "professional" ? "professional" : "standard";
       const memoryPreferenceKey = `${LONG_TERM_MEMORY_STORAGE_PREFIX}:${sessionState.session?.subjectId || sessionState.session?.username || "anonymous"}`;
       longTermMemoryEnabled.value = localStorage.getItem(memoryPreferenceKey) !== "false";
-      const items = await recoverHistory(await listImageConversations());
+      const localItems = await listLocalImageConversations();
       if (unmounted) return;
-      conversations.value = items;
-      const storedConversationId = localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY);
-      const activeConversationId = storedConversationId && items.some((item) => item.id === storedConversationId)
-        ? storedConversationId
-        : null;
-      if (activeConversationId) syncModeFromConversation(items.find((item) => item.id === activeConversationId));
-      setSelectedConversationId(activeConversationId, Boolean(activeConversationId));
+      if (localItems.length) {
+        applyHistoryItems(localItems, true);
+        isLoadingHistory.value = false;
+      }
+      const recoveredLocalItems = await recoverHistory(localItems);
+      if (unmounted) return;
+      if (recoveredLocalItems.length || localItems.length) {
+        applyHistoryItems(recoveredLocalItems, !selectedConversationId.value);
+        isLoadingHistory.value = false;
+      }
+      const remoteItems = await recoverHistory(await refreshImageConversationsRemote(recoveredLocalItems));
+      if (unmounted) return;
+      applyHistoryItems(remoteItems, !localItems.length && !selectedConversationId.value);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "读取会话记录失败");
     } finally { isLoadingHistory.value = false; }
@@ -1369,6 +1704,30 @@ export function useImageWorkspace(isAdmin: boolean) {
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取参考图失败"); }
   }
   function removeReference(index: number) { referenceImages.value = referenceImages.value.filter((_, current) => current !== index); }
+  async function appendAgentVideoFiles(files: File[]) {
+    const selected = files.filter(isVideoFile).slice(0, Math.max(0, AGENT_VIDEO_MAX_ITEMS - agentVideos.value.length));
+    if (!selected.length) {
+      toast.error(agentVideos.value.length >= AGENT_VIDEO_MAX_ITEMS ? `单次最多上传 ${AGENT_VIDEO_MAX_ITEMS} 个视频` : "请选择 MP4、MOV 或 WebM 视频");
+      return;
+    }
+    isUploadingAgentVideo.value = true;
+    try {
+      const response = await uploadAgentVideos(selected, selectedConversationId.value || "");
+      const next = response.items.map(agentVideoFromAsset).filter((item) => item.videoId && item.url);
+      if (!next.length) throw new Error("视频上传结果不完整");
+      promptEngineMode.value = "professional";
+      agentVideos.value = [...agentVideos.value, ...next].slice(-AGENT_VIDEO_MAX_ITEMS);
+      void pollAgentVideoStatuses(next.map((item) => item.videoId));
+      toast.success(`已上传 ${next.length} 个视频，发送对话后开始解析`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "上传视频失败");
+    } finally {
+      isUploadingAgentVideo.value = false;
+    }
+  }
+  function removeAgentVideo(index: number) {
+    agentVideos.value = agentVideos.value.filter((_, current) => current !== index);
+  }
   async function pickBatchProduct() {
     try {
       const file = (await pickImageFiles({ multiple: false })).find((item) => item.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(item.name));
@@ -1564,7 +1923,7 @@ export function useImageWorkspace(isAdmin: boolean) {
           };
         });
         return { ...conversation, updatedAt: new Date().toISOString(), turns };
-      }, false);
+      });
     };
     const referencePreuploadEnabled = () => settingsConfig.value?.image_reference_upload?.enabled !== false;
     const referenceReady = (reference: StoredReferenceImage) => {
@@ -1841,6 +2200,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         if (shouldRunImageTurn(turn) && !activeImageTurnQueueIds.has(imageTurnQueueKey(conversation.id, turn.id))) void runConversationQueue(conversation.id, turn.id);
       }
     }
+    scheduleVideoAnalysisPolling();
   }
 
   async function submit() {
@@ -1853,8 +2213,9 @@ export function useImageWorkspace(isAdmin: boolean) {
     const isBatchFolder = Boolean(hasBatchFolder && !batchProductImage.value);
     const isImageAgent = promptEngineMode.value === "professional" && !isBatchReplace && !isBatchFolder;
     const composerReferences = referenceImages.value.filter(hasUsableReference);
+    const currentAgentVideos = isImageAgent ? agentVideos.value.filter((video) => video.videoId && video.url).slice(-AGENT_VIDEO_MAX_ITEMS) : [];
     const referencePayload = isImageAgent ? agentReferencePayload(composerReferences) : [];
-    if (!prompt && !isBatchReplace && !referencePayload.length && !hasAgentFolder) { toast.error("请输入提示词或上传文件夹"); return; }
+    if (!prompt && !isBatchReplace && !referencePayload.length && !currentAgentVideos.length && !hasAgentFolder) { toast.error("请输入提示词，或上传图片、视频、文件夹"); return; }
     if (batchProductImage.value && !batchFolderImages.value.length) { toast.error("请先上传包含场景图的文件夹"); return; }
     isSubmitting.value = true;
     submitPhase.value = isImageAgent
@@ -1871,8 +2232,8 @@ export function useImageWorkspace(isAdmin: boolean) {
       const turnId = createId();
       agentConversationId = conversationId;
       agentTurnId = turnId;
-      const batchReplace: ImageBatchReplacePlan | undefined = isBatchReplace && batchProductImage.value ? { productImage: batchProductImage.value, folderImages: batchFolderImages.value } : undefined;
-      const batchFolder: ImageBatchFolderPlan | undefined = isBatchFolder ? { folderImages: batchFolderImages.value } : undefined;
+      let batchReplace: ImageBatchReplacePlan | undefined = isBatchReplace && batchProductImage.value ? { productImage: batchProductImage.value, folderImages: batchFolderImages.value } : undefined;
+      let batchFolder: ImageBatchFolderPlan | undefined = isBatchFolder ? { folderImages: batchFolderImages.value } : undefined;
       const folderId = agentFolder.value?.folderId || inheritedFolderId;
       const shouldInheritAgentReferences = Boolean(
         isImageAgent
@@ -1880,7 +2241,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         && !folderId
         && hasConversationReferenceAnchor(target)
       );
-      const effectiveReferences = batchReplace
+      let effectiveReferences = batchReplace
         ? [batchReplace.productImage, ...batchReplace.folderImages]
         : batchFolder
           ? batchFolder.folderImages
@@ -1889,11 +2250,18 @@ export function useImageWorkspace(isAdmin: boolean) {
             : composerReferences;
       const conversationalPrompt = prompt || (isImageAgent && effectiveReferences.length
         ? "请分析我刚上传的图片，并根据当前对话继续给出专业建议。"
+        : isImageAgent && currentAgentVideos.length
+          ? "请分析我刚上传的视频素材，提炼商品信息、口播卖点、关键画面和可用于生图的视觉方案。"
         : isImageAgent && folderId
           ? "请先读取这个文件夹的摘要和少量样本，分析图片分类并给出批处理方案。"
           : prompt);
       const mode: ImageConversationMode = effectiveReferences.length || hasAgentFolder || shouldInheritAgentReferences ? "edit" : "generate";
       const shouldPreserveSubject = mode === "edit" && (isImageAgent || preserveSubject.value || Boolean(batchReplace));
+      const preparedReferences = new Map<string, ReferenceUploadItem>();
+      if (mode === "edit" && !batchReplace && !batchFolder && settingsConfig.value?.image_reference_upload?.enabled !== false) {
+        const prepared = await preuploadReferencesForHistory(effectiveReferences, turnId, preparedReferences);
+        effectiveReferences = prepared.references;
+      }
       let effectivePrompt = batchReplace ? buildBatchReplacePrompt(prompt) : conversationalPrompt;
       let promptEngine: ImagePromptEngineMetadata | undefined = isImageAgent
         ? {
@@ -1923,6 +2291,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         sourcePrompt: promptEngine ? conversationalPrompt : undefined,
         promptEngine,
         agentRequested: isImageAgent,
+        agentVideos: isImageAgent ? currentAgentVideos : undefined,
         folderId: isImageAgent ? folderId || undefined : undefined,
         model: submitModel,
         mode,
@@ -1953,7 +2322,7 @@ export function useImageWorkspace(isAdmin: boolean) {
       await persistConversation(conversation);
       agentTurnPersisted = isImageAgent;
       if (isImageAgent) {
-        const agentImages = await prepareAgentReferencePayload(effectiveReferences, turnId, new Map<string, ReferenceUploadItem>());
+        const agentImages = await prepareAgentReferencePayload(effectiveReferences, turnId, preparedReferences);
         const agentResponse = await startImageAgentRun({
           prompt: conversationalPrompt,
           agentEngine: "cowagent",
@@ -1970,6 +2339,7 @@ export function useImageWorkspace(isAdmin: boolean) {
           turnId,
           folderId: folderId || undefined,
           images: agentImages,
+          videos: agentVideoPayload(currentAgentVideos),
           conversationContext: buildAgentConversationContext(target),
         });
         const turnKey = imageTurnQueueKey(conversationId, turnId);
@@ -1981,6 +2351,7 @@ export function useImageWorkspace(isAdmin: boolean) {
           if (!current) return current!;
           return { ...current, turns: current.turns.map((item) => item.id === turnId ? { ...item, agentRun: agentResponse.agentRun } : item), updatedAt: new Date().toISOString() };
         });
+        void pollAgentVideoStatuses(currentAgentVideos.map((item) => item.videoId));
         void watchImageAgent(conversationId, turnId, agentResponse.agentRun.runId);
       } else {
         void runConversationQueue(conversationId, turnId);
@@ -2222,7 +2593,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   async function reuseTurnConfig(turnId: string) {
     const turn = selectedConversation.value?.turns.find((item) => item.id === turnId);
     if (!turn || !turn.prompt.trim()) return;
-    imagePrompt.value = turn.sourcePrompt || turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; longTermMemoryEnabled.value = turn.useLongTermMemory !== false; promptEngineMode.value = isAgentImageTurn(turn) ? "professional" : "standard"; referenceImages.value = turn.referenceImages; toast.success("已复用这条内容和配置"); await nextTick();
+    imagePrompt.value = turn.sourcePrompt || turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; longTermMemoryEnabled.value = turn.useLongTermMemory !== false; promptEngineMode.value = isAgentImageTurn(turn) ? "professional" : "standard"; referenceImages.value = turn.referenceImages; agentVideos.value = turn.agentVideos || []; toast.success("已复用这条内容和配置"); await nextTick();
   }
   async function continueEdit(image: StoredImage | StoredReferenceImage) {
     try {
@@ -2260,7 +2631,15 @@ export function useImageWorkspace(isAdmin: boolean) {
     await loadHistory();
     if (!unmounted) scanQueues();
   });
-  onBeforeUnmount(() => { unmounted = true; activeImageTurnQueueIds.clear(); activeImageAgentIds.clear(); canceledImageAgentTurnIds.clear(); submittedImageTaskIds.clear(); });
+  onBeforeUnmount(() => {
+    unmounted = true;
+    if (videoAnalysisPollTimer) clearTimeout(videoAnalysisPollTimer);
+    videoAnalysisPollTimer = null;
+    activeImageTurnQueueIds.clear();
+    activeImageAgentIds.clear();
+    canceledImageAgentTurnIds.clear();
+    submittedImageTaskIds.clear();
+  });
   watch([imageRatio, imageTier, imageQuality, imageModel, imageCount, preserveSubject, promptEngineMode, longTermMemoryEnabled], persistPreferences);
   watch(selectedConversationId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id);
@@ -2269,7 +2648,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
-    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, appendReferenceFiles, removeReference, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
+    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
   };
 }
 

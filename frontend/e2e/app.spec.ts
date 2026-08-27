@@ -350,7 +350,7 @@ async function mockAppApi(page: Page, overrides: Partial<MockState> = {}) {
             ...(includeResult ? {
               result: {
                 phase: "completed",
-                promptPlan: { model: "gpt-4o", sceneType: "auto", sceneName: "CowAgent open workflow" },
+                promptPlan: { model: "gpt-5.6-sol", sceneType: "auto", sceneName: "CowAgent open workflow" },
                 proposal: {},
                 images: shouldGenerate ? [{ taskId: "mock-cowagent-image-1", url: fakePngDataUrl, width: 1, height: 1 }] : [],
                 qualityChecks: [],

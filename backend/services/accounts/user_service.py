@@ -416,6 +416,14 @@ class UserService:
                     )
                     if other_enabled_admins < 1:
                         raise ValueError("至少需要保留一个启用的管理员账号")
+            if "username" in updates:
+                next_username = _clean(updates.get("username"))
+                if not next_username:
+                    raise ValueError("用户名不能为空")
+                existing = session.query(UserModel).filter(UserModel.username == next_username, UserModel.id != user.id).one_or_none()
+                if existing is not None:
+                    raise ValueError("用户名已存在")
+                user.username = next_username
             if "name" in updates:
                 user.name = _clean(updates.get("name")) or user.username
             if "role" in updates and user.id != DEFAULT_ADMIN_ID:

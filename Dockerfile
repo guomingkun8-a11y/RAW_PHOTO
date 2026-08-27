@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
+    ffmpeg \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -45,6 +46,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY main.py ./
 COPY worker.py ./
 COPY agent_worker.py ./
+COPY video_worker.py ./
 COPY config.example.json ./config.json
 COPY VERSION ./
 COPY backend ./backend

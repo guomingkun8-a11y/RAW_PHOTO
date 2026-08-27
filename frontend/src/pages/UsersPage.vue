@@ -366,7 +366,6 @@ onMounted(load);
               </span>
               <div class="min-w-0">
                 <h2 class="truncate text-lg font-semibold text-slate-950 dark:text-stone-50">{{ item.name || item.username }}</h2>
-                <p class="mt-1 truncate text-xs text-slate-500">{{ item.username }} / {{ item.id }}</p>
               </div>
             </div>
             <span class="rounded-full px-2.5 py-1 text-[11px] font-semibold" :class="item.enabled ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300' : 'bg-rose-50 text-rose-700 dark:bg-rose-400/10 dark:text-rose-300'">

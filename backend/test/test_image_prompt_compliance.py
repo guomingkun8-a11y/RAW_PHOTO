@@ -55,9 +55,9 @@ class ImagePromptComplianceTests(unittest.TestCase):
 
         self.assertIn("生成一张香水电商主图", prompt)
         self.assertIn(IMAGE_PROMPT_DIRECTOR_MARKER, prompt)
-        self.assertIn("商品定位", prompt)
-        self.assertIn("排版自主", prompt)
-        self.assertIn("本张创意方向", prompt)
+        self.assertIn("按用户原始提示", prompt)
+        self.assertIn("不套固定电商模板", prompt)
+        self.assertNotIn("本张创意方向", prompt)
         self.assertIn("画面结构约束", prompt)
         self.assertIn("合规约束", prompt)
         self.assertIn("负面约束", prompt)
@@ -69,6 +69,27 @@ class ImagePromptComplianceTests(unittest.TestCase):
         self.assertIn("第 1/3 张", first)
         self.assertIn("第 2/3 张", second)
         self.assertNotEqual(first, second)
+
+    def test_batch_prompt_conflict_collapses_to_current_single_variation(self):
+        source = (
+            "设计五张以床垫清洁剂为主题的电商图片：\n"
+            "1. 场景一：温馨卧室，文案突出“深层清洁”。\n"
+            "2. 场景二：清晨阳光，文案强调“低泡易干”。\n"
+            "3. 场景三：家庭日常清洁，文案突出“清新洁净”。\n"
+            "4. 场景四：儿童房场景，文案强调“呵护家人”。\n"
+            "5. 场景五：现代简约卧室，文案突出“舒适睡眠”。\n"
+            "保持字体和配色统一。"
+        )
+        prompt = sanitize_image_prompt(source, image_count=5, image_index=2)
+        user_prompt_section = prompt.split(IMAGE_PROMPT_DIRECTOR_MARKER, 1)[0]
+
+        self.assertIn("批量单图执行", user_prompt_section)
+        self.assertIn("当前是第 3/5 张", user_prompt_section)
+        self.assertIn("当前这一张的具体方向：家庭日常清洁", user_prompt_section)
+        self.assertNotIn("设计五张", user_prompt_section)
+        self.assertNotIn("清晨阳光", user_prompt_section)
+        self.assertNotIn("儿童房场景", user_prompt_section)
+        self.assertIn("不要合集、拼图或分屏", user_prompt_section)
 
     def test_standard_mode_keeps_basic_guards_without_professional_direction(self):
         prompt = sanitize_image_prompt(
@@ -101,7 +122,7 @@ class ImagePromptComplianceTests(unittest.TestCase):
         self.assertIn("按用户当前提示生成文字排版", prompt)
         self.assertIn("排版语言默认使用简体中文", prompt)
         self.assertIn("不强制固定商品占比", prompt)
-        self.assertIn("可自主提炼简短中性中文卖点文案", prompt)
+        self.assertIn("不要新增价格", prompt)
         self.assertNotIn("商品占约 55% 到 62%", prompt)
         self.assertNotIn(IMAGE_PROMPT_DIRECTOR_MARKER, prompt)
 
@@ -112,7 +133,7 @@ class ImagePromptComplianceTests(unittest.TestCase):
         self.assertNotIn("99%", user_prompt_section)
         self.assertNotIn("百分之百", user_prompt_section)
         self.assertIn("高比例", user_prompt_section)
-        self.assertIn("不要生成百分百、100%、99%", prompt)
+        self.assertIn("百分百/100%/99%", prompt)
 
     def test_english_typography_request_is_detected_only_when_explicit(self):
         self.assertTrue(has_explicit_english_typography_request("Please make the headline in English"))
@@ -182,8 +203,8 @@ class ImagePromptComplianceTests(unittest.TestCase):
             prompt_engine_mode="standard",
         )
 
-        self.assertIn("允许严格按照用户原始提示修改商品", prompt)
-        self.assertIn("不要把任务退化为只更换背景", prompt)
+        self.assertIn("按用户原始提示修改明确指定的商品", prompt)
+        self.assertIn("未要求修改的商品识别特征", prompt)
         self.assertNotIn("只按用户要求改变场景，不更换商品款式", prompt)
         self.assertNotIn("主体保真：", prompt)
 
@@ -195,8 +216,7 @@ class ImagePromptComplianceTests(unittest.TestCase):
             prompt_engine_mode="standard",
         )
 
-        self.assertIn("按照用户要求修改背景、场景、构图、道具、机位或光线", prompt)
-        self.assertIn("不得覆盖本轮明确修改要求", prompt)
+        self.assertIn("按用户要求修改背景", prompt)
         self.assertIn("主体保真：", prompt)
 
     def test_standard_prompt_is_not_upgraded_by_downstream_default(self):
@@ -214,7 +234,7 @@ class ImagePromptComplianceTests(unittest.TestCase):
         )
 
         self.assertIn("参考图约束", prompt)
-        self.assertIn("保持商品外形", prompt)
+        self.assertIn("保持外形", prompt)
         self.assertIn("主体保真", prompt)
 
     def test_professional_product_mutation_uses_dynamic_reference_guard(self):
@@ -226,8 +246,8 @@ class ImagePromptComplianceTests(unittest.TestCase):
         )
 
         self.assertIn("允许修改用户明确指定的商品属性", prompt)
-        self.assertIn("不能把商品修改要求退化为只换背景", prompt)
-        self.assertNotIn("只升级场景、光影、构图和质感", prompt)
+        self.assertIn("未指定的品牌", prompt)
+        self.assertNotIn("只按用户要求改变场景", prompt)
 
     def test_professional_product_replacement_does_not_inherit_old_product(self):
         prompt = sanitize_image_prompt(

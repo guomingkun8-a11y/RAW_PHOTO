@@ -18,6 +18,7 @@ import { useRoute } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
+import ReferenceImagePreview from "@/components/image/ReferenceImagePreview.vue";
 import {
   bulkDeleteImageLibraryItems,
   downloadImageLibraryItem,
@@ -25,11 +26,13 @@ import {
   fetchImageLibrary,
   fetchPromptTemplates,
   fetchUsers,
+  resolveApiAssetUrl,
   updateImageLibraryItem,
   type ImageLibraryItem,
   type PromptTemplate,
   type UserAccount,
 } from "@/lib/api";
+import { imageLibraryDisplayPrompt } from "@/lib/prompt-display";
 import { sessionState } from "@/stores/session";
 
 const PAGE_SIZE = 20;
@@ -55,6 +58,7 @@ const bulkDeleting = ref(false);
 const bulkDownloading = ref(false);
 let filterTimer = 0;
 let requestId = 0;
+const referencePreview = ref<{ previewUrl: string; label: string; subtitle: string } | null>(null);
 
 const templateMap = computed(() => new Map(templates.value.map((item) => [item.id, item])));
 const ownerMap = computed(() => new Map(users.value.map((item) => [item.id, item])));
@@ -94,8 +98,32 @@ function dimensions(item: ImageLibraryItem) {
 function thumbnail(item: ImageLibraryItem) {
   return item.thumbnail_url || item.image_url;
 }
+function displayPrompt(item: ImageLibraryItem | null | undefined) {
+  return imageLibraryDisplayPrompt(item);
+}
+function imageAlt(item: ImageLibraryItem | null | undefined) {
+  const prompt = displayPrompt(item);
+  return prompt === "未记录 Prompt" ? "生成图片" : prompt;
+}
 function ownerLabel(ownerId: string) {
   return ownerMap.value.get(ownerId)?.name || ownerMap.value.get(ownerId)?.username || ownerId || "未知用户";
+}
+function referenceItems(item: ImageLibraryItem | null | undefined) {
+  return (item?.reference_images || [])
+    .map((asset, index) => ({
+      key: `${item?.id || "image"}:reference:${index}:${asset.preview_url}`,
+      previewUrl: resolveApiAssetUrl(asset.preview_url),
+      label: asset.filename || asset.role || `reference-${index + 1}`,
+      role: asset.role || "",
+    }))
+    .filter((asset) => asset.previewUrl);
+}
+function openReferencePreview(reference: { previewUrl: string; label: string; role?: string }) {
+  referencePreview.value = {
+    previewUrl: reference.previewUrl,
+    label: reference.label || "上传参考图",
+    subtitle: reference.role || "",
+  };
 }
 function analysis(item: ImageLibraryItem) {
   const prompt = `${item.prompt || item.revised_prompt || ""}`;
@@ -119,6 +147,7 @@ async function load(page = currentPage.value) {
       favorite: favoriteOnly.value,
       allOwners: isAdmin.value && (viewScope.value === "all" || viewScope.value === "owner"),
       ownerId: isAdmin.value && viewScope.value === "owner" ? selectedOwnerId.value : "",
+      includeReferences: true,
     });
     if (currentId !== requestId) return;
     const maxPage = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
@@ -339,7 +368,7 @@ onBeforeUnmount(() => {
         <div class="mt-5 grid gap-2 xl:grid-cols-[minmax(240px,520px)_190px_auto_auto]">
           <div class="relative">
             <Search class="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" placeholder="搜索 Prompt、模型或优化后的提示词" data-testid="library-search-input" />
+            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" placeholder="搜索用户提示词、模型或优化后的提示词" data-testid="library-search-input" />
           </div>
           <select v-model="selectedTemplateId" class="studio-input h-12 px-3">
             <option :value="null">全部模板</option>
@@ -404,7 +433,7 @@ onBeforeUnmount(() => {
           <article v-for="item in items" :key="item.id" class="group studio-card flex min-h-[330px] flex-col overflow-hidden bg-white dark:bg-[#171a21]" :class="selectedIds.has(item.id) ? 'border-[#4F7CFF]/45 ring-2 ring-[#4F7CFF]/30' : ''" data-testid="library-image-card">
             <div class="relative">
               <button type="button" class="block aspect-[4/3] w-full overflow-hidden bg-slate-100 text-left dark:bg-white/[0.04]" @click="selectedItemId = item.id">
-                <img :src="thumbnail(item)" :alt="item.prompt || '生成图片'" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.01]" loading="lazy" decoding="async" />
+                <img :src="thumbnail(item)" :alt="imageAlt(item)" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.01]" loading="lazy" decoding="async" />
               </button>
               <button type="button" class="studio-button absolute left-3 top-3 inline-flex size-9 items-center justify-center rounded-xl border text-white shadow-sm" :class="selectedIds.has(item.id) ? 'border-[#4F7CFF] bg-[#4F7CFF]' : 'border-white/70 bg-slate-950/45 hover:bg-slate-950/70'" :aria-label="selectedIds.has(item.id) ? '取消选择图片' : '选择图片'" @click.stop="toggleSelected(item)">
                 <Check v-if="selectedIds.has(item.id)" class="size-4" />
@@ -420,7 +449,7 @@ onBeforeUnmount(() => {
                   <Heart class="size-4" :fill="item.favorite ? 'currentColor' : 'none'" />
                 </button>
               </div>
-              <p class="mt-3 line-clamp-2 text-sm leading-6 text-slate-700 dark:text-stone-200">{{ item.prompt || item.revised_prompt || '未记录 Prompt' }}</p>
+              <p class="mt-3 line-clamp-2 text-sm leading-6 text-slate-700 dark:text-stone-200">{{ displayPrompt(item) }}</p>
               <div class="mt-3 flex items-center justify-between gap-2 text-[11px] text-slate-500">
                 <span>{{ formatCreatedAt(item.created_at) }}</span>
                 <span>{{ formatFileSize(item.file_size) }}</span>
@@ -463,12 +492,29 @@ onBeforeUnmount(() => {
   <BaseModal :open="Boolean(selectedItem)" title="图片详情" width-class="max-w-[980px]" @close="selectedItemId = null">
     <div v-if="selectedItem" class="grid gap-5 p-5 lg:grid-cols-[minmax(0,1.2fr)_minmax(300px,.8fr)]">
       <div class="overflow-hidden rounded-2xl bg-slate-100 dark:bg-white/[0.04]">
-        <img :src="selectedItem.image_url" :alt="selectedItem.prompt || '生成图片'" class="h-auto max-h-[72dvh] w-full object-contain" loading="eager" decoding="async" />
+        <img :src="selectedItem.image_url" :alt="imageAlt(selectedItem)" class="h-auto max-h-[72dvh] w-full object-contain" loading="eager" decoding="async" />
       </div>
       <div class="space-y-4">
         <div>
-          <h3 class="text-sm font-semibold">Prompt</h3>
-          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600 dark:text-stone-300">{{ selectedItem.prompt || selectedItem.revised_prompt || '未记录' }}</p>
+          <h3 class="text-sm font-semibold">用户提示词</h3>
+          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600 dark:text-stone-300">{{ displayPrompt(selectedItem) }}</p>
+        </div>
+        <div v-if="referenceItems(selectedItem).length">
+          <h3 class="text-sm font-semibold">上传参考图</h3>
+          <div class="mt-2 flex gap-2 overflow-x-auto pb-1">
+            <button
+              v-for="reference in referenceItems(selectedItem)"
+              :key="reference.key"
+              type="button"
+              class="group relative size-16 shrink-0 cursor-pointer overflow-hidden rounded-xl border border-black/[0.06] bg-slate-100 transition-colors hover:border-[#4F7CFF]/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 dark:border-white/10 dark:bg-white/[0.06]"
+              :title="reference.label"
+              :aria-label="`预览${reference.label}`"
+              @click="openReferencePreview(reference)"
+            >
+              <img :src="reference.previewUrl" alt="上传参考图" class="size-full object-cover transition-transform duration-200 group-hover:scale-[1.03]" loading="lazy" decoding="async" />
+              <span v-if="reference.role" class="absolute bottom-0 left-0 right-0 truncate bg-slate-950/70 px-1 py-0.5 text-[9px] leading-none text-white">{{ reference.role }}</span>
+            </button>
+          </div>
         </div>
         <div class="rounded-2xl border border-[#4F7CFF]/20 bg-[#4F7CFF]/[0.06] p-4">
           <div class="flex items-center gap-2 text-sm font-semibold text-[#315be8]">
@@ -498,12 +544,20 @@ onBeforeUnmount(() => {
     </div>
   </BaseModal>
 
+  <ReferenceImagePreview
+    :open="Boolean(referencePreview)"
+    :image-url="referencePreview?.previewUrl || ''"
+    :title="referencePreview?.label"
+    :subtitle="referencePreview?.subtitle"
+    @close="referencePreview = null"
+  />
+
   <BaseModal :open="Boolean(deleteTarget)" title="确认删除图片" description="删除后这张图片会从历史图库移出，后续不会在图库列表中展示。" width-class="max-w-[460px]" :show-close="false" @close="deleteTarget = null">
     <div v-if="deleteTarget" class="space-y-4 p-5">
       <div class="flex gap-3 rounded-xl bg-slate-100 p-3 dark:bg-white/[0.06]">
-        <img :src="thumbnail(deleteTarget)" :alt="deleteTarget.prompt || '生成图片'" class="size-16 shrink-0 rounded-lg object-cover" loading="lazy" decoding="async" />
+        <img :src="thumbnail(deleteTarget)" :alt="imageAlt(deleteTarget)" class="size-16 shrink-0 rounded-lg object-cover" loading="lazy" decoding="async" />
         <div class="min-w-0 text-sm">
-          <p class="line-clamp-2 leading-6 text-slate-700 dark:text-stone-200">{{ deleteTarget.prompt || deleteTarget.revised_prompt || '未记录 Prompt' }}</p>
+          <p class="line-clamp-2 leading-6 text-slate-700 dark:text-stone-200">{{ displayPrompt(deleteTarget) }}</p>
           <p class="mt-1 text-xs text-slate-500">{{ formatCreatedAt(deleteTarget.created_at) }} · {{ ownerLabel(deleteTarget.owner_id) }}</p>
         </div>
       </div>
@@ -523,7 +577,7 @@ onBeforeUnmount(() => {
         将移出当前选中的 {{ selectedCount }} 张图片。生成记录和源文件不会被物理删除，只是不再显示在历史图库中。
       </div>
       <div v-if="selectedItems.length" class="grid grid-cols-6 gap-2">
-        <img v-for="item in selectedItems.slice(0, 12)" :key="item.id" :src="thumbnail(item)" :alt="item.prompt || '生成图片'" class="aspect-square rounded-lg object-cover" loading="lazy" decoding="async" />
+        <img v-for="item in selectedItems.slice(0, 12)" :key="item.id" :src="thumbnail(item)" :alt="imageAlt(item)" class="aspect-square rounded-lg object-cover" loading="lazy" decoding="async" />
       </div>
       <div class="flex justify-end gap-2">
         <button type="button" class="studio-button rounded-xl border border-black/[0.08] px-4 py-2 text-sm dark:border-white/10" :disabled="bulkDeleting" @click="bulkDeleteOpen = false">取消</button>

@@ -10,15 +10,10 @@ from PIL import Image, ImageFilter, ImageOps
 ImageInput = tuple[bytes, str, str]
 
 ECOMMERCE_PRESERVE_PROMPT = (
-    "Product subject preservation mode. Treat the first reference image as the fixed product reference. "
-    "Keep the exact product shape, package structure, label layout, logo, brand name, product name, "
-    "specifications, icons, and every visible character unchanged. Do not invent, rewrite, translate, "
-    "stylize, replace, blur, crop, cover, duplicate, or repaint any text on the product. "
-    "Only change the surrounding environment: background, surface, props, lighting, reflections, "
-    "shadows, atmosphere, and camera framing. The product must look naturally photographed in the new "
-    "scene, with believable contact shadows, reflections, perspective, and color harmony. If preserving "
-    "text conflicts with the requested scene, preserving the original product identity and text has "
-    "higher priority.\n\n"
+    "Product subject preservation mode. Use the first reference image as the product identity source. "
+    "Preserve product category, shape, package structure, label layout, logo, brand/product names, and visible text "
+    "unless the user explicitly asks to change product attributes. Other references may guide style or layout only. "
+    "Apply the user request freely to background, surface, props, lighting, framing, typography, and atmosphere.\n\n"
     "User request:"
 )
 
@@ -27,9 +22,8 @@ def build_preserve_subject_prompt(prompt: str) -> str:
     text = str(prompt or "").strip()
     if text and any(marker in text for marker in ("文字排版", "画面文字", "标题", "副标题", "卖点标签", "淘宝主图")):
         overlay_rule = (
-            "Overlay typography is allowed in the empty background area outside the product. "
-            "The no-cover rule applies to text printed on the product itself; do not paint over or alter the label. "
-            "Render the requested overlay strings exactly, character for character, with a clean commercial layout."
+            "Overlay typography may be added outside the product area. "
+            "Do not cover or rewrite product label text. Use exact user-provided copy when present."
         )
         return f"{ECOMMERCE_PRESERVE_PROMPT}\n{overlay_rule}\n\nUser request:\n{text}"
     return f"{ECOMMERCE_PRESERVE_PROMPT}\n{text}" if text else ECOMMERCE_PRESERVE_PROMPT

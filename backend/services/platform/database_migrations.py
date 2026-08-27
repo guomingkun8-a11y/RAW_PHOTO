@@ -102,6 +102,28 @@ def _apply_generation_stage_columns(engine: Engine) -> None:
                 connection.execute(text(f"ALTER TABLE generation_task_events ADD COLUMN {name} INTEGER NULL"))
 
 
+def _apply_generation_cost_columns(engine: Engine) -> None:
+    if "generation_task_events" not in inspect(engine).get_table_names():
+        return
+    with engine.begin() as connection:
+        columns = _column_names(connection, "generation_task_events")
+        if "cost" not in columns:
+            connection.execute(text("ALTER TABLE generation_task_events ADD COLUMN cost FLOAT NULL"))
+        if "upstream_task_id" not in columns:
+            connection.execute(text("ALTER TABLE generation_task_events ADD COLUMN upstream_task_id VARCHAR(191) NULL"))
+        try:
+            connection.execute(text("CREATE INDEX idx_generation_events_upstream_task ON generation_task_events (upstream_task_id)"))
+        except Exception:
+            pass
+
+
+def _remove_model_token_monitoring_schema(engine: Engine) -> None:
+    if "model_cost_events" not in inspect(engine).get_table_names():
+        return
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE model_cost_events"))
+
+
 def _apply_operational_indexes(engine: Engine) -> None:
     key_column = _quoted_identifier(engine, "key")
     statements = {
@@ -553,6 +575,102 @@ def _apply_professional_agent_folder_schema(engine: Engine) -> None:
                 pass
 
 
+def _apply_professional_agent_video_schema(engine: Engine) -> None:
+    metadata = MetaData()
+    long_text = Text().with_variant(LONGTEXT, "mysql")
+    Table(
+        "professional_agent_video_assets",
+        metadata,
+        Column("video_id", String(191), primary_key=True),
+        Column("owner_id", String(191), nullable=False),
+        Column("conversation_id", String(191), nullable=False),
+        Column("filename", String(191), nullable=False),
+        Column("mime_type", String(120), nullable=False),
+        Column("size", BigInteger().with_variant(Integer, "sqlite"), nullable=False),
+        Column("sha256", String(64), nullable=False),
+        Column("storage_provider", String(32), nullable=False),
+        Column("bucket", String(191), nullable=False),
+        Column("object_key", String(1000), nullable=False),
+        Column("url", String(2000), nullable=False),
+        Column("status", String(32), nullable=False),
+        Column("analysis_status", String(32), nullable=False),
+        Column("analysis_json", long_text, nullable=False),
+        Column("analysis_error", long_text, nullable=False, default=""),
+        Column("analysis_started_at", DateTime, nullable=True),
+        Column("analysis_finished_at", DateTime, nullable=True),
+        Column("analysis_version", Integer, nullable=False, default=1),
+        Column("created_at", DateTime, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
+        UniqueConstraint("owner_id", "sha256", name="uq_prof_agent_video_owner_sha"),
+    )
+    metadata.create_all(engine)
+    statements = [
+        "CREATE INDEX idx_prof_agent_video_owner_updated ON professional_agent_video_assets (owner_id, status, updated_at)",
+        "CREATE INDEX idx_prof_agent_video_conversation ON professional_agent_video_assets (owner_id, conversation_id, created_at)",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _apply_professional_agent_video_analysis_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "professional_agent_video_assets"):
+        _apply_professional_agent_video_schema(engine)
+    definitions = {
+        "analysis_error": "TEXT NULL",
+        "analysis_started_at": "DATETIME NULL",
+        "analysis_finished_at": "DATETIME NULL",
+        "analysis_version": "INTEGER NOT NULL DEFAULT 1",
+    }
+    with engine.begin() as connection:
+        columns = _column_names(connection, "professional_agent_video_assets")
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE professional_agent_video_assets ADD COLUMN {name} {definition}"))
+        for statement in (
+            "CREATE INDEX idx_prof_agent_video_analysis_status ON professional_agent_video_assets (analysis_status, updated_at)",
+            "CREATE INDEX idx_prof_agent_video_owner_analysis ON professional_agent_video_assets (owner_id, analysis_status, updated_at)",
+        ):
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _apply_video_generation_task_schema(engine: Engine) -> None:
+    metadata = MetaData()
+    long_text = Text().with_variant(LONGTEXT, "mysql")
+    Table(
+        "video_generation_tasks",
+        metadata,
+        Column("key", String(383), primary_key=True),
+        Column("owner_id", String(191), nullable=False),
+        Column("task_id", String(191), nullable=False),
+        Column("status", String(32), nullable=False),
+        Column("mode", String(32), nullable=False),
+        Column("model", String(191), nullable=True),
+        Column("upstream_task_id", String(191), nullable=True),
+        Column("created_at", DateTime, nullable=True),
+        Column("updated_at", DateTime, nullable=True),
+        Column("task_json", long_text, nullable=False),
+    )
+    metadata.create_all(engine)
+    statements = [
+        "CREATE INDEX idx_video_generation_owner_updated ON video_generation_tasks (owner_id, updated_at)",
+        "CREATE INDEX idx_video_generation_status_updated ON video_generation_tasks (status, updated_at)",
+        "CREATE INDEX idx_video_generation_upstream_task ON video_generation_tasks (upstream_task_id)",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
 def _apply_professional_knowledge_schema(engine: Engine) -> None:
     metadata = MetaData()
     long_text = Text().with_variant(LONGTEXT, "mysql")
@@ -755,6 +873,11 @@ MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("016_professional_memory_review_governance", _apply_professional_memory_review_governance),
     ("017_chatgpt_style_memory_scopes", _apply_chatgpt_style_memory_scopes),
     ("018_professional_agent_operational_indexes", _apply_professional_agent_operational_indexes),
+    ("019_generation_cost_monitoring", _apply_generation_cost_columns),
+    ("021_remove_model_token_monitoring", _remove_model_token_monitoring_schema),
+    ("022_professional_agent_videos", _apply_professional_agent_video_schema),
+    ("023_professional_agent_video_analysis", _apply_professional_agent_video_analysis_schema),
+    ("024_video_generation_tasks", _apply_video_generation_task_schema),
 )
 
 

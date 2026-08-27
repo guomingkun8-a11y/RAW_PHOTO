@@ -67,6 +67,55 @@ class SystemAuthApiTests(unittest.TestCase):
         self.assertEqual(set_avatar.call_args.kwargs["content_type"], "image/jpeg")
         self.assertEqual(set_avatar.call_args.kwargs["payload"], b"\xff\xd8\xffavatar")
 
+    def test_update_profile_returns_updated_current_user(self) -> None:
+        updated = {
+            "id": "user-1",
+            "username": "avatar-user",
+            "name": "真实姓名",
+            "role": "user",
+            "avatar_url": "/avatars/user-1.png",
+        }
+        with (
+            mock.patch.object(system_module, "require_identity", return_value=TEST_IDENTITY),
+            mock.patch.object(system_module.user_service, "update_user", return_value=updated) as update_user,
+        ):
+            response = self.client.patch(
+                "/api/auth/profile",
+                headers=AUTH_HEADERS,
+                json={"name": "  真实姓名  "},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["subject_id"], "user-1")
+        self.assertEqual(payload["name"], "真实姓名")
+        self.assertEqual(update_user.call_args.args[0], "user-1")
+        self.assertEqual(update_user.call_args.args[1], {"name": "真实姓名"})
+
+    def test_update_profile_can_change_username(self) -> None:
+        updated = {
+            "id": "user-1",
+            "username": "new-avatar-user",
+            "name": "真实姓名",
+            "role": "user",
+            "avatar_url": "/avatars/user-1.png",
+        }
+        with (
+            mock.patch.object(system_module, "require_identity", return_value=TEST_IDENTITY),
+            mock.patch.object(system_module.user_service, "update_user", return_value=updated) as update_user,
+        ):
+            response = self.client.patch(
+                "/api/auth/profile",
+                headers=AUTH_HEADERS,
+                json={"username": "  new-avatar-user  ", "name": "  真实姓名  "},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["username"], "new-avatar-user")
+        self.assertEqual(payload["name"], "真实姓名")
+        self.assertEqual(update_user.call_args.args[1], {"username": "new-avatar-user", "name": "真实姓名"})
+
     def test_list_announcements_requires_login_and_returns_items(self) -> None:
         result = {"items": [{"id": 1, "title": "更新", "content": "优化图片生成页", "type": "info", "enabled": True}], "total": 1}
         with (

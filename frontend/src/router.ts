@@ -12,6 +12,7 @@ const routes: RouteRecordRaw[] = [
   { path: "/products", redirect: "/image" },
   { path: "/prompt-templates", name: "prompt-templates", component: () => import("@/pages/PromptTemplatesPage.vue") },
   { path: "/monitoring", name: "monitoring", component: () => import("@/pages/MonitoringPage.vue"), meta: { role: "admin" } },
+  { path: "/costs", name: "costs", component: () => import("@/pages/CostsPage.vue"), meta: { role: "admin" } },
   { path: "/users", name: "users", component: () => import("@/pages/UsersPage.vue"), meta: { role: "admin" } },
   { path: "/:pathMatch(.*)*", redirect: "/image" },
 ];

@@ -16,6 +16,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Square,
+  Video,
   X,
   Zap,
 } from "@lucide/vue";
@@ -24,7 +25,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { analyzeImagePrompt, type ImageModel, type PromptEngineMode } from "@/lib/api";
 import type { AgentFolderAsset } from "@/lib/api";
 import { formatImageModel, imageModelFeatures } from "@/lib/image-models";
-import type { StoredReferenceImage } from "@/stores/image-conversations";
+import type { StoredAgentVideo, StoredReferenceImage } from "@/stores/image-conversations";
 import EngineSwitch from "@/components/image/EngineSwitch.vue";
 
 const props = defineProps<{
@@ -33,10 +34,12 @@ const props = defineProps<{
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: StoredReferenceImage[];
+  agentVideos?: StoredAgentVideo[];
   batchProductImage: StoredReferenceImage | null;
   batchFolderImages: StoredReferenceImage[];
   agentFolder: AgentFolderAsset | null;
   isSubmitting: boolean;
+  isUploadingAgentVideo?: boolean;
   submitPhase?: string;
   allowReferenceOnlySubmit?: boolean;
   longTermMemoryEnabled?: boolean;
@@ -47,7 +50,9 @@ const emit = defineEmits<{
   submit: [];
   createDraft: [];
   referenceFiles: [files: File[]];
+  videoFiles: [files: File[]];
   removeReference: [index: number];
+  removeVideo: [index: number];
   pickBatchProduct: [];
   pickBatchFolder: [];
   clearBatch: [];
@@ -68,6 +73,7 @@ const preserveSubject = defineModel<boolean>("preserveSubject", { required: true
 const promptEngineMode = defineModel<PromptEngineMode>("promptEngineMode", { required: true });
 
 const fileInput = ref<HTMLInputElement | null>(null);
+const videoInput = ref<HTMLInputElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const settingCards = ref<HTMLElement | null>(null);
 const isDragging = ref(false);
@@ -105,6 +111,7 @@ const AGENT_COUNT_MAX = 20;
 const AGENT_FOLDER_COUNT_MAX = 300;
 const previewWidth = 280;
 const previewMaxHeight = 340;
+const videoExtensionPattern = /\.(mp4|mov|m4v|webm|avi|mkv)$/i;
 const promptMinHeight = computed(() => (isHome.value ? 28 : 108));
 const promptMaxHeight = computed(() => (isHome.value ? 148 : 240));
 
@@ -115,6 +122,7 @@ const canvasLabel = computed(() => imageRatio.value === "auto" ? "自动" : imag
 const countLabel = computed(() => `${normalizeCountValue(imageCount.value, countMaxForCurrentMode())} 张`);
 const preferencesLabel = computed(() => `${canvasLabel.value} · ${countLabel.value}`);
 const hasReferences = computed(() => props.referenceImages.length > 0);
+const hasAgentVideos = computed(() => isAgentMode.value && Boolean(props.agentVideos?.length));
 const hasAgentFolder = computed(() => Boolean(props.agentFolder?.folderId));
 const hasBatch = computed(() => Boolean(props.batchProductImage || props.batchFolderImages.length || hasAgentFolder.value));
 const isBatchReplaceMode = computed(() => Boolean(props.batchProductImage && props.batchFolderImages.length));
@@ -133,6 +141,7 @@ const canSubmit = computed(() => !props.isSubmitting && (
   Boolean(prompt.value.trim())
   || isBatchReplaceMode.value
   || hasAgentFolder.value
+  || hasAgentVideos.value
   || (props.allowReferenceOnlySubmit === true && hasReferences.value)
 ));
 const canPreserve = computed(() => hasReferences.value || hasBatch.value);
@@ -140,7 +149,10 @@ const promptPlaceholder = computed(() => {
   if (isHome.value) return hasReferences.value ? "描述你希望如何修改这张参考图..." : "描述你想生成的图片...";
   return isBatchReplaceMode.value ? "补充批量替换要求..." : isFolderBatchMode.value ? "输入要套用到每张文件夹图片的生成要求..." : hasReferences.value ? "描述你希望如何修改参考图..." : "输入商品图片生成需求...";
 });
-const agentPromptPlaceholder = computed(() => hasReferences.value ? "继续描述你希望怎么调整这张图..." : "输入你的商品、目标和画面要求...");
+const agentPromptPlaceholder = computed(() => {
+  if (hasAgentVideos.value) return "描述希望从视频里提炼的商品信息、关键画面或生图方向...";
+  return hasReferences.value ? "继续描述你希望怎么调整这张图..." : "输入你的商品、目标和画面要求...";
+});
 const submitText = computed(() => props.isSubmitting ? isAgentMode.value ? "处理中" : "提交中" : isAgentMode.value ? "发送" : isBatchReplaceMode.value ? "批量替换" : isFolderBatchMode.value ? "批量生图" : hasReferences.value ? "编辑图片" : "生成图片");
 const submitStatusText = computed(() => props.submitPhase || submitText.value);
 const promptShellState = computed(() => ({
@@ -268,10 +280,25 @@ function selectEngine(value: string) {
 function pickReferences() {
   fileInput.value?.click();
 }
+function pickVideos() {
+  videoInput.value?.click();
+}
+function isImageFile(file: File) {
+  return file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(file.name);
+}
+function isVideoFile(file: File) {
+  return file.type.startsWith("video/") || videoExtensionPattern.test(file.name);
+}
 function onFiles(event: Event) {
   const input = event.target as HTMLInputElement;
-  const files = Array.from(input.files || []).filter((file) => file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(file.name));
+  const files = Array.from(input.files || []).filter(isImageFile);
   if (files.length) emit("referenceFiles", files);
+  input.value = "";
+}
+function onVideoFiles(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []).filter(isVideoFile);
+  if (files.length) emit("videoFiles", files);
   input.value = "";
 }
 function onPaste(event: ClipboardEvent) {
@@ -289,8 +316,25 @@ function onPromptKeydown(event: KeyboardEvent) {
 function onDrop(event: DragEvent) {
   event.preventDefault();
   isDragging.value = false;
-  const files = Array.from(event.dataTransfer?.files || []).filter((file) => file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp|svg)$/i.test(file.name));
-  if (files.length) emit("referenceFiles", files);
+  const dropped = Array.from(event.dataTransfer?.files || []);
+  const imageFiles = dropped.filter(isImageFile);
+  const videoFiles = dropped.filter(isVideoFile);
+  if (imageFiles.length) emit("referenceFiles", imageFiles);
+  if (videoFiles.length) emit("videoFiles", videoFiles);
+}
+function formatVideoSize(bytes: number) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${Math.ceil(value / 1024)} KB`;
+  return `${value} B`;
+}
+function videoStatusLabel(video: StoredAgentVideo) {
+  if (video.analysisStatus === "ready" || video.status === "ready") return "已解析";
+  if (video.analysisStatus === "failed" || video.status === "failed") return "解析失败";
+  if (video.analysisStatus === "queued" || video.status === "queued") return "排队中";
+  if (video.analysisStatus === "processing" || video.status === "processing") return "解析中";
+  return "待解析";
 }
 async function assist(action: PromptAssistAction) {
   if (!hasReferences.value || promptAssistAction.value) {
@@ -302,7 +346,7 @@ async function assist(action: PromptAssistAction) {
   try {
     const analyzableImages = props.referenceImages
       .filter((image) => image.dataUrl)
-      .slice(0, 4)
+      .slice(0, 6)
       .map((image) => ({ name: image.name, dataUrl: image.dataUrl || "" }));
     if (!analyzableImages.length) throw new Error("当前历史参考图已瘦身为 URL，请先加入本地图片后再分析");
     const result = await analyzeImagePrompt({
@@ -433,7 +477,32 @@ watch(promptEngineMode, () => {
         <button type="button" class="rounded-xl px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-50" @click="emit('clearBatch')">清空</button>
       </div>
 
+      <div v-if="hasAgentVideos" class="composer-video-row" data-testid="agent-video-assets">
+        <div
+          v-for="(video, index) in agentVideos || []"
+          :key="video.videoId || `${video.name}-${index}`"
+          class="composer-video-chip"
+        >
+          <span class="composer-video-icon">
+            <Video class="size-4" />
+          </span>
+          <span class="composer-video-meta">
+            <strong :title="video.name">{{ video.name }}</strong>
+            <small :title="video.analysisError || ''">{{ formatVideoSize(video.size) }} · {{ videoStatusLabel(video) }}</small>
+          </span>
+          <button
+            type="button"
+            class="composer-video-remove"
+            :aria-label="`移除视频 ${index + 1}`"
+            @click="emit('removeVideo', index)"
+          >
+            <X class="size-3" />
+          </button>
+        </div>
+      </div>
+
       <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" data-testid="reference-file-input" @change="onFiles" />
+      <input ref="videoInput" type="file" accept="video/mp4,video/quicktime,video/webm,video/x-msvideo,video/x-matroska,.mp4,.mov,.m4v,.webm,.avi,.mkv" multiple class="hidden" data-testid="agent-video-file-input" @change="onVideoFiles" />
 
       <div ref="settingCards" class="composer-control-surface" @keydown.escape="closeSettingCards">
         <div class="composer-settings-bar" :class="{ 'is-agent-mode': isAgentMode }">
@@ -605,6 +674,19 @@ watch(promptEngineMode, () => {
             <button type="button" class="composer-tool-button" data-testid="pick-reference-button" @click="pickReferences">
               <ImagePlus class="size-4" />
               图片
+            </button>
+            <button
+              v-if="isAgentMode"
+              type="button"
+              class="composer-tool-button"
+              :disabled="props.isUploadingAgentVideo"
+              :aria-busy="props.isUploadingAgentVideo"
+              data-testid="pick-agent-video-button"
+              @click="pickVideos"
+            >
+              <LoaderCircle v-if="props.isUploadingAgentVideo" class="size-4 animate-spin" />
+              <Video v-else class="size-4" />
+              {{ props.isUploadingAgentVideo ? '上传中' : '视频' }}
             </button>
           </div>
           <div class="composer-tool-group composer-tool-group--trailing">
@@ -1292,6 +1374,87 @@ watch(promptEngineMode, () => {
   white-space: nowrap;
 }
 
+.composer-video-row {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.composer-video-chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(100%, 22rem);
+  align-items: center;
+  gap: 0.55rem;
+  border: 1px solid rgb(79 124 255 / 0.2);
+  border-radius: 10px;
+  background: rgb(79 124 255 / 0.055);
+  padding: 0.45rem 0.5rem 0.45rem 0.6rem;
+  color: rgb(51 65 85);
+}
+
+.composer-video-icon {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  place-items: center;
+  border-radius: 8px;
+  background: rgb(79 124 255 / 0.12);
+  color: rgb(49 91 232);
+}
+
+.composer-video-meta {
+  display: grid;
+  min-width: 0;
+  gap: 0.05rem;
+  line-height: 1.25;
+}
+
+.composer-video-meta strong {
+  overflow: hidden;
+  color: rgb(30 41 59);
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-video-meta small {
+  color: rgb(100 116 139);
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.composer-video-remove {
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgb(100 116 139);
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+}
+
+.composer-video-remove:hover,
+.composer-video-remove:focus-visible {
+  background: rgb(15 23 42 / 0.055);
+  color: rgb(225 29 72);
+  outline: none;
+}
+
+.composer-video-remove:focus-visible {
+  box-shadow: 0 0 0 3px rgb(79 124 255 / 0.12);
+}
+
 .composer-settings-bar {
   display: flex;
   min-width: 0;
@@ -1534,6 +1697,11 @@ watch(promptEngineMode, () => {
   box-shadow: 0 0 0 3px rgb(79 124 255 / 0.12);
 }
 
+.composer-tool-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
 .composer-submit-status {
   color: rgb(100 116 139);
   font-size: 0.74rem;
@@ -1594,6 +1762,32 @@ watch(promptEngineMode, () => {
 
 .dark .composer-reference-assist-button small {
   color: rgb(168 162 158);
+}
+
+.dark .composer-video-chip {
+  border-color: rgb(79 124 255 / 0.28);
+  background: rgb(79 124 255 / 0.13);
+  color: rgb(214 211 209);
+}
+
+.dark .composer-video-icon {
+  background: rgb(79 124 255 / 0.2);
+  color: rgb(191 219 254);
+}
+
+.dark .composer-video-meta strong {
+  color: rgb(245 245 244);
+}
+
+.dark .composer-video-meta small,
+.dark .composer-video-remove {
+  color: rgb(168 162 158);
+}
+
+.dark .composer-video-remove:hover,
+.dark .composer-video-remove:focus-visible {
+  background: rgb(255 255 255 / 0.08);
+  color: rgb(251 113 133);
 }
 
 .dark .composer-settings-bar,

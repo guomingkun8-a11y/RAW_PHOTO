@@ -12,6 +12,10 @@ SECRET_PATHS: tuple[tuple[str, ...], ...] = (
     ("backup", "passphrase"),
     ("image_reference_upload", "oss_access_key"),
     ("image_reference_upload", "oss_secret_key"),
+    ("video_upload", "oss_access_key"),
+    ("video_upload", "oss_secret_key"),
+    ("video_generation", "api_key"),
+    ("video_generation", "api_keys"),
     ("image_storage", "webdav_password"),
     ("image_storage", "minio_access_key"),
     ("image_storage", "minio_secret_key"),
@@ -29,6 +33,9 @@ URL_PATHS: tuple[tuple[str, ...], ...] = (
     ("image_storage", "webdav_url"),
     ("image_task_queue", "redis_url"),
     ("image_task_queue", "database_url"),
+    ("video_analysis", "redis_url"),
+    ("video_generation", "redis_url"),
+    ("video_generation", "database_url"),
 )
 
 

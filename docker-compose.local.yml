@@ -43,14 +43,21 @@ services:
       IMAGE_TASK_OWNER_CONCURRENCY: "2"
       AGENT_QUEUE_ENABLED: "true"
       AGENT_REDIS_URL: redis://redis:6379/0
-      AGENT_WORKER_CONCURRENCY: "4"
-      AGENT_TOTAL_CONCURRENCY: "4"
+      AGENT_WORKER_CONCURRENCY: "12"
+      AGENT_TOTAL_CONCURRENCY: "12"
       AGENT_OWNER_CONCURRENCY: "1"
       AGENT_OWNER_PENDING_LIMIT: "10"
       AGENT_MAX_RETRIES: "3"
       AGENT_RETRY_BASE_DELAY_SECS: "2"
       AGENT_RETRY_MAX_DELAY_SECS: "60"
       AGENT_DEAD_LETTER_RETENTION_SECS: "604800"
+      VIDEO_ANALYSIS_ENABLED: "true"
+      VIDEO_PARSE_QUEUE_ENABLED: "true"
+      VIDEO_PARSE_REDIS_URL: redis://redis:6379/0
+      VIDEO_PARSE_WORKER_CONCURRENCY: "4"
+      VIDEO_PARSE_TOTAL_CONCURRENCY: "4"
+      VIDEO_PARSE_OWNER_CONCURRENCY: "1"
+      VIDEO_PARSE_OWNER_PENDING_LIMIT: "8"
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: raw_professional_memory
       QDRANT_FOLDER_COLLECTION: raw_professional_folder_assets
@@ -99,18 +106,52 @@ services:
       IMAGE_TASK_DATABASE_URL: sqlite:////app/data/image_tasks.db
       AGENT_QUEUE_ENABLED: "true"
       AGENT_REDIS_URL: redis://redis:6379/0
-      AGENT_WORKER_CONCURRENCY: "4"
-      AGENT_TOTAL_CONCURRENCY: "4"
+      AGENT_WORKER_CONCURRENCY: "12"
+      AGENT_TOTAL_CONCURRENCY: "12"
       AGENT_OWNER_CONCURRENCY: "1"
       AGENT_OWNER_PENDING_LIMIT: "10"
       AGENT_MAX_RETRIES: "3"
       AGENT_RETRY_BASE_DELAY_SECS: "2"
       AGENT_RETRY_MAX_DELAY_SECS: "60"
       AGENT_DEAD_LETTER_RETENTION_SECS: "604800"
+      VIDEO_ANALYSIS_ENABLED: "true"
+      VIDEO_PARSE_QUEUE_ENABLED: "true"
+      VIDEO_PARSE_REDIS_URL: redis://redis:6379/0
+      VIDEO_PARSE_WORKER_CONCURRENCY: "4"
+      VIDEO_PARSE_TOTAL_CONCURRENCY: "4"
+      VIDEO_PARSE_OWNER_CONCURRENCY: "1"
+      VIDEO_PARSE_OWNER_PENDING_LIMIT: "8"
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: raw_professional_memory
       QDRANT_FOLDER_COLLECTION: raw_professional_folder_assets
       QDRANT_KNOWLEDGE_COLLECTION: raw_professional_knowledge
+
+  video-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gmkraw:local
+    container_name: gmkraw-video-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "video_worker.py"]
+    depends_on:
+      - redis
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      STORAGE_BACKEND: sqlite
+      DATABASE_URL: sqlite:////app/data/accounts.db
+      IMAGE_TASK_QUEUE_ENABLED: "true"
+      IMAGE_TASK_REDIS_URL: redis://redis:6379/0
+      IMAGE_TASK_DATABASE_URL: sqlite:////app/data/image_tasks.db
+      VIDEO_ANALYSIS_ENABLED: "true"
+      VIDEO_PARSE_QUEUE_ENABLED: "true"
+      VIDEO_PARSE_REDIS_URL: redis://redis:6379/0
+      VIDEO_PARSE_WORKER_CONCURRENCY: "4"
+      VIDEO_PARSE_TOTAL_CONCURRENCY: "4"
+      VIDEO_PARSE_OWNER_CONCURRENCY: "1"
+      VIDEO_PARSE_OWNER_PENDING_LIMIT: "8"
     # 存储后端配置 (可选值: json, sqlite, postgres, git)
     # environment:
     #   STORAGE_BACKEND: json

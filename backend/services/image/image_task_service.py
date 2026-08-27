@@ -53,8 +53,11 @@ QUEUE_PRIORITY_BATCH = "batch"
 DEFAULT_EMPTY_TASK_LIST_LIMIT = 200
 CONTENT_POLICY_ERROR_MARKERS = (
     "内容安全",
+    "内容政策",
     "安全策略",
     "提示已被",
+    "可能违反",
+    "违反了我们的内容政策",
     "content policy",
     "content_policy",
     "safety policy",
@@ -261,6 +264,10 @@ def _public_task(
         item["data"] = task.get("data")
     if task.get("usage") is not None:
         item["usage"] = task.get("usage")
+    if task.get("cost") is not None:
+        item["cost"] = task.get("cost")
+    if task.get("upstream_task_id"):
+        item["upstream_task_id"] = task.get("upstream_task_id")
     if task.get("error"):
         item["error"] = task.get("error")
     if task.get("progress"):
@@ -286,7 +293,7 @@ def _public_task(
 
 
 def _monitoring_event_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {
+    event = {
         "id": task.get("id"),
         "owner_id": task.get("owner_id"),
         "status": task.get("status"),
@@ -301,6 +308,11 @@ def _monitoring_event_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if "cost" in task:
+        event["cost"] = task.get("cost")
+    if "upstream_task_id" in task:
+        event["upstream_task_id"] = task.get("upstream_task_id")
+    return event
 
 
 class ImageTaskService:
@@ -1336,6 +1348,8 @@ class ImageTaskService:
                     aspect_policy=aspect_policy,
                 )
             usage = result.get("usage")
+            cost = result.get("cost")
+            upstream_task_id = _clean(result.get("_media_task_id") or result.get("upstream_task_id"))
             stage_timings["save"] = max(0, int(stage_timings.get("save") or 0)) + int((time.time() - save_started) * 1000)
             duration_ms = int((time.time() - started) * 1000)
             if not self._update_task_unless_canceled(
@@ -1343,6 +1357,8 @@ class ImageTaskService:
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=usage,
+                cost=cost,
+                upstream_task_id=upstream_task_id,
                 error="",
                 duration_ms=duration_ms,
                 stage_timings_ms=stage_timings,
@@ -1450,6 +1466,8 @@ class ImageTaskService:
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 usage=result.get("usage"),
+                cost=result.get("cost"),
+                upstream_task_id=_clean(result.get("_media_task_id") or result.get("upstream_task_id")),
                 error="",
                 progress="completed",
                 duration_ms=duration_ms,
@@ -1678,6 +1696,10 @@ class ImageTaskService:
                 "duration_ms": item.get("duration_ms"),
                 "stage_timings_ms": item.get("stage_timings_ms") if isinstance(item.get("stage_timings_ms"), dict) else {},
             }
+            if item.get("cost") is not None:
+                task["cost"] = item.get("cost")
+            if item.get("upstream_task_id"):
+                task["upstream_task_id"] = _clean(item.get("upstream_task_id"))
             identity = item.get("identity")
             if isinstance(identity, dict):
                 task["identity"] = _identity_snapshot(identity)

@@ -189,6 +189,31 @@ class UserServiceTests(unittest.TestCase):
             self.assertTrue(next_token.startswith("bt-"))
             service.close()
 
+    def test_update_user_can_change_username_and_rejects_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            database_url = f"sqlite:///{Path(tmp_dir) / 'users.db'}"
+            service = UserService(database_url)
+            first = service.create_user(
+                username="first-user",
+                password="secret123",
+                name="First User",
+            )
+            service.create_user(
+                username="second-user",
+                password="secret123",
+                name="Second User",
+            )
+
+            updated = service.update_user(str(first["id"]), {"username": "renamed-user"})
+
+            self.assertIsNotNone(updated)
+            self.assertEqual(updated["username"], "renamed-user")
+            self.assertIsNone(service.authenticate_password("first-user", "secret123"))
+            self.assertEqual(service.authenticate_password("renamed-user", "secret123")[0]["id"], first["id"])
+            with self.assertRaisesRegex(ValueError, "用户名已存在"):
+                service.update_user(str(first["id"]), {"username": "second-user"})
+            service.close()
+
 
 if __name__ == "__main__":
     unittest.main()

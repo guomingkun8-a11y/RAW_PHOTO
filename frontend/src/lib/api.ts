@@ -68,6 +68,31 @@ export type SettingsConfig = {
     provider?: "oss";
     [key: string]: unknown;
   };
+  video_upload?: {
+    enabled?: boolean;
+    provider?: "oss";
+    [key: string]: unknown;
+  };
+  video_analysis?: {
+    enabled?: boolean;
+    queue_enabled?: boolean;
+    worker_concurrency?: number | string;
+    total_concurrency?: number | string;
+    owner_concurrency?: number | string;
+    owner_pending_limit?: number | string;
+    [key: string]: unknown;
+  };
+  video_generation?: {
+    enabled?: boolean;
+    queue_enabled?: boolean;
+    has_api_key?: boolean;
+    api_key_count?: number;
+    worker_concurrency?: number | string;
+    total_concurrency?: number | string;
+    owner_concurrency?: number | string;
+    owner_pending_limit?: number | string;
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 };
 
@@ -97,6 +122,8 @@ export type ImageTask = {
   progress?: string;
   elapsed_secs?: number;
   duration_ms?: number;
+  cost?: number;
+  upstream_task_id?: string;
   stage_timings_ms?: {
     upload?: number;
     queue?: number;
@@ -115,6 +142,43 @@ export type ImageTask = {
     running: number;
     queued: number;
   };
+};
+
+export type VideoGenerationTask = {
+  id: string;
+  status: "queued" | "running" | "success" | "error" | "canceled";
+  mode: "text_to_video" | "image_to_video" | string;
+  model?: string;
+  prompt?: string;
+  aspect_ratio?: string;
+  duration_secs?: number;
+  quality?: string;
+  resolution?: string;
+  image_urls?: string[];
+  created_at: string;
+  updated_at: string;
+  data?: Array<{
+    type?: "video" | string;
+    url?: string;
+    cover_url?: string;
+  }>;
+  video_url?: string;
+  cover_url?: string;
+  error?: string;
+  progress?: string;
+  elapsed_secs?: number;
+  duration_ms?: number;
+  cost?: number;
+  upstream_task_id?: string;
+  conversation_id?: string;
+  turn_id?: string;
+};
+
+export type VideoGenerationTaskListResponse = {
+  items: VideoGenerationTask[];
+  missing_ids: string[];
+  has_more?: boolean;
+  limit?: number;
 };
 
 export type AgentRunStatus = "pending" | "running" | "waiting_for_images" | "waiting_for_input" | "completed" | "failed" | "canceled";
@@ -304,9 +368,6 @@ export type ImageAgentResult = {
     imageGenerationCalls: number;
     estimatedInputChars?: number;
     estimatedOutputChars?: number;
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
   };
   folderId?: string;
   batchPlanId?: string;
@@ -418,6 +479,7 @@ export type ImageLibraryItem = {
   storage?: string;
   duration_ms?: number;
   favorite?: boolean;
+  reference_images?: MonitoringTaskReferenceImage[];
   deleted_at?: string;
   created_at: string;
 };
@@ -613,6 +675,9 @@ export type MonitoringUserStat = {
   success_count: number;
   failed_count: number;
   total_count: number;
+  cost_total?: number;
+  cost_count?: number;
+  cost_average?: number;
   queued_tasks: number;
   running_tasks: number;
   active_tasks: number;
@@ -680,11 +745,32 @@ export type MonitoringAgentQueueSummary = {
   ownerPendingLimit?: number;
 };
 
+export type MonitoringVideoGenerationQueueSummary = {
+  enabled: boolean;
+  available?: boolean;
+  error?: string;
+  queue_enabled?: boolean;
+  queue_depth?: number;
+  queued_tasks?: number;
+  running_tasks?: number;
+  active_workers?: number;
+  worker_concurrency?: number;
+  owner_concurrency?: number;
+  owner_pending_limit?: number;
+};
+
 export type MonitoringLatencySummary = {
   sample_size: number;
   average_ms: number;
   p95_ms: number;
   max_ms: number;
+};
+
+export type MonitoringModelStat = {
+  model: string;
+  cost_count: number;
+  cost_total: number;
+  cost_average: number;
 };
 
 export type MonitoringStageLatencySummary = {
@@ -699,13 +785,98 @@ export type MonitoringSummary = {
   active_sessions: number;
   total_success: number;
   total_failed: number;
+  total_cost?: number;
+  cost_count?: number;
+  models?: MonitoringModelStat[];
   total_users: number;
   online_window_minutes: number;
+  range: {
+    start_at: string;
+    end_at: string;
+    end_exclusive: boolean;
+  };
   task_queue: MonitoringQueueSummary;
   agent_queue?: MonitoringAgentQueueSummary;
+  video_generation_queue?: MonitoringVideoGenerationQueueSummary;
   task_latency: MonitoringLatencySummary;
   stage_latency: MonitoringStageLatencySummary;
   users: MonitoringUserStat[];
+};
+
+export type MonitoringTaskDetail = {
+  row_key: string;
+  source_type?: "image" | "event" | string;
+  task_id: string;
+  owner_id: string;
+  status: "success" | "error";
+  image_count: number;
+  mode: string;
+  model: string;
+  duration_ms: number;
+  cost?: number | null;
+  upstream_task_id?: string;
+  error: string;
+  completed_at: string;
+  image_url: string;
+  reference_images?: MonitoringTaskReferenceImage[];
+};
+
+export type MonitoringTaskReferenceImage = {
+  preview_url: string;
+  filename: string;
+  mime_type: string;
+  role?: string;
+  kind?: string;
+  rel?: string;
+};
+
+export type MonitoringTaskDetails = {
+  items: MonitoringTaskDetail[];
+  record_count: number;
+  image_count: number;
+  cost_total?: number;
+  cost_count?: number;
+  limit: number;
+  truncated: boolean;
+  range: MonitoringSummary["range"];
+  owner_id: string;
+  status: "all" | "success" | "error";
+};
+
+export type AgentVideoAsset = {
+  videoId: string;
+  conversationId?: string;
+  name: string;
+  filename?: string;
+  type: string;
+  mimeType?: string;
+  size: number;
+  fileSize?: number;
+  url: string;
+  sha256?: string;
+  cached?: boolean;
+  status?: string;
+  analysisStatus?: string;
+  analysisError?: string;
+  analysis?: Record<string, unknown>;
+  analysisStartedAt?: string;
+  analysisFinishedAt?: string;
+  analysisVersion?: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type AgentVideoUploadResponse = {
+  items: AgentVideoAsset[];
+  total: number;
+  uploaded: number;
+  cache_hits: number;
+  analysisQueueErrors?: Array<{ videoId: string; error: string }>;
+};
+
+export type AgentVideoStatusResponse = {
+  items: AgentVideoAsset[];
+  missing: string[];
 };
 
 export type ReferenceUploadItem = {
@@ -777,6 +948,13 @@ export async function uploadAvatar(file: File) {
   });
 }
 
+export async function updateCurrentUserProfile(body: { username?: string; name?: string }) {
+  return httpRequest<CurrentUserResponse>("/api/auth/profile", {
+    method: "PATCH",
+    body,
+  });
+}
+
 export async function logout() {
   return httpRequest<{ ok: boolean }>("/api/auth/logout", {
     method: "POST",
@@ -799,8 +977,33 @@ export async function fetchUsers() {
   return httpRequest<{ items: UserAccount[]; total: number }>(`/api/users?_t=${Date.now()}`);
 }
 
-export async function fetchMonitoringSummary() {
-  return httpRequest<MonitoringSummary>(`/api/monitoring/summary?_t=${Date.now()}`);
+export async function fetchMonitoringSummary(options: { startAt?: string; endAt?: string } = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.startAt) params.set("startAt", options.startAt);
+  if (options.endAt) params.set("endAt", options.endAt);
+  return httpRequest<MonitoringSummary>(`/api/monitoring/summary?${params.toString()}`);
+}
+
+export async function fetchMonitoringTasks(options: {
+  startAt?: string;
+  endAt?: string;
+  ownerId?: string;
+  status?: "all" | "success" | "error";
+  limit?: number;
+  includeReferences?: boolean;
+} = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.startAt) params.set("startAt", options.startAt);
+  if (options.endAt) params.set("endAt", options.endAt);
+  if (options.ownerId) params.set("ownerId", options.ownerId);
+  if (options.status) params.set("status", options.status);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.includeReferences) params.set("includeReferences", "1");
+  return httpRequest<MonitoringTaskDetails>(`/api/monitoring/tasks?${params.toString()}`);
+}
+
+export async function fetchVideoGenerationQueue() {
+  return httpRequest<MonitoringVideoGenerationQueueSummary>(`/api/video-generation/queue?_t=${Date.now()}`);
 }
 
 export async function createUser(body: {
@@ -868,6 +1071,7 @@ export async function startImageAgentRun(body: {
   turnId: string;
   folderId?: string;
   images?: Array<{ name: string; type: string; dataUrl?: string; url?: string; role?: "working_canvas" | "product_anchor" | "reference" | string }>;
+  videos?: AgentVideoAsset[];
   conversationContext?: Array<{
     userRequest: string;
     sceneName?: string;
@@ -883,6 +1087,32 @@ export async function startImageAgentRun(body: {
     method: "POST",
     body,
     timeout: 120_000,
+  });
+}
+
+export async function uploadAgentVideos(files: File[], conversationId = "") {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("videos", file, file.name));
+  if (conversationId) formData.append("conversation_id", conversationId);
+  return httpRequest<AgentVideoUploadResponse>("/api/image-agent/videos", {
+    method: "POST",
+    body: formData,
+    timeout: 600_000,
+  });
+}
+
+export async function fetchAgentVideoStatuses(ids: string[]) {
+  const uniqueIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean))).slice(0, 50);
+  if (!uniqueIds.length) return { items: [], missing: [] } as AgentVideoStatusResponse;
+  return httpRequest<AgentVideoStatusResponse>("/api/image-agent/videos/status", {
+    method: "POST",
+    body: { ids: uniqueIds },
+  });
+}
+
+export async function retryAgentVideoAnalysis(videoId: string) {
+  return httpRequest<{ item: AgentVideoAsset }>(`/api/image-agent/videos/${encodeURIComponent(videoId)}/retry-analysis`, {
+    method: "POST",
   });
 }
 
@@ -1277,6 +1507,69 @@ export async function cancelImageTask(taskId: string) {
   });
 }
 
+export async function createVideoGenerationTask(body: {
+  clientTaskId: string;
+  prompt: string;
+  model: string;
+  mode?: "text_to_video" | "image_to_video";
+  aspectRatio?: string;
+  durationSecs?: number;
+  quality?: string;
+  resolution?: string;
+  imageUrls?: string[];
+  params?: Record<string, unknown>;
+  conversationId?: string;
+  turnId?: string;
+}) {
+  return httpRequest<VideoGenerationTask>("/api/video-generation/tasks", {
+    method: "POST",
+    body: {
+      client_task_id: body.clientTaskId,
+      prompt: body.prompt,
+      model: body.model,
+      mode: body.mode || (body.imageUrls?.length ? "image_to_video" : "text_to_video"),
+      aspect_ratio: body.aspectRatio || "16:9",
+      duration_secs: body.durationSecs || 5,
+      quality: body.quality || "standard",
+      resolution: body.resolution || "",
+      image_urls: body.imageUrls || [],
+      params: body.params || {},
+      conversation_id: body.conversationId || "",
+      turn_id: body.turnId || "",
+    },
+  });
+}
+
+export async function fetchVideoGenerationTasks(ids: string[] = []) {
+  const uniqueIds = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
+  if (!uniqueIds.length) {
+    return httpRequest<VideoGenerationTaskListResponse>(`/api/video-generation/tasks?_t=${Date.now()}`);
+  }
+  const chunkSize = 100;
+  const chunks = Array.from(
+    { length: Math.ceil(uniqueIds.length / chunkSize) },
+    (_, index) => uniqueIds.slice(index * chunkSize, (index + 1) * chunkSize),
+  );
+  const responses = await Promise.all(
+    chunks.map((chunk) =>
+      httpRequest<VideoGenerationTaskListResponse>("/api/video-generation/tasks/query", {
+        method: "POST",
+        body: { ids: chunk },
+      }),
+    ),
+  );
+  return {
+    items: responses.flatMap((response) => response.items),
+    missing_ids: responses.flatMap((response) => response.missing_ids),
+  } as VideoGenerationTaskListResponse;
+}
+
+export async function cancelVideoGenerationTask(taskId: string) {
+  return httpRequest<VideoGenerationTask>(`/api/video-generation/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: "POST",
+  });
+}
+
 export async function reportImageFailure(body: {
   taskId: string;
   failureReportId?: string;
@@ -1345,6 +1638,7 @@ export async function fetchImageLibrary(options: {
   favorite?: boolean;
   allOwners?: boolean;
   ownerId?: string;
+  includeReferences?: boolean;
 } = {}) {
   const {
     limit = 80,
@@ -1356,6 +1650,7 @@ export async function fetchImageLibrary(options: {
     favorite = false,
     allOwners = false,
     ownerId = "",
+    includeReferences = false,
   } = options;
   const params = new URLSearchParams({
     limit: String(limit),
@@ -1383,6 +1678,9 @@ export async function fetchImageLibrary(options: {
   }
   if (ownerId.trim()) {
     params.set("owner_id", ownerId.trim());
+  }
+  if (includeReferences) {
+    params.set("includeReferences", "1");
   }
   return httpRequest<ImageLibraryResponse>(`/api/image-library?${params.toString()}`);
 }

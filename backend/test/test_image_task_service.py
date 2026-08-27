@@ -119,6 +119,30 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
 
+    def test_generation_result_cost_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def handler(_payload):
+                return {
+                    "data": [{"url": "http://example.test/image.png"}],
+                    "cost": 1.25,
+                    "_media_task_id": "upstream-task-1",
+                }
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="cost-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            task = wait_for_task(service, OWNER, "cost-task", "success")
+
+            self.assertEqual(task["cost"], 1.25)
+            self.assertEqual(task["upstream_task_id"], "upstream-task-1")
+
     def test_queue_priority_is_persisted_and_forwarded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             queue = MemoryTaskQueue()
@@ -356,6 +380,43 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "error")
             self.assertIn("内容安全策略", result["error"])
+            self.assertEqual(result.get("attempts"), 0)
+            self.assertEqual(calls, 1)
+            self.assertEqual(queue.items, [])
+
+    def test_queue_mode_does_not_retry_generated_image_policy_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                raise RuntimeError(
+                    "502: {'error': 'media generation failed: 非常抱歉，生成的图片可能违反了我们的内容政策。"
+                    "如果你认为此判断有误，请重试或修改提示语。'}"
+                )
+
+            queue = MemoryTaskQueue()
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler,
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 3,
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="generated-policy-task",
+                prompt="生成我的世界",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+
+            result = service.work_once()
+
+            self.assertEqual(result["status"], "error")
+            self.assertIn("内容政策", result["error"])
             self.assertEqual(result.get("attempts"), 0)
             self.assertEqual(calls, 1)
             self.assertEqual(queue.items, [])
@@ -1034,7 +1095,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             def handler(payload):
                 self.assertNotIn("Product subject preservation mode", payload["prompt"])
                 self.assertIn("标准 Prompt 约束", payload["prompt"])
-                self.assertIn("不得覆盖本轮明确修改要求", payload["prompt"])
+                self.assertIn("按用户要求修改背景", payload["prompt"])
                 self.assertEqual(payload["mask"], [])
                 return {"data": [{"url": "http://example.test/standard-scene.png"}]}
 
@@ -1067,7 +1128,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             def handler(payload):
                 seen_payloads.append(payload)
                 self.assertNotIn("Product subject preservation mode", payload["prompt"])
-                self.assertIn("允许严格按照用户原始提示修改商品", payload["prompt"])
+                self.assertIn("按用户原始提示修改明确指定的商品", payload["prompt"])
                 self.assertEqual(payload["mask"], [])
                 return {"data": [{"url": "http://example.test/product-style.png"}]}
 

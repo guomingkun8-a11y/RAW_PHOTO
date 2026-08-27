@@ -139,7 +139,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as post,
         ):
             result = openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "make it brighter",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "mask": [(b"mask-bytes", "mask.png", "image/png")],
@@ -150,7 +150,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(result["data"][0]["url"], "https://example.test/image.png")
         self.assertEqual(post.call_args.args[0], "https://relay.example/v1/images/edits")
         self.assertNotIn("files", post.call_args.kwargs)
-        self.assertEqual(post.call_args.kwargs["data"]["model"], "gpt-image-2")
+        self.assertEqual(post.call_args.kwargs["data"]["model"], "openai-image-test")
         self.assertPromptEngineered(post.call_args.kwargs["data"]["prompt"], "make it brighter", has_reference=True)
         self.assertIs(post.call_args.kwargs["multipart"], FakeCurlMime.instances[0])
         self.assertTrue(FakeCurlMime.instances[0].closed)
@@ -184,7 +184,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as post,
         ):
             openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "plain product photo",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "prompt_engine_mode": "standard",
@@ -206,7 +206,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as post,
         ):
             openai_relay_service.image_generations({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "生成一张香水商品主图",
                 "prompt_engine_mode": "professional",
             })
@@ -232,7 +232,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as post,
         ):
             result = openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "make it brighter",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "response_format": "url",
@@ -242,7 +242,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(post.call_args_list[0].args[0], "https://relay.example/v1/images/edits")
         self.assertEqual(post.call_args_list[1].args[0], "https://relay.example/v1/images/generations")
         fallback_json = post.call_args_list[1].kwargs["json"]
-        self.assertEqual(fallback_json["model"], "gpt-image-2")
+        self.assertEqual(fallback_json["model"], "openai-image-test")
         self.assertPromptEngineered(fallback_json["prompt"], "make it brighter", has_reference=True)
         self.assertEqual(fallback_json["response_format"], "url")
         self.assertEqual(fallback_json["images"], ["data:image/png;base64,aW1hZ2UtYnl0ZXM="])
@@ -262,7 +262,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as post,
         ):
             result = openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "make it brighter",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "image_urls": ["https://cdn.example.test/input.png"],
@@ -296,7 +296,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ),
         ):
             result = openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "make it brighter",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "image_urls": ["https://cdn.example.test/input.png"],
@@ -306,7 +306,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(result["data"][0]["url"], "https://example.test/lingke.png")
         post.assert_called_once()
         self.assertEqual(post.call_args.args[0], "https://api.lingkeai.ai/v1/images/edits")
-        self.assertEqual(post.call_args.kwargs["data"]["model"], "gpt-image-2")
+        self.assertEqual(post.call_args.kwargs["data"]["model"], "openai-image-test")
         self.assertPromptEngineered(post.call_args.kwargs["data"]["prompt"], "make it brighter", has_reference=True)
         self.assertIs(post.call_args.kwargs["multipart"], FakeCurlMime.instances[0])
 
@@ -334,7 +334,7 @@ class OpenAIRelayServiceTests(unittest.TestCase):
             ) as upload_images,
         ):
             result = openai_relay_service.image_edits({
-                "model": "gpt-image-2",
+                "model": "openai-image-test",
                 "prompt": "make it brighter",
                 "images": [(b"image-bytes", "input.png", "image/png")],
                 "response_format": "url",
@@ -383,12 +383,196 @@ class OpenAIRelayServiceTests(unittest.TestCase):
 
         self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/nano.png")
         self.assertEqual(post.call_args.args[0], "https://relay.example/v1/media/generate")
-        self.assertEqual(post.call_args.kwargs["json"]["model"], "gemini-3.1-flash-image-preview")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "banana-2")
         self.assertEqual(post.call_args.kwargs["json"]["params"]["aspectRatio"], "1:1")
         self.assertEqual(post.call_args.kwargs["json"]["params"]["imageSize"], "1K")
-        self.assertEqual(get.call_args.args[0], "https://relay.example/v1/skills/task-status")
+        self.assertEqual(get.call_args.args[0], "https://relay.example/v1/media/status")
         self.assertEqual(get.call_args.kwargs["params"], {"task_id": "12345"})
         self.assertEqual(progress_steps, ["image_stream_resolve_start"])
+
+    def test_media_image_model_returns_status_cost(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "cost-task"}}),
+            ),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                return_value=FakeResponse(payload={
+                    "data": {
+                        "is_final": True,
+                        "status": "success",
+                        "result_url": "https://cdn.example.test/cost.png",
+                        "cost": "1.25",
+                    }
+                }),
+            ) as get,
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "gemini-3.1-flash-image-preview",
+                "prompt": "cat",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/cost.png")
+        self.assertEqual(result["cost"], 1.25)
+        self.assertEqual(result["_media_task_id"], "cost-task")
+        self.assertEqual(get.call_args.args[0], "https://relay.example/v1/media/status")
+
+    def test_gpt_image_2_uses_tt_image_2_media_task_api_and_returns_cost(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "official-task"}}),
+            ) as post,
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                return_value=FakeResponse(payload={
+                    "task_id": "official-task",
+                    "is_final": True,
+                    "state": "success",
+                    "progress": "100%",
+                    "result_url": "https://cdn.example.test/gpt-image-2.png",
+                    "cost": 0.23,
+                }),
+            ) as get,
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "gpt-image-2",
+                "prompt": "cat",
+                "image_urls": ["https://cdn.example.test/reference.png"],
+                "n": 1,
+                "quality": "auto",
+                "size": "auto",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/gpt-image-2.png")
+        self.assertEqual(result["cost"], 0.23)
+        self.assertEqual(result["_media_task_id"], "official-task")
+        self.assertEqual(post.call_args.args[0], "https://relay.example/v1/media/generate")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "tt-image-2")
+        self.assertEqual(payload["params"]["images"], ["https://cdn.example.test/reference.png"])
+        self.assertEqual(payload["params"]["n"], 1)
+        self.assertEqual(payload["params"]["quality"], "auto")
+        self.assertEqual(payload["params"]["size"], "auto")
+        self.assertEqual(get.call_args.args[0], "https://relay.example/v1/media/status")
+        self.assertEqual(get.call_args.kwargs["params"], {"task_id": "official-task"})
+
+    def test_banana_2_uses_media_task_api_and_returns_cost(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "banana-task"}}),
+            ) as post,
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                return_value=FakeResponse(payload={
+                    "data": {
+                        "is_final": True,
+                        "state": "success",
+                        "result_url": "https://cdn.example.test/banana-2.png",
+                        "cost": "0.66",
+                    }
+                }),
+            ),
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "banana-2",
+                "prompt": "cat",
+                "size": "1024x1024",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/banana-2.png")
+        self.assertEqual(result["cost"], 0.66)
+        self.assertEqual(result["_media_task_id"], "banana-task")
+        self.assertEqual(post.call_args.args[0], "https://relay.example/v1/media/generate")
+        self.assertEqual(post.call_args.kwargs["json"]["model"], "banana-2")
+
+    def test_media_image_model_returns_nested_status_cost(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "nested-cost-task"}}),
+            ),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                return_value=FakeResponse(payload={
+                    "data": {
+                        "is_final": True,
+                        "status": "success",
+                        "result": {
+                            "result_url": "https://cdn.example.test/nested-cost.png",
+                            "billing": {"cost": "2.75"},
+                        },
+                    }
+                }),
+            ),
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "gemini-3.1-flash-image-preview",
+                "prompt": "cat",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/nested-cost.png")
+        self.assertEqual(result["cost"], 2.75)
+
+    def test_non_media_generation_promotes_nested_response_cost(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={
+                    "created": 1,
+                    "data": [{"url": "https://example.test/image.png"}],
+                    "usage": {"cost": "0.42"},
+                }),
+            ),
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "openai-image-test",
+                "prompt": "cat",
+            })
+
+        self.assertEqual(result["cost"], 0.42)
+
+    def test_media_status_falls_back_to_legacy_task_status(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "legacy-task"}}),
+            ),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                side_effect=[
+                    FakeResponse(status_code=404, payload={"error": {"message": "missing"}}),
+                    FakeResponse(payload={"data": {"is_final": True, "status": "success", "result_url": "https://cdn.example.test/legacy.png"}}),
+                ],
+            ) as get,
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "gemini-3.1-flash-image-preview",
+                "prompt": "cat",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/legacy.png")
+        self.assertEqual(get.call_args_list[0].args[0], "https://relay.example/v1/media/status")
+        self.assertEqual(get.call_args_list[1].args[0], "https://relay.example/v1/skills/task-status")
 
     def test_seedream_image_model_uses_media_task_api(self):
         with (
@@ -417,8 +601,10 @@ class OpenAIRelayServiceTests(unittest.TestCase):
 
     def test_relay_media_image_models_use_media_task_api(self):
         models = [
+            "banana-2",
             "vidu-image-2",
             "mj_imagine",
+            "tt-image-2",
             "wan2.7-image",
             "kling-v3-omni",
             "qwen-image",

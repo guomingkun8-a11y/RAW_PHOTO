@@ -14,6 +14,42 @@ import services.image.image_library_service as image_library_service
 
 
 class ImageLibraryServiceTests(unittest.TestCase):
+    def test_task_reference_images_returns_all_stored_images(self):
+        task = {
+            "payload": {
+                "images": [
+                    {"url": f"https://cdn.example.test/stored-{index}.png"}
+                    for index in range(6)
+                ],
+                "image_urls": [
+                    f"https://cdn.example.test/original-{index}.png"
+                    for index in range(6)
+                ],
+            }
+        }
+
+        references = image_library_service._task_reference_images(task, base_url="http://app.test")
+
+        self.assertEqual(len(references), 6)
+        self.assertEqual(references[0]["preview_url"], "https://cdn.example.test/stored-0.png")
+        self.assertEqual(references[-1]["preview_url"], "https://cdn.example.test/stored-5.png")
+
+    def test_task_reference_images_falls_back_to_all_urls(self):
+        task = {
+            "payload": {
+                "images": [],
+                "image_urls": [
+                    f"https://cdn.example.test/reference-{index}.png"
+                    for index in range(7)
+                ],
+            }
+        }
+
+        references = image_library_service._task_reference_images(task, base_url="http://app.test")
+
+        self.assertEqual(len(references), 7)
+        self.assertEqual(references[-1]["preview_url"], "https://cdn.example.test/reference-6.png")
+
     def row(self):
         return SimpleNamespace(
             id=1,
@@ -201,6 +237,39 @@ class ImageLibraryServiceTests(unittest.TestCase):
 
                 self.assertEqual(result["total"], 1)
                 self.assertEqual([item["task_id"] for item in result["items"]], ["own-task"])
+            finally:
+                service.engine.dispose()
+
+    def test_list_images_can_include_task_reference_images(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = image_library_service.ImageLibraryService(f"sqlite:///{Path(tmp_dir) / 'library.db'}")
+            try:
+                self.insert_image(service, image_id=1, task_id="task-with-reference", owner_id="user-1")
+                reference_images = [
+                    {
+                        "preview_url": "https://example.test/reference.png",
+                        "filename": "reference.png",
+                        "mime_type": "image/png",
+                        "role": "",
+                        "kind": "url",
+                        "rel": "",
+                    }
+                ]
+
+                with mock.patch.object(
+                    image_library_service,
+                    "_reference_images_for_library_items",
+                    return_value={("user-1", "task-with-reference"): reference_images},
+                ) as reference_loader:
+                    result = service.list_images(
+                        identity={"id": "admin-1", "role": "admin"},
+                        base_url="http://app.test",
+                        include_all_owners=True,
+                        include_references=True,
+                    )
+
+                reference_loader.assert_called_once()
+                self.assertEqual(result["items"][0]["reference_images"], reference_images)
             finally:
                 service.engine.dispose()
 

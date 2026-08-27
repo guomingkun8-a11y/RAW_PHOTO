@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
+from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Iterator
 
 from curl_cffi import requests
 from fastapi import HTTPException
@@ -13,10 +15,21 @@ from services.platform.proxy_service import proxy_settings
 
 
 REQUEST_TIMEOUT_SECONDS = 120
-MAX_REFERENCE_IMAGES = 4
+MAX_REFERENCE_IMAGES = 6
 MAX_IMAGE_DATA_URL_CHARS = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_DATA_URL_CHARS = 24 * 1024 * 1024
-DEFAULT_PROMPT_ANALYSIS_MODEL = "gpt-4o"
+DEFAULT_PROMPT_ANALYSIS_MODEL = "gpt-5.6-sol"
+CHAT_MODEL_ALIASES = {
+    "gpt-5.6-sol": "tt-5.6-sol",
+}
+LEGACY_CHAT_MODEL_ALIASES = {
+    "gpt-4o": DEFAULT_PROMPT_ANALYSIS_MODEL,
+    "gpt4o": DEFAULT_PROMPT_ANALYSIS_MODEL,
+}
+MULTI_IMAGE_REQUEST_RE = re.compile(
+    r"(?:[2-9]|1\d|[二两三四五六七八九十])\s*(?:张|幅|款|版|组|个)|"
+    r"多张|几张|多幅|几幅|多款|几款|多个版本|多种场景|不同场景|不同卖点|不同版本|不同风格"
+)
 
 
 def _relay_settings() -> dict[str, object]:
@@ -58,20 +71,91 @@ def _relay_url(path: str) -> str:
 
 
 def _relay_headers() -> dict[str, str]:
+    headers = _relay_auth_headers()
+    headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _relay_auth_headers() -> dict[str, str]:
     relay = _active_relay_settings()
     api_key = str(relay.get("api_key") or "").strip()
     if not api_key:
         raise HTTPException(status_code=500, detail={"error": "openai_relay.api_key is required"})
-    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {api_key}"}
 
 
 def _prompt_analysis_model(model: str = "") -> str:
     relay = _relay_settings()
-    return str(model or relay.get("prompt_analysis_model") or DEFAULT_PROMPT_ANALYSIS_MODEL).strip()
+    selected = str(model or relay.get("prompt_analysis_model") or DEFAULT_PROMPT_ANALYSIS_MODEL).strip()
+    return LEGACY_CHAT_MODEL_ALIASES.get(selected.lower(), selected)
 
 
 def prompt_analysis_model(model: str = "") -> str:
     return _prompt_analysis_model(model)
+
+
+def upstream_chat_model(model: object) -> str:
+    value = str(model or "").strip()
+    normalized = value.lower()
+    return CHAT_MODEL_ALIASES.get(normalized, value)
+
+
+def is_reasoning_chat_model(model: object) -> bool:
+    value = str(model or "").strip().lower()
+    return value.startswith("gpt-5") or value.startswith(("o1", "o3", "o4"))
+
+
+def _normalize_response_cost(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) and number >= 0 else None
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        matched = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not matched:
+            return None
+        try:
+            number = float(matched.group(0))
+        except ValueError:
+            return None
+        return number if math.isfinite(number) and number >= 0 else None
+    return None
+
+
+def _iter_response_cost_candidates(value: object) -> Iterator[object]:
+    if isinstance(value, dict):
+        if "cost" in value:
+            yield value.get("cost")
+        for key in ("data", "result", "usage", "meta", "metadata", "billing"):
+            nested = value.get(key)
+            if nested is value:
+                continue
+            yield from _iter_response_cost_candidates(nested)
+        return
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_response_cost_candidates(item)
+
+
+def response_cost(data: object) -> float | None:
+    for candidate in _iter_response_cost_candidates(data):
+        cost = _normalize_response_cost(candidate)
+        if cost is not None:
+            return cost
+    return None
+
+
+def _chat_payload_model(model: str) -> str:
+    return upstream_chat_model(model)
+
+
+def _apply_sampling_params(payload: dict[str, Any], *, model: str, temperature: float) -> None:
+    if not is_reasoning_chat_model(model):
+        payload["temperature"] = temperature
 
 
 def validate_reference_images(
@@ -191,15 +275,15 @@ def request_json_completion(
     temperature: float = 0.2,
 ) -> dict[str, Any]:
     payload = {
-        "model": model,
+        "model": _chat_payload_model(model),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
-        "temperature": temperature,
         "max_tokens": max(256, min(8000, int(max_tokens))),
         "response_format": {"type": "json_object"},
     }
+    _apply_sampling_params(payload, model=model, temperature=temperature)
     try:
         data = _chat_completion(payload)
     except HTTPException as exc:
@@ -219,16 +303,75 @@ def request_text_completion(
     temperature: float = 0.3,
 ) -> str:
     payload = {
-        "model": model,
+        "model": _chat_payload_model(model),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
-        "temperature": temperature,
         "max_tokens": max(256, min(8000, int(max_tokens))),
     }
+    _apply_sampling_params(payload, model=model, temperature=temperature)
     data = _chat_completion(payload)
     return _extract_message_content(data)
+
+
+def _audio_transcription_once(payload: dict[str, Any]) -> dict[str, Any]:
+    file_path = Path(str(payload["file_path"]))
+    with file_path.open("rb") as handle:
+        response = requests.post(
+            _relay_url("/v1/audio/transcriptions"),
+            headers=_relay_auth_headers(),
+            data={
+                "model": str(payload.get("model") or "whisper-1"),
+                "response_format": "json",
+                **({"prompt": str(payload.get("prompt") or "")} if payload.get("prompt") else {}),
+            },
+            files={"file": (file_path.name, handle, str(payload.get("mime_type") or "audio/mpeg"))},
+            timeout=int(payload.get("timeout") or REQUEST_TIMEOUT_SECONDS),
+            **proxy_settings.build_session_kwargs(),
+        )
+    if 200 <= response.status_code < 300:
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": "audio transcription response is not JSON"}) from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=502, detail={"error": "audio transcription response is not a JSON object"})
+        return data
+    try:
+        detail = response.json()
+    except Exception:
+        detail = {"error": {"message": str(response.text or "")[:500] or f"HTTP {response.status_code}"}}
+    raise HTTPException(status_code=response.status_code, detail=detail)
+
+
+def request_audio_transcription(
+    *,
+    model: str,
+    file_path: str | Path,
+    prompt: str = "",
+    mime_type: str = "audio/mpeg",
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> str:
+    payload = {
+        "model": str(model or "whisper-1").strip() or "whisper-1",
+        "file_path": str(file_path),
+        "prompt": prompt,
+        "mime_type": mime_type,
+        "timeout": timeout,
+    }
+    data = run_with_relay_pool(
+        _relay_settings(),
+        "audio_transcription",
+        lambda: _audio_transcription_once(payload),
+    )
+    text = data.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    segments = data.get("segments")
+    if isinstance(segments, list):
+        return "\n".join(str(item.get("text") or "").strip() for item in segments if isinstance(item, dict)).strip()
+    return ""
 
 
 def _normalize_result(parsed: dict[str, Any], model: str) -> dict[str, Any]:
@@ -258,6 +401,10 @@ def _normalize_result(parsed: dict[str, Any], model: str) -> dict[str, Any]:
     }
 
 
+def _has_multi_image_request(prompt: str) -> bool:
+    return bool(MULTI_IMAGE_REQUEST_RE.search(str(prompt or "")))
+
+
 def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
     if not _relay_settings().get("enabled"):
         raise HTTPException(status_code=400, detail={"error": "openai_relay is not enabled"})
@@ -278,17 +425,23 @@ def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
         "category": str(product.get("category") or "").strip(),
         "selling_points": str(product.get("selling_points") or product.get("sellingPoints") or "").strip(),
     }
+    multi_image_request = _has_multi_image_request(prompt)
 
     user_text = {
         "task": "Analyze reference product images and produce ecommerce prompt guidance.",
         "action": action,
         "current_prompt": prompt,
         "product_context": product_context,
+        "multi_image_request": multi_image_request,
         "requirements": [
             "Identify the visible product subject, material, package structure, logo/text areas, composition, lighting, and style.",
             "Do not invent claims that are not visible or provided in product_context.",
             "Preserve product shape, package text, logo, layout, and core identity in the optimized prompt.",
             "Return Chinese copy suitable for an AI ecommerce image generation tool.",
+            "If multi_image_request is true, optimizedPrompt must contain a numbered list of separate image directions matching the requested count when clear, or 4 directions when the count is unclear.",
+            "Each numbered direction must derive its selling point, scene, and visible copy from the current product evidence, reference images, product_context, and user text.",
+            "Do not use a fixed cross-category default set of selling points; never hard-code cleaning-power, drying-speed, gentleness, fragrance, or usage-scenario claims unless visible or provided.",
+            "For multi_image_request, write each numbered item as 场景一/场景二 or 设计1/设计2 so downstream can assign one item to each image.",
         ],
         "json_schema": {
             "analysis": {
@@ -324,7 +477,7 @@ def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
         })
 
     payload = {
-        "model": model,
+        "model": _chat_payload_model(model),
         "messages": [
             {
                 "role": "system",
@@ -335,10 +488,10 @@ def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
                 "content": content,
             },
         ],
-        "temperature": 0.2,
         "max_tokens": 1800,
         "response_format": {"type": "json_object"},
     }
+    _apply_sampling_params(payload, model=model, temperature=0.2)
 
     try:
         data = _chat_completion(payload)

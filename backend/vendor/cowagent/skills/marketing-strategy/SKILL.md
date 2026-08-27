@@ -5,9 +5,14 @@ description: Build ecommerce marketing copy, differentiated selling points, and 
 
 # RAW Marketing Strategy
 
-Use `raw_marketing_strategy` only when the current request involves ecommerce main images, carousel images, detail pages, visible copy, typography, selling points, marketing, conversion, differentiation, posters, banners, or ad creatives.
+Use `raw_marketing_strategy` only when the current request explicitly asks for visible copy, typography, headlines, selling points, marketing copy, conversion messaging, or differentiation messaging.
+
+Do not use `raw_marketing_strategy` just because the output is an ecommerce main image, carousel image, detail page, poster, banner, or ad creative.
+
+Do not use `raw_marketing_strategy` when the latest user asks for no text, no copy, remove text, or no typography. That instruction overrides any previous proposal, memory, template reference, or working canvas.
 
 Do not use this skill for simple background replacement, color adjustment, ratio change, retouching, or non-commercial visual edits.
+Do not use this skill to recover, rewrite, or preserve overlay text from a previous generated image when the latest user asked to remove text.
 
 ## Workflow
 

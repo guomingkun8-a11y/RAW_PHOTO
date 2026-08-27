@@ -75,6 +75,12 @@ class ImageConversationServiceTests(unittest.TestCase):
                                     "name": "ref.png",
                                     "type": "image/png",
                                     "dataUrl": "data:image/png;base64," + ("a" * 4096),
+                                },
+                                {
+                                    "name": "uploaded-ref.png",
+                                    "type": "image/png",
+                                    "url": "https://example.test/uploads/uploaded-ref.png",
+                                    "dataUrl": "data:image/png;base64," + ("b" * 4096),
                                 }
                             ],
                             "images": [
@@ -105,6 +111,10 @@ class ImageConversationServiceTests(unittest.TestCase):
                 self.assertNotIn("b64_json", json.dumps(stored))
                 self.assertNotIn("dataUrl", json.dumps(stored))
                 self.assertEqual(turn["images"][0]["url"], "http://app.test/images/result.png")
+                self.assertEqual(
+                    turn["referenceImages"][1]["url"],
+                    "https://example.test/uploads/uploaded-ref.png",
+                )
             finally:
                 service.engine.dispose()
 

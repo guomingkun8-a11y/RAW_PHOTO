@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ListChecks, MessageSquarePlus, Pencil, Search, Sparkles, Trash2, X } from "@lucide/vue";
+import { ChevronLeft, ChevronRight, ListChecks, MessageSquarePlus, Pencil, Search, Sparkles, Trash2, X } from "@lucide/vue";
 import { computed, nextTick, ref, watch } from "vue";
 
+import { extractUserDisplayPrompt } from "@/lib/prompt-display";
 import { getImageConversationStats, type ImageConversation } from "@/stores/image-conversations";
 
 const props = defineProps<{
@@ -24,23 +25,37 @@ const editingId = ref<string | null>(null);
 const editingTitle = ref("");
 const editInput = ref<HTMLInputElement | null>(null);
 const searchQuery = ref("");
+const currentPage = ref(1);
 const selectionMode = ref(false);
 const selectedIds = ref<Set<string>>(new Set());
+const HISTORY_PAGE_SIZE = 20;
 const filteredConversations = computed(() => {
   const query = searchQuery.value.trim().toLocaleLowerCase("zh-CN");
   if (!query) return props.conversations;
   return props.conversations.filter((conversation) => {
-    const prompts = conversation.turns.map((turn) => turn.sourcePrompt || turn.prompt).join(" ");
+    const prompts = conversation.turns.map((turn) => turnDisplayPrompt(turn)).join(" ");
     return `${conversation.title} ${prompts}`.toLocaleLowerCase("zh-CN").includes(query);
   });
 });
 const filteredConversationIds = computed(() => filteredConversations.value.map((conversation) => conversation.id));
+const totalPages = computed(() => Math.max(1, Math.ceil(filteredConversations.value.length / HISTORY_PAGE_SIZE)));
+const pageStart = computed(() => filteredConversations.value.length ? (currentPage.value - 1) * HISTORY_PAGE_SIZE + 1 : 0);
+const pageEnd = computed(() => Math.min(currentPage.value * HISTORY_PAGE_SIZE, filteredConversations.value.length));
+const paginatedConversations = computed(() =>
+  filteredConversations.value.slice(
+    (currentPage.value - 1) * HISTORY_PAGE_SIZE,
+    currentPage.value * HISTORY_PAGE_SIZE,
+  ),
+);
 const selectedCount = computed(() => selectedIds.value.size);
 const allFilteredSelected = computed(() => (
   filteredConversationIds.value.length > 0
   && filteredConversationIds.value.every((id) => selectedIds.value.has(id))
 ));
 
+function turnDisplayPrompt(turn: ImageConversation["turns"][number]) {
+  return turn.sourcePrompt || extractUserDisplayPrompt(turn.prompt) || turn.prompt;
+}
 async function startRename(conversation: ImageConversation) {
   selectionMode.value = false;
   selectedIds.value = new Set();
@@ -60,7 +75,7 @@ function matchingSnippet(conversation: ImageConversation) {
   const query = searchQuery.value.trim().toLocaleLowerCase("zh-CN");
   if (!query || conversation.title.toLocaleLowerCase("zh-CN").includes(query)) return "";
   const match = conversation.turns
-    .map((turn) => turn.sourcePrompt || turn.prompt)
+    .map((turn) => turnDisplayPrompt(turn))
     .find((prompt) => prompt.toLocaleLowerCase("zh-CN").includes(query));
   if (!match) return "";
   const compact = match.replace(/\s+/g, " ").trim();
@@ -106,6 +121,15 @@ function requestDeleteSelected() {
   emit("deleteMany", ids);
   cancelSelectionMode();
 }
+function goToPage(page: number) {
+  currentPage.value = Math.min(totalPages.value, Math.max(1, page));
+}
+watch(searchQuery, () => {
+  currentPage.value = 1;
+});
+watch(totalPages, (pages) => {
+  if (currentPage.value > pages) currentPage.value = pages;
+});
 watch(() => props.conversations.map((conversation) => conversation.id).join("|"), () => {
   const existingIds = new Set(props.conversations.map((conversation) => conversation.id));
   selectedIds.value = new Set(Array.from(selectedIds.value).filter((id) => existingIds.has(id)));
@@ -155,20 +179,24 @@ watch(() => props.conversations.map((conversation) => conversation.id).join("|")
         </button>
       </label>
       <div class="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-        <div v-if="loading" class="space-y-3"><div v-for="index in 4" :key="index" class="studio-skeleton h-[86px] rounded-2xl" /></div>
+        <div v-if="loading" class="space-y-3">
+          <div class="rounded-xl bg-[#F8FAFC] px-3 py-2 text-xs text-slate-500 dark:bg-white/[0.04] dark:text-stone-400">正在读取历史记录...</div>
+          <div v-for="index in 5" :key="index" class="studio-skeleton h-[86px] rounded-2xl" />
+        </div>
         <div v-else-if="!conversations.length" class="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-5 text-sm leading-6 text-slate-500 dark:border-white/10 dark:bg-white/[0.04]"><div class="mb-3 flex size-10 items-center justify-center rounded-xl bg-[#4F7CFF]/10 text-[#4F7CFF]"><Sparkles class="size-5" /></div>还没有生成记录。提交第一个任务后，这里会沉淀历史、状态和可复用配置。</div>
         <div v-else-if="!filteredConversations.length" class="px-4 py-8 text-center text-sm text-slate-500 dark:text-stone-400">没有找到匹配的历史对话</div>
         <article
-          v-for="conversation in filteredConversations"
+          v-for="(conversation, index) in paginatedConversations"
           v-else
           :key="conversation.id"
-          class="group relative w-full rounded-xl border py-3.5 text-left transition"
+          class="history-panel-item group relative w-full rounded-xl border py-3.5 text-left transition"
           :class="[
             selectionMode ? 'px-4 pl-11' : 'px-4',
             isSelected(conversation.id) || conversation.id === selectedId
               ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-slate-950 dark:text-white'
               : 'border-black/[0.06] bg-white text-slate-700 hover:border-[#4F7CFF]/20 dark:border-white/10 dark:bg-white/[0.04] dark:text-stone-200',
           ]"
+          :style="{ '--history-row-index': index }"
         >
           <input
             v-if="selectionMode"
@@ -199,6 +227,57 @@ watch(() => props.conversations.map((conversation) => conversation.id).join("|")
           </div>
         </article>
       </div>
+      <div v-if="!loading && filteredConversations.length" class="flex shrink-0 flex-col gap-3 border-t border-black/[0.06] pt-3 text-xs text-slate-500 dark:border-white/10 dark:text-stone-400 sm:flex-row sm:items-center sm:justify-between">
+        <span>
+          显示 {{ pageStart }}-{{ pageEnd }} / {{ filteredConversations.length }} 条，每页 20 条
+        </span>
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            class="studio-button inline-flex size-9 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300"
+            :disabled="currentPage <= 1"
+            aria-label="上一页"
+            @click="goToPage(currentPage - 1)"
+          >
+            <ChevronLeft class="size-4" />
+          </button>
+          <span class="min-w-16 text-center font-semibold tabular-nums text-slate-900 dark:text-stone-100">{{ currentPage }} / {{ totalPages }}</span>
+          <button
+            type="button"
+            class="studio-button inline-flex size-9 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300"
+            :disabled="currentPage >= totalPages"
+            aria-label="下一页"
+            @click="goToPage(currentPage + 1)"
+          >
+            <ChevronRight class="size-4" />
+          </button>
+        </div>
+      </div>
     </div>
   </aside>
 </template>
+
+<style scoped>
+.history-panel-item {
+  animation: history-panel-row-in 180ms var(--studio-ease) both;
+  animation-delay: calc(var(--history-row-index, 0) * 12ms);
+}
+
+@keyframes history-panel-row-in {
+  from {
+    opacity: 0.96;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-panel-item {
+    animation: none;
+  }
+}
+</style>

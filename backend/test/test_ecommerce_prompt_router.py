@@ -144,8 +144,8 @@ class EcommercePromptRouterTests(unittest.TestCase):
         self.assertIn("专业 Prompt 引擎：", final_prompt)
         self.assertIn("主标题：橙香饭店油污净", final_prompt)
         self.assertIn("卖点标签：强力去油、清新橙香", final_prompt)
-        self.assertIn("自主选择版式", final_prompt)
-        self.assertIn("文字、商品、Logo 和包装关键信息之间保留清晰净空", final_prompt)
+        self.assertIn("按用户要求和参考图决定版式", final_prompt)
+        self.assertIn("文字、商品、Logo 和包装关键信息之间保留净空", final_prompt)
         self.assertIn("验收标准", final_prompt)
         self.assertIn("投放环境：淘宝/天猫", final_prompt)
         self.assertIn("严格保持 1:1 方形比例", final_prompt)
@@ -155,7 +155,7 @@ class EcommercePromptRouterTests(unittest.TestCase):
         self.assertIn("不要默认使用纯白空背景", final_prompt)
         self.assertIn("文字所在区域要有稳定高对比", final_prompt)
         self.assertIn("审美增强", final_prompt)
-        self.assertIn("高点击商业广告摄影", final_prompt)
+        self.assertIn("不强制品牌大片", final_prompt)
         self.assertIn("百分比承诺", negative_prompt)
         self.assertIn("纯白空背景、白底商品图", negative_prompt)
         self.assertIn("背景为纯白空底或白底商品棚拍均视为不合格", final_prompt)
@@ -508,7 +508,7 @@ class EcommercePromptRouterTests(unittest.TestCase):
         self.assertNotIn("淘宝文字主图版式", result["finalPrompt"])
         self.assertNotIn("保持圆柱瓶身", result["finalPrompt"])
 
-    @patch("services.ecommerce.ecommerce_prompt_router.prompt_analysis_model", return_value="gpt-4o")
+    @patch("services.ecommerce.ecommerce_prompt_router.prompt_analysis_model", return_value="gpt-5.6-sol")
     @patch("services.ecommerce.ecommerce_prompt_router.request_json_completion")
     @patch("services.ecommerce.ecommerce_prompt_router.is_prompt_analysis_enabled", return_value=True)
     def test_agent_request_does_not_use_image_model_for_prompt_analysis(
@@ -532,8 +532,8 @@ class EcommercePromptRouterTests(unittest.TestCase):
         })
 
         analysis_model.assert_called_once_with("")
-        self.assertEqual("gpt-4o", request_json.call_args.kwargs["model"])
-        self.assertEqual("gpt-4o", result["model"])
+        self.assertEqual("gpt-5.6-sol", request_json.call_args.kwargs["model"])
+        self.assertEqual("gpt-5.6-sol", result["model"])
 
 
 if __name__ == "__main__":

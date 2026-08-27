@@ -36,7 +36,7 @@ class PromptAnalysisApiTests(unittest.TestCase):
 
     def test_professional_prompt_endpoint_accepts_prompt_only(self):
         expected = {
-            "model": "gpt-4o",
+            "model": "gpt-5.6-sol",
             "productProfile": {"productName": "香水"},
             "sceneType": "luxury_atmosphere",
             "sceneName": "高端氛围主视觉",

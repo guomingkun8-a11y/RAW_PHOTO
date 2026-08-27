@@ -216,11 +216,12 @@ onBeforeUnmount(() => {
               </div>
             </label>
             <label class="auth-field">
-              <span>名称</span>
+              <span>姓名</span>
               <div class="auth-input-wrap">
                 <UserPlus class="size-4" />
-                <input v-model="registerName" autocomplete="name" aria-label="名称" data-testid="register-name" />
+                <input v-model="registerName" autocomplete="name" aria-label="姓名" placeholder="请填写真实姓名" data-testid="register-name" />
               </div>
+              <p class="text-xs leading-5 text-slate-500">请填写真实姓名，方便团队识别和历史记录显示。</p>
             </label>
             <div class="auth-field-grid">
               <label class="auth-field">
