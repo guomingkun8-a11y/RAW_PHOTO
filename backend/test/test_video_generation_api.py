@@ -18,6 +18,8 @@ class FakeVideoGenerationTaskService:
     def __init__(self):
         self.submit_calls = []
         self.cancel_calls = []
+        self.reconcile_calls = []
+        self.list_calls = []
 
     def submit_task(self, identity, **kwargs):
         self.submit_calls.append((identity, kwargs))
@@ -30,7 +32,8 @@ class FakeVideoGenerationTaskService:
             "updated_at": "2026-01-01 00:00:00",
         }
 
-    def list_tasks(self, _identity, ids):
+    def list_tasks(self, _identity, ids, **_options):
+        self.list_calls.append(_options)
         return {
             "items": [
                 {
@@ -56,6 +59,17 @@ class FakeVideoGenerationTaskService:
             "mode": "text_to_video",
             "created_at": "2026-01-01 00:00:00",
             "updated_at": "2026-01-01 00:00:01",
+        }
+
+    def reconcile_task(self, identity, task_id):
+        self.reconcile_calls.append((identity, task_id))
+        return {
+            "id": task_id,
+            "status": "queued",
+            "mode": "text_to_video",
+            "upstream_task_id": "upstream-1",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:02",
         }
 
     def monitoring_snapshot(self):
@@ -100,6 +114,66 @@ class VideoGenerationApiTests(unittest.TestCase):
         self.assertEqual(kwargs["aspect_ratio"], "9:16")
         self.assertEqual(kwargs["duration_secs"], 6)
 
+    def test_create_video_generation_task_accepts_auto_duration_and_thirty_images(self):
+        image_urls = [f"https://cdn.example.test/reference-{index}.png" for index in range(30)]
+        response = self.client.post(
+            "/api/video-generation/tasks",
+            headers=AUTH_HEADERS,
+            json={
+                "client_task_id": "video-image-1",
+                "prompt": "animate the product references",
+                "model": "doubao-seedance-2-5-cankaosheng",
+                "mode": "image_to_video",
+                "duration_secs": "auto",
+                "image_urls": image_urls,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        kwargs = self.fake_service.submit_calls[0][1]
+        self.assertEqual(kwargs["duration_secs"], "auto")
+        self.assertEqual(kwargs["image_urls"], image_urls)
+
+    def test_create_video_generation_task_preserves_first_last_frame_order(self):
+        image_urls = [
+            "https://cdn.example.test/first.png",
+            "https://cdn.example.test/last.png",
+        ]
+        response = self.client.post(
+            "/api/video-generation/tasks",
+            headers=AUTH_HEADERS,
+            json={
+                "client_task_id": "video-first-last",
+                "prompt": "transition between both frames",
+                "model": "hailuo-h3-max-shouweizhen",
+                "mode": "image_to_video",
+                "duration_secs": 10,
+                "resolution": "768P",
+                "image_urls": image_urls,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        kwargs = self.fake_service.submit_calls[0][1]
+        self.assertEqual(kwargs["model"], "hailuo-h3-max-shouweizhen")
+        self.assertEqual(kwargs["image_urls"], image_urls)
+
+    def test_create_video_generation_task_rejects_more_than_thirty_images(self):
+        response = self.client.post(
+            "/api/video-generation/tasks",
+            headers=AUTH_HEADERS,
+            json={
+                "client_task_id": "video-image-too-many",
+                "prompt": "animate the product references",
+                "model": "doubao-seedance-2-5-cankaosheng",
+                "mode": "image_to_video",
+                "image_urls": [f"https://cdn.example.test/reference-{index}.png" for index in range(31)],
+            },
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.submit_calls, [])
+
     def test_query_video_generation_tasks(self):
         response = self.client.post(
             "/api/video-generation/tasks/query",
@@ -111,12 +185,36 @@ class VideoGenerationApiTests(unittest.TestCase):
         self.assertEqual(response.json()["items"][0]["video_url"], "https://cdn.example.test/result.mp4")
         self.assertEqual(response.json()["missing_ids"], ["missing"])
 
+    def test_list_video_generation_tasks_forwards_history_scope(self):
+        response = self.client.get(
+            "/api/video-generation/tasks?limit=50&all_owners=true&owner_id=user-2&conversation_id=video-conversation-1&cursor=page-2&status=success&q=product",
+            headers=AUTH_HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.list_calls[-1], {
+            "limit": 50,
+            "include_all_owners": True,
+            "owner_id_filter": "user-2",
+            "conversation_id_filter": "video-conversation-1",
+            "cursor": "page-2",
+            "status_filter": "success",
+            "query_filter": "product",
+        })
+
     def test_cancel_video_generation_task(self):
         response = self.client.post("/api/video-generation/tasks/video-1/cancel", headers=AUTH_HEADERS)
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "canceled")
         self.assertEqual(self.fake_service.cancel_calls[0][1], "video-1")
+
+    def test_reconcile_video_generation_task(self):
+        response = self.client.post("/api/video-generation/tasks/video-1/reconcile", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(self.fake_service.reconcile_calls[0][1], "video-1")
 
     def test_video_generation_queue_requires_admin(self):
         response = self.client.get("/api/video-generation/queue", headers=AUTH_HEADERS)

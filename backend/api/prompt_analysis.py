@@ -143,6 +143,8 @@ def create_router() -> APIRouter:
             await filter_or_log(call, body.prompt)
         try:
             payload = body.model_dump(mode="python", by_alias=False)
+            payload["billing_owner_id"] = identity.get("id") or identity.get("username")
+            payload["billing_local_source"] = "image_prompt"
             return await call.run(analyze_image_prompt, payload)
         except HTTPException:
             raise
@@ -165,6 +167,8 @@ def create_router() -> APIRouter:
             await filter_or_log(call, body.prompt)
         try:
             payload = body.model_dump(mode="python", by_alias=False)
+            payload["billing_owner_id"] = identity.get("id") or identity.get("username")
+            payload["billing_local_source"] = "image_agent_prompt"
             handler = lambda value: run_professional_prompt_agent(
                 value,
                 prompt_builder=build_professional_image_prompt,

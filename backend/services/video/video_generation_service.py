@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
+import random
 import socket
 import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from services.image.image_task_queue import ImageTaskQueue
 from services.platform.config import DATA_DIR, config
 from services.platform.enterprise_schema import resolve_enterprise_database_url
 from services.platform.log_service import LOG_TYPE_CALL, log_service
-from services.video.video_generation_provider import run_video_generation
-from services.video.video_generation_queue import RedisVideoGenerationQueue
-from services.video.video_generation_task_store import DatabaseVideoGenerationTaskStore, VideoGenerationTaskStore
+from services.video.video_generation_models import normalize_video_generation_options
+from services.video.video_generation_provider import run_video_generation, VideoGenerationProviderError
+from services.video.video_generation_queue import RedisVideoGenerationQueue, VideoDelivery
+from services.video.video_generation_storage import video_generation_storage_service
+from services.video.video_generation_task_store import DatabaseVideoGenerationTaskStore, VideoGenerationTaskStore, encode_cursor
 
 
 TASK_STATUS_QUEUED = "queued"
@@ -26,6 +31,15 @@ TASK_STATUS_CANCELED = "canceled"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELED}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 DEFAULT_EMPTY_TASK_LIST_LIMIT = 200
+LOGGER = logging.getLogger(__name__)
+
+
+class LeaseLost(RuntimeError):
+    pass
+
+
+def _env_seconds(name: str, default: int, minimum: int = 1) -> int:
+    return _positive_int(os.getenv(name), default, minimum)
 
 
 def _now_iso() -> str:
@@ -63,9 +77,15 @@ def _task_key(owner_id: str, task_id: str) -> str:
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
+    snapshot = task.get("identity") if isinstance(task.get("identity"), dict) else {}
+    owner_id = _clean(task.get("owner_id") or snapshot.get("id"), "anonymous", 191)
+    owner_name = _clean(snapshot.get("name"), limit=191)
+    owner_username = _clean(snapshot.get("username"), limit=191)
     item: dict[str, Any] = {
         "id": task.get("id"),
-        "status": task.get("status"),
+        "owner_id": owner_id,
+        "owner_username": owner_username,
+        "status": TASK_STATUS_CANCELED if task.get("cancel_requested") else task.get("status"),
         "mode": task.get("mode"),
         "model": task.get("model"),
         "prompt": task.get("prompt"),
@@ -76,6 +96,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if owner_name:
+        item["owner_name"] = owner_name
     for key in (
         "conversation_id",
         "turn_id",
@@ -88,6 +110,13 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "cost",
         "attempts",
         "max_retries",
+        "storage",
+        "file_size",
+        "storage_error",
+        "cancellation_pending",
+        "reconciliation_required",
+        "storage_pending",
+        "next_attempt_ts",
     ):
         if task.get(key) is not None and task.get(key) != "":
             item[key] = task.get(key)
@@ -95,6 +124,17 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["image_urls"] = task.get("image_urls")
     if isinstance(task.get("data"), list):
         item["data"] = task.get("data")
+    if task.get("cancel_requested"):
+        item["cancellation_pending"] = task.get("status") in UNFINISHED_STATUSES
+    if task.get("storage") in {"local", "oss"}:
+        try:
+            url = video_generation_storage_service.resolve_result_url(task)
+            item["video_url"] = url
+            item["data"] = [{"type": "video", "url": url, "cover_url": task.get("cover_url", "")}]
+        except Exception:
+            item["video_url"] = ""
+            item["data"] = []
+            item["storage_error"] = "Video access temporarily unavailable"
     if task.get("status") in UNFINISHED_STATUSES:
         base_ts = task.get("started_ts") if task.get("status") == TASK_STATUS_RUNNING else task.get("created_ts")
         if base_ts:
@@ -118,6 +158,8 @@ class VideoGenerationTaskService:
         owner_pending_limit_getter: Callable[[], int] | None = None,
         owner_concurrency_getter: Callable[[], int] | None = None,
         stale_running_timeout_getter: Callable[[], int] | None = None,
+        result_storage_handler: Callable[..., Any] | None = None,
+        download_results_getter: Callable[[], bool] | None = None,
     ) -> None:
         self.task_store = task_store
         self.task_queue = task_queue
@@ -134,9 +176,17 @@ class VideoGenerationTaskService:
         self.stale_running_timeout_getter = stale_running_timeout_getter or (
             lambda: int(config.get_video_generation_settings().get("stale_running_timeout_secs") or 3600)
         )
+        self.result_storage_handler = result_storage_handler or video_generation_storage_service.store_remote_video
+        self.download_results_getter = download_results_getter or (
+            lambda: bool(config.get_video_generation_settings().get("download_results"))
+        )
         settings = config.get_video_generation_settings()
         self._worker_concurrency = max(1, int(settings.get("worker_concurrency") or 1))
         self._lock = threading.RLock()
+        self._recovery_cursor = ""
+        self._recovery_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._inline_threads: set[threading.Thread] = set()
 
     def submit_task(
         self,
@@ -147,7 +197,7 @@ class VideoGenerationTaskService:
         model: str,
         mode: str = "text_to_video",
         aspect_ratio: str = "16:9",
-        duration_secs: int = 5,
+        duration_secs: int | str = 5,
         quality: str = "standard",
         resolution: str = "",
         image_urls: list[str] | None = None,
@@ -172,26 +222,51 @@ class VideoGenerationTaskService:
             existing = self.task_store.get_task(key)
             if existing is not None:
                 return _public_task(existing)
-            active_count = self.task_store.count_tasks(owner, {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING})
-            if active_count >= max(1, int(self.owner_pending_limit_getter())):
-                raise ValueError("user video generation queue is full; wait for existing tasks to finish")
             now = _now_iso()
-            normalized_image_urls = [
-                _clean(url, limit=2000)
-                for url in list(image_urls or [])[:8]
-                if _clean(url, limit=2000).startswith(("http://", "https://"))
-            ]
+            raw_image_urls = list(image_urls or [])
+            if len(raw_image_urls) > 30:
+                raise ValueError("video generation supports at most 30 reference images")
+            normalized_image_urls: list[str] = []
+            seen_image_urls: set[str] = set()
+            for value in raw_image_urls:
+                image_url = _clean(value, limit=2000)
+                if not image_url.startswith(("http://", "https://")):
+                    raise ValueError("reference images must use http or https URLs")
+                normalized_image_urls.append(image_url)
+                seen_image_urls.add(image_url)
             normalized_mode = _clean(mode, "image_to_video" if normalized_image_urls else "text_to_video", 40)
             if normalized_mode not in {"text_to_video", "image_to_video"}:
                 normalized_mode = "image_to_video" if normalized_image_urls else "text_to_video"
-            provider_params = {
-                "mode": normalized_mode,
-                "aspectRatio": _clean(aspect_ratio, "16:9", 40),
-                "duration": _positive_int(duration_secs, 5, 1),
-                "quality": _clean(quality, "standard", 80),
-                **({"resolution": _clean(resolution, limit=80)} if _clean(resolution) else {}),
-                **(dict(params or {}) if isinstance(params, dict) else {}),
-            }
+            if normalized_mode == "text_to_video" and normalized_image_urls:
+                raise ValueError("text-to-video does not support reference images")
+            provider_options = normalize_video_generation_options(
+                safe_model,
+                aspect_ratio=aspect_ratio,
+                duration_secs=duration_secs,
+                quality=quality,
+                resolution=resolution,
+                params=params,
+            )
+            if normalized_mode not in provider_options.get("modes", ("text_to_video", "image_to_video")):
+                raise ValueError(f"{safe_model} does not support mode: {normalized_mode}")
+            if normalized_mode == "image_to_video":
+                image_count = len(normalized_image_urls)
+                min_images = int(provider_options.get("min_images") or 1)
+                max_images = int(provider_options.get("max_images") or 30)
+                image_input_kind = _clean(provider_options.get("image_input_kind"), "reference", 40)
+                model_label = _clean(provider_options.get("model_label"), safe_model, 191)
+                if image_input_kind == "first_last_frame" and image_count < 1:
+                    raise ValueError(f"{model_label} requires a first-frame image")
+                if image_input_kind == "first_last_frame" and image_count > 2:
+                    raise ValueError(f"{model_label} supports at most a first frame and a last frame (2 images)")
+                if image_input_kind != "first_last_frame" and min_images == max_images and image_count != min_images:
+                    noun = "image" if min_images == 1 else "images"
+                    raise ValueError(f"{model_label} requires exactly {min_images} reference {noun}")
+                if image_input_kind != "first_last_frame" and image_count < min_images:
+                    raise ValueError(f"{model_label} requires at least {min_images} reference images")
+                if image_input_kind != "first_last_frame" and image_count > max_images:
+                    raise ValueError(f"{model_label} supports at most {max_images} reference images")
+            provider_params = dict(provider_options["params"])
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -199,10 +274,10 @@ class VideoGenerationTaskService:
                 "mode": normalized_mode,
                 "model": safe_model,
                 "prompt": safe_prompt,
-                "aspect_ratio": provider_params["aspectRatio"],
-                "duration_secs": provider_params["duration"],
-                "quality": provider_params["quality"],
-                "resolution": provider_params.get("resolution", ""),
+                "aspect_ratio": provider_options["aspect_ratio"],
+                "duration_secs": provider_options["duration_secs"],
+                "quality": provider_options["quality"],
+                "resolution": provider_options.get("resolution", ""),
                 "image_urls": normalized_image_urls,
                 "params": provider_params,
                 "conversation_id": _clean(conversation_id, limit=191),
@@ -215,20 +290,65 @@ class VideoGenerationTaskService:
                 "updated_at": now,
                 "created_ts": time.time(),
             }
-            task, created = self.task_store.create_task(key, task)
+            task, created = self.task_store.create_task(key, task, pending_limit=max(1, int(self.owner_pending_limit_getter())))
             if not created:
                 return _public_task(task)
         if self.task_queue is not None and not self.run_inline:
-            self.task_queue.enqueue(key)
+            self._enqueue(key)
         else:
-            threading.Thread(target=self._run_task, args=(key,), name=f"video-generation-{task_id[:16]}", daemon=True).start()
+            def execute_inline():
+                try:
+                    while not self._stop.is_set():
+                        self._run_task(key)
+                        current = self.task_store.get_task(key)
+                        if not current or current.get("status") != TASK_STATUS_QUEUED:
+                            break
+                        self._stop.wait(max(0.1, float(current.get("next_attempt_ts") or 0) - time.time()))
+                finally:
+                    with self._lock:
+                        self._inline_threads.discard(threading.current_thread())
+            thread = threading.Thread(target=execute_inline, name=f"video-generation-{task_id[:16]}", daemon=True)
+            with self._lock:
+                self._inline_threads.add(thread)
+            thread.start()
         return _public_task(task)
 
-    def list_tasks(self, identity: dict[str, object], task_ids: list[str], *, limit: int | None = None) -> dict[str, Any]:
+    def list_tasks(
+        self,
+        identity: dict[str, object],
+        task_ids: list[str],
+        *,
+        limit: int | None = None,
+        include_all_owners: bool = False,
+        owner_id_filter: str = "",
+        conversation_id_filter: str = "",
+        cursor: str = "",
+        status_filter: str = "",
+        query_filter: str = "",
+    ) -> dict[str, Any]:
         owner = _owner_id(identity)
+        is_admin = _clean(identity.get("role"), "user", 40) == "admin"
+        requested_owner_id = _clean(owner_id_filter, limit=191)
+        requested_conversation_id = _clean(conversation_id_filter, limit=191)
+        requested_status = _clean(status_filter, limit=32)
+        if requested_status and requested_status not in {
+            TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELED,
+        }:
+            raise ValueError("invalid video task status")
+        requested_query = _clean(query_filter, limit=200)
+        all_owners = is_admin and (include_all_owners or bool(requested_owner_id))
+        scope_owner_id = requested_owner_id if all_owners and requested_owner_id else None if all_owners else owner
         requested_ids = [_clean(task_id, limit=191) for task_id in task_ids if _clean(task_id, limit=191)]
         page_limit = min(500, _positive_int(limit, DEFAULT_EMPTY_TASK_LIST_LIMIT, 1))
-        raw_items = self.task_store.list_tasks(owner, requested_ids or None, limit=None if requested_ids else page_limit + 1)
+        raw_items = self.task_store.list_tasks(
+            scope_owner_id,
+            requested_ids or None,
+            conversation_id=requested_conversation_id,
+            limit=None if requested_ids else page_limit + 1,
+            cursor=cursor,
+            status="" if requested_ids else requested_status,
+            query_text="" if requested_ids else requested_query,
+        )
         indexed = {_clean(task.get("id"), limit=191): task for task in raw_items}
         if requested_ids:
             return {
@@ -236,10 +356,39 @@ class VideoGenerationTaskService:
                 "missing_ids": [task_id for task_id in requested_ids if task_id not in indexed],
             }
         has_more = len(raw_items) > page_limit
-        items = sorted((_public_task(task) for task in raw_items[:page_limit]), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        return {"items": items, "missing_ids": [], "has_more": has_more, "limit": page_limit}
+        items = [_public_task(task) for task in raw_items[:page_limit]]
+        total = self.task_store.count_all_tasks(
+            scope_owner_id,
+            conversation_id=requested_conversation_id,
+            status=requested_status,
+            query_text=requested_query,
+        )
+        return {
+            "items": items,
+            "missing_ids": [],
+            "has_more": has_more,
+            "limit": page_limit,
+            "total": total,
+            "next_cursor": encode_cursor(raw_items[page_limit - 1]) if has_more else None,
+        }
 
     def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        normalized_task_id = _clean(task_id, limit=191)
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        key = _task_key(owner, normalized_task_id)
+        updated = self.task_store.request_cancel(key)
+        if updated is None:
+            raise ValueError("task not found")
+        if self.task_queue is not None:
+            try:
+                self.task_queue.notify_task_update(key)
+            except Exception:
+                pass
+        return _public_task(updated)
+
+    def reconcile_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
         owner = _owner_id(identity)
         normalized_task_id = _clean(task_id, limit=191)
         if not normalized_task_id:
@@ -249,24 +398,69 @@ class VideoGenerationTaskService:
             task = self.task_store.get_task(key)
             if task is None:
                 raise ValueError("task not found")
-            if task.get("status") in TERMINAL_STATUSES:
+            if not task.get("reconciliation_required"):
                 return _public_task(task)
+            if not _clean(task.get("upstream_task_id"), limit=191):
+                raise ValueError("upstream task id is unknown; automatic reconciliation is unavailable")
             updated = self.task_store.update_task(
                 key,
                 {
-                    "status": TASK_STATUS_CANCELED,
-                    "error": "task canceled",
-                    "progress": "canceled",
+                    "status": TASK_STATUS_QUEUED,
+                    "execution_token": "",
+                    "progress": "reconciliation_queued",
+                    "reconciliation_required": False,
+                    "cancellation_pending": bool(task.get("cancel_requested")),
+                    "poll_started_ts": time.time(),
+                    "next_attempt_ts": time.time(),
+                    "attempts": 0,
+                    "error": "",
                     "updated_at": _now_iso(),
                     "updated_ts": time.time(),
                 },
             )
-        if self.task_queue is not None:
-            try:
-                self.task_queue.notify_task_update(key)
-            except Exception:
-                pass
-        return _public_task(updated or task)
+            if updated is None:
+                raise ValueError("task could not be queued for reconciliation")
+        self._enqueue(key)
+        return _public_task(updated)
+
+    def delete_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        normalized_task_id = _clean(task_id, limit=191)
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        key = _task_key(owner, normalized_task_id)
+        with self._lock:
+            task = self.task_store.get_task(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") in UNFINISHED_STATUSES:
+                raise ValueError("video task is still in progress")
+            if not self.task_store.delete_task(key):
+                raise ValueError("task not found")
+        return {"ok": True, "deleted": 1}
+
+    def delete_conversation(self, identity: dict[str, object], conversation_id: str) -> dict[str, Any]:
+        owner = _owner_id(identity)
+        normalized_conversation_id = _clean(conversation_id, limit=191)
+        if not normalized_conversation_id:
+            raise ValueError("conversation_id is required")
+        with self._lock:
+            tasks = self.task_store.list_tasks(
+                owner,
+                conversation_id=normalized_conversation_id,
+            )
+            if not tasks:
+                raise ValueError("video conversation not found")
+            if any(task.get("status") in UNFINISHED_STATUSES for task in tasks):
+                raise ValueError("video conversation has tasks still in progress")
+            if any(task.get("reconciliation_required") for task in tasks):
+                raise ValueError("video conversation has tasks requiring billing reconciliation")
+            deleted = sum(
+                1
+                for task in tasks
+                if self.task_store.delete_task(_task_key(owner, _clean(task.get("id"), limit=191)))
+            )
+        return {"ok": True, "deleted": deleted}
 
     def process_queued_task(self, task_key: str) -> dict[str, Any] | None:
         key = _clean(task_key, limit=383)
@@ -279,10 +473,17 @@ class VideoGenerationTaskService:
     def work_once(self, timeout_secs: int = 5) -> dict[str, Any] | None:
         if self.task_queue is None:
             raise RuntimeError("video generation task queue is not configured")
-        task_key = self.task_queue.dequeue(timeout_secs)
-        if not task_key:
+        delivery = self.task_queue.reserve(timeout_secs)
+        if not delivery:
             return None
-        return self.process_queued_task(task_key)
+        self._run_task(delivery.key, delivery=delivery)
+        task = self.task_store.get_task(delivery.key)
+        if task and task.get("status") == TASK_STATUS_QUEUED:
+            delay = max(1.0, float(task.get("next_attempt_ts") or 0) - time.time())
+            self.task_queue.retry(delivery, delay)
+        else:
+            self.task_queue.ack(delivery)
+        return _public_task(task) if task else None
 
     def work_forever(self, stop_event: threading.Event | None = None, timeout_secs: int = 5) -> None:
         if self.task_queue is None:
@@ -290,14 +491,29 @@ class VideoGenerationTaskService:
         shutdown_event = stop_event or threading.Event()
         worker_id = f"{socket.gethostname()}:{os.getpid()}:video-generation"
 
+        def maintenance() -> None:
+            last_recovery = 0.0
+            while not shutdown_event.is_set():
+                try:
+                    for index in range(self._worker_concurrency):
+                        self.task_queue.touch_worker(f"{worker_id}:{index}", timeout_secs=60)
+                    if time.monotonic() - last_recovery >= 10:
+                        self.task_queue.recover_deliveries()
+                        self.recover_stale_unfinished()
+                        self.task_store.cleanup_batch(
+                            lambda task: video_generation_storage_service.delete_stored_video(
+                                task,
+                                owner_id=_clean(task.get("owner_id"), limit=191),
+                            )
+                        )
+                        last_recovery = time.monotonic()
+                except Exception:
+                    LOGGER.exception("Video worker maintenance failed")
+                shutdown_event.wait(10)
+
         def _worker_loop(index: int) -> None:
             while not shutdown_event.is_set():
                 try:
-                    if self.task_queue is not None:
-                        try:
-                            self.task_queue.touch_worker(f"{worker_id}:{index}", timeout_secs=60)
-                        except TypeError:
-                            self.task_queue.touch_worker(f"{worker_id}:{index}")
                     self.work_once(timeout_secs)
                 except Exception as exc:
                     try:
@@ -310,6 +526,8 @@ class VideoGenerationTaskService:
             threading.Thread(target=_worker_loop, args=(index,), name=f"video-generation-worker-{index + 1}", daemon=True)
             for index in range(self._worker_concurrency)
         ]
+        heartbeat_thread = threading.Thread(target=maintenance, name="video-worker-maintenance", daemon=True)
+        heartbeat_thread.start()
         for thread in threads:
             thread.start()
         try:
@@ -317,76 +535,107 @@ class VideoGenerationTaskService:
                 shutdown_event.wait(0.5)
         finally:
             shutdown_event.set()
+            self._stop.set()
             for thread in threads:
-                thread.join(timeout=max(1, int(timeout_secs)))
+                thread.join(timeout=35)
+            heartbeat_thread.join(timeout=10)
+            for index in range(self._worker_concurrency):
+                try:
+                    self.task_queue.forget_worker(f"{worker_id}:{index}")
+                except Exception:
+                    pass
 
     def monitoring_snapshot(self) -> dict[str, Any]:
-        try:
-            self.recover_stale_unfinished()
-        except Exception:
-            pass
-        unfinished = self.task_store.list_unfinished()
-        queued_tasks = sum(1 for _key, task in unfinished if task.get("status") == TASK_STATUS_QUEUED)
-        running_tasks = sum(1 for _key, task in unfinished if task.get("status") == TASK_STATUS_RUNNING)
+        queued_tasks = self.task_store.count_tasks(None, {TASK_STATUS_QUEUED})
+        running_tasks = self.task_store.count_tasks(None, {TASK_STATUS_RUNNING})
         queue = self.task_queue
+        queue_error = ""
+        queue_depths: dict[str, int] = {}
+        processing_tasks = 0
+        active_slots = 0
         try:
-            queue_depth = int(getattr(queue, "queue_depth", lambda: 0)() or 0) if queue is not None else 0
-        except Exception:
+            if queue is not None:
+                raw_depths = getattr(queue, "queue_depths", lambda: {})() or {}
+                queue_depths = {str(name): int(value or 0) for name, value in raw_depths.items()}
+            queue_depth = sum(queue_depths.values())
+        except Exception as exc:
             queue_depth = 0
+            queue_error = str(exc)[:200]
+        try:
+            processing_tasks = int(getattr(queue, "processing_count", lambda: 0)() or 0) if queue is not None else 0
+        except Exception as exc:
+            queue_error = queue_error or str(exc)[:200]
+        try:
+            active_slots = int(getattr(queue, "active_slot_count", lambda: 0)() or 0) if queue is not None else 0
+        except Exception as exc:
+            queue_error = queue_error or str(exc)[:200]
         try:
             active_workers = int(getattr(queue, "active_worker_count", lambda: 0)() or 0) if queue is not None else 0
         except Exception:
             active_workers = 0
+        total_concurrency = int(config.get_video_generation_settings().get("total_concurrency") or 2)
         return {
             "enabled": bool(self.enabled_getter()),
             "queue_enabled": queue is not None,
             "queue_depth": queue_depth,
+            "queue_depths": queue_depths,
+            "processing_tasks": processing_tasks,
             "queued_tasks": queued_tasks,
             "running_tasks": running_tasks,
             "active_workers": active_workers,
             "worker_concurrency": self._worker_concurrency,
+            "active_slots": active_slots,
+            "slot_limit": total_concurrency,
+            "configured_total_concurrency": total_concurrency,
+            "total_concurrency": total_concurrency,
+            "worker_heartbeat_secs": 10,
+            "queue_error": queue_error,
             "owner_concurrency": max(1, int(self.owner_concurrency_getter())),
             "owner_pending_limit": max(1, int(self.owner_pending_limit_getter())),
+            "stale_running_timeout_secs": max(60, int(self.stale_running_timeout_getter())),
         }
 
     def recover_stale_unfinished(self) -> int:
-        stale_cutoff = time.time() - max(60, int(self.stale_running_timeout_getter()))
+        if not self._recovery_lock.acquire(blocking=False):
+            return 0
         recovered = 0
-        for key, task in self.task_store.list_unfinished():
-            if task.get("status") != TASK_STATUS_RUNNING:
-                continue
-            try:
-                activity = float(task.get("updated_ts") or task.get("started_ts") or task.get("created_ts") or 0)
-            except (TypeError, ValueError):
-                activity = 0.0
-            if activity > stale_cutoff:
-                continue
-            updated = self.task_store.update_task(
-                key,
-                {
-                    "status": TASK_STATUS_QUEUED if self.task_queue is not None else TASK_STATUS_ERROR,
-                    "progress": "stale_requeued" if self.task_queue is not None else "stale_timeout",
-                    "error": "" if self.task_queue is not None else "video generation task timed out",
-                    "updated_at": _now_iso(),
-                    "updated_ts": time.time(),
-                },
-                expected_status=TASK_STATUS_RUNNING,
-            )
-            if updated is None:
-                continue
-            recovered += 1
-            if self.task_queue is not None:
-                self.task_queue.enqueue(key)
+        try:
+            rows = self.task_store.list_unfinished(limit=200, after_key=self._recovery_cursor)
+            self._recovery_cursor = rows[-1][0] if len(rows) == 200 else ""
+            for key, task in rows:
+                if task.get("status") == TASK_STATUS_RUNNING:
+                    timeout = 90 if task.get("execution_token") else max(60, int(self.stale_running_timeout_getter()))
+                    task = self.task_store.recover_task(key, time.time() - timeout)
+                    if task is None:
+                        continue
+                    recovered += 1
+                if task.get("status") == TASK_STATUS_QUEUED:
+                    self._enqueue(key, max(0.0, float(task.get("next_attempt_ts") or 0) - time.time()))
+        finally:
+            self._recovery_lock.release()
         return recovered
 
+    def _enqueue(self, key: str, delay: float = 0) -> None:
+        if self.task_queue is None:
+            return
+        try:
+            self.task_queue.enqueue(key, delay_secs=delay)
+        except Exception:
+            # The committed queued row is the durable outbox; maintenance repairs it.
+            LOGGER.exception("Video dispatch failed; database task retained for recovery: %s", key)
+
     def close(self) -> None:
+        self._stop.set()
+        for thread in list(self._inline_threads):
+            thread.join(timeout=5)
         close = getattr(self.task_store, "close", None)
         if callable(close):
             close()
 
-    def _run_task(self, key: str) -> None:
+    def _run_task(self, key: str, *, delivery: VideoDelivery | None = None) -> None:
         started = time.time()
         owner_id = ""
+        token = uuid4().hex
         with self._lock:
             task = self.task_store.get_task(key)
             if task is None or task.get("status") != TASK_STATUS_QUEUED:
@@ -394,10 +643,13 @@ class VideoGenerationTaskService:
             owner_id = _clean(task.get("owner_id"), "anonymous", 191)
             claimed = self.task_store.claim_task(
                 key,
+                owner_id=owner_id,
                 owner_concurrency=max(1, int(self.owner_concurrency_getter())),
                 updates={
                     "status": TASK_STATUS_RUNNING,
                     "progress": "starting",
+                    "execution_token": token,
+                    "heartbeat_ts": time.time(),
                     "error": "",
                     "started_at": _now_iso(),
                     "started_ts": time.time(),
@@ -406,15 +658,51 @@ class VideoGenerationTaskService:
                 },
             )
             if claimed is None:
-                if self.task_queue is not None and task.get("status") == TASK_STATUS_QUEUED:
-                    time.sleep(0.1)
-                    self.task_queue.enqueue(key)
                 return
             task = claimed
         identity = task.get("identity") if isinstance(task.get("identity"), dict) else {"id": owner_id}
 
+        lost_lease = threading.Event()
+        heartbeat_done = threading.Event()
+
+        def update(**changes):
+            result = self.task_store.update_task(key, {"updated_at": _now_iso(), "updated_ts": time.time(), **changes},
+                                                expected_token=token, expected_status=TASK_STATUS_RUNNING)
+            if result is None:
+                raise LeaseLost("Video task ownership changed")
+            return result
+
+        def checkpoint():
+            if lost_lease.is_set() or self._stop.is_set():
+                raise LeaseLost("Video worker stopping or lease unavailable")
+            current = self.task_store.get_task(key)
+            if not current or current.get("execution_token") != token or current.get("status") != TASK_STATUS_RUNNING:
+                raise LeaseLost("Video task is no longer owned by this worker")
+
+        def heartbeat():
+            while not heartbeat_done.wait(10):
+                try:
+                    if delivery and not self.task_queue.renew_delivery(delivery):
+                        raise LeaseLost("Video delivery expired")
+                    if distributed_slot and not self.task_queue.renew_slot(slot_token):
+                        raise LeaseLost("Video capacity lease expired")
+                    update(heartbeat_ts=time.time())
+                except Exception:
+                    lost_lease.set()
+                    LOGGER.exception("Video task heartbeat failed: %s", key)
+                    return
+
         def progress_callback(step: str) -> None:
-            self._update_unless_canceled(key, progress=_clean(step, "running", 120))
+            checkpoint()
+            update(progress=_clean(step, "running", 120))
+
+        def submission_started_callback():
+            checkpoint()
+            update(submission_state="submitting", poll_started_ts=time.time(), progress="submitting")
+
+        def submission_callback(upstream_task_id: str, credential_id: str = "", cost=None) -> None:
+            update(upstream_task_id=_clean(upstream_task_id, limit=191), credential_id=credential_id,
+                   cost=cost, submission_state="submitted", progress="submitted")
 
         handler_payload = {
             "prompt": task.get("prompt"),
@@ -423,75 +711,145 @@ class VideoGenerationTaskService:
             "image_urls": task.get("image_urls") if isinstance(task.get("image_urls"), list) else [],
             "params": task.get("params") if isinstance(task.get("params"), dict) else {},
             "progress_callback": progress_callback,
+            "submission_callback": submission_callback,
+            "submission_started_callback": submission_started_callback,
+            "checkpoint_callback": checkpoint,
+            "cost_callback": lambda cost: update(cost=cost),
+            "upstream_task_id": task.get("upstream_task_id", ""),
+            "credential_id": task.get("credential_id", ""),
+            "submission_state": task.get("submission_state", ""),
+            "previous_cost": task.get("cost"),
+            "poll_started_ts": task.get("poll_started_ts"),
         }
         slot_token = f"{os.getpid()}:{threading.get_ident()}:{key}"
         acquire_slot = getattr(self.task_queue, "acquire_slot", None)
         release_slot = getattr(self.task_queue, "release_slot", None)
         distributed_slot = False
+        heartbeat_thread = threading.Thread(target=heartbeat, name="video-task-heartbeat", daemon=True)
+        heartbeat_thread.start()
         try:
             if callable(acquire_slot):
                 distributed_slot = bool(acquire_slot(slot_token, timeout_secs=5))
                 if not distributed_slot:
-                    updated = self.task_store.update_task(
-                        key,
-                        {
-                            "status": TASK_STATUS_QUEUED,
-                            "progress": "waiting_for_slot",
-                            "error": "",
-                            "updated_at": _now_iso(),
-                            "updated_ts": time.time(),
-                        },
-                        expected_status=TASK_STATUS_RUNNING,
-                    )
-                    if updated is not None and self.task_queue is not None:
-                        self.task_queue.enqueue(key)
+                    update(status=TASK_STATUS_QUEUED, execution_token="", progress="waiting_for_slot",
+                           next_attempt_ts=time.time() + 2)
                     return
-            self._update_unless_canceled(key, progress="submitting")
-            result = self.generation_handler(handler_payload)
+            checkpoint()
+            # Transfer retries reuse the persisted result, never a new paid generation.
+            result = task.get("upstream_result") or self.generation_handler(handler_payload)
             if not isinstance(result, dict):
                 raise RuntimeError("video generation handler did not return an object")
             video_url = _clean(result.get("video_url"), limit=2000)
             if not video_url:
                 raise RuntimeError("video generation result missing video_url")
+            checkpoint()
+            current = self.task_store.get_task(key) or task
+            update(upstream_result=result, upstream_task_id=result.get("upstream_task_id") or current.get("upstream_task_id", ""),
+                   cost=result.get("cost"), submission_state="completed", reconciliation_required=False)
+            source_video_url = video_url
+            stored_video = None
+            storage_error = ""
+            if self.download_results_getter():
+                try:
+                    stored_video = self.result_storage_handler(
+                        video_url,
+                        owner_id=owner_id,
+                        task_id=_clean(task.get("id"), "video-task", 191),
+                        base_url=config.base_url,
+                    )
+                    video_url = stored_video.url
+                except Exception as exc:
+                    storage_error = _clean(str(exc), limit=1000)
+                    update(storage_pending=True, storage_error=storage_error, progress="storage_pending")
+                    LOGGER.error("Video result persistence failed for %s: %s", key, storage_error)
+                    if self._retry_task(key, storage_error, int((time.time() - started) * 1000),
+                                        token=token, stage="storage"):
+                        return
+                    update(status=TASK_STATUS_ERROR, execution_token="", error="Video generated but storage failed; retry storage only.")
+                    return
             data = [{
                 "type": "video",
                 "url": video_url,
                 "cover_url": _clean(result.get("cover_url"), limit=2000),
             }]
             duration_ms = int((time.time() - started) * 1000)
-            if not self._update_unless_canceled(
-                key,
+            checkpoint()
+            update(
                 status=TASK_STATUS_SUCCESS,
+                execution_token="",
                 progress="completed",
                 video_url=video_url,
                 cover_url=_clean(result.get("cover_url"), limit=2000),
                 data=data,
                 cost=result.get("cost"),
-                upstream_task_id=_clean(result.get("upstream_task_id"), limit=191),
+                upstream_task_id=_clean(result.get("upstream_task_id") or current.get("upstream_task_id"), limit=191),
                 raw_result=result.get("raw") if isinstance(result.get("raw"), dict) else {},
                 duration_ms=duration_ms,
+                source_video_url=source_video_url if stored_video is not None else "",
+                storage=stored_video.storage if stored_video is not None else "remote",
+                storage_rel=stored_video.relative_path if stored_video is not None else "",
+                file_size=stored_video.size if stored_video is not None else None,
+                storage_error=storage_error,
+                storage_pending=False,
+                reconciliation_required=False,
+                completed_at=_now_iso(),
+                **({"storage_object_key": getattr(stored_video, "object_key", ""),
+                    "storage_bucket": getattr(stored_video, "bucket", "")} if stored_video else {}),
                 error="",
-            ):
-                return
+            )
             self._log_call(identity, task, started, "completed")
+        except LeaseLost:
+            LOGGER.warning("Video execution stopped after lease/cancellation change: %s", key)
         except Exception as exc:
             error_message = str(exc) or "video generation failed"
             duration_ms = int((time.time() - started) * 1000)
-            if self._retry_task(key, error_message, duration_ms):
+            current = self.task_store.get_task(key) or {}
+            if current.get("execution_token") != token or current.get("status") != TASK_STATUS_RUNNING:
+                return
+            exception_upstream_id = _clean(getattr(exc, "upstream_task_id", ""), limit=191)
+            exception_credential_id = _clean(getattr(exc, "credential_id", ""), limit=191)
+            exception_cost = getattr(exc, "cost", None)
+            recovery_metadata: dict[str, Any] = {}
+            if exception_upstream_id:
+                recovery_metadata.update(
+                    upstream_task_id=exception_upstream_id,
+                    submission_state="submitted",
+                )
+            if exception_credential_id:
+                recovery_metadata["credential_id"] = exception_credential_id
+            if exception_cost is not None:
+                recovery_metadata["cost"] = exception_cost
+            if recovery_metadata:
+                current = update(**recovery_metadata)
+            known_upstream = bool(current.get("upstream_task_id") or exception_upstream_id)
+            if isinstance(exc, VideoGenerationProviderError):
+                uncertain = bool(exc.submission_uncertain) and not known_upstream
+            else:
+                uncertain = current.get("submission_state") == "submitting" and not known_upstream
+            retryable = bool(getattr(exc, "retryable", False)) and not uncertain
+            if retryable and not known_upstream:
+                current = update(submission_state="rejected")
+            if retryable and self._retry_task(key, error_message, duration_ms, token=token):
                 self._log_call(identity, task, started, "failed, retry queued", status="failed", error=error_message)
                 return
-            if not self._update_unless_canceled(
-                key,
+            update(
                 status=TASK_STATUS_ERROR,
-                progress="failed",
+                execution_token="",
+                progress="submission_uncertain" if uncertain else "failed",
+                reconciliation_required=uncertain or (known_upstream and not getattr(exc, "upstream_finished", False)),
                 error=error_message,
                 duration_ms=duration_ms,
-            ):
-                return
+                completed_at=_now_iso(),
+            )
             self._log_call(identity, task, started, "failed", status="failed", error=error_message)
         finally:
+            heartbeat_done.set()
+            heartbeat_thread.join(timeout=15)
             if distributed_slot and callable(release_slot):
-                release_slot(slot_token)
+                try:
+                    release_slot(slot_token)
+                except Exception:
+                    LOGGER.exception("Video capacity release failed; lease will expire")
 
     def _update_unless_canceled(self, key: str, **updates: Any) -> bool:
         updates["updated_at"] = _now_iso()
@@ -504,33 +862,40 @@ class VideoGenerationTaskService:
                 pass
         return updated is not None
 
-    def _retry_task(self, key: str, error_message: str, duration_ms: int) -> bool:
+    def _retry_task(self, key: str, error_message: str, duration_ms: int, *, token: str, stage: str = "provider") -> bool:
         if self.task_queue is None or self.run_inline:
             return False
         with self._lock:
             task = self.task_store.get_task(key)
             if task is None or task.get("status") == TASK_STATUS_CANCELED:
                 return False
-            attempts = int(task.get("attempts") or 0) + 1
-            max_retries = max(0, int(task.get("max_retries") or self.max_retries_getter()))
+            counter = "storage_attempts" if stage == "storage" else "attempts"
+            attempts = int(task.get(counter) or 0) + 1
+            max_retries = _env_seconds("VIDEO_GENERATION_STORAGE_MAX_RETRIES", 3, 0) if stage == "storage" else max(0, int(task.get("max_retries", self.max_retries_getter())))
             if attempts > max_retries:
                 return False
+            delay = min(_env_seconds("VIDEO_GENERATION_RETRY_MAX_DELAY_SECS", 120),
+                        _env_seconds("VIDEO_GENERATION_RETRY_BASE_DELAY_SECS", 5) * 2 ** (attempts - 1))
+            delay *= random.uniform(1, 1.2)
             updated = self.task_store.update_task(
                 key,
                 {
                     "status": TASK_STATUS_QUEUED,
-                    "attempts": attempts,
+                    counter: attempts,
+                    "execution_token": "",
+                    "next_attempt_ts": time.time() + delay,
                     "progress": f"retrying:{attempts}/{max_retries}",
                     "error": error_message,
                     "duration_ms": duration_ms,
                     "updated_at": _now_iso(),
                     "updated_ts": time.time(),
                 },
-                reject_status=TASK_STATUS_CANCELED,
+                expected_token=token,
+                expected_status=TASK_STATUS_RUNNING,
             )
             should_enqueue = updated is not None
         if should_enqueue and self.task_queue is not None:
-            self.task_queue.enqueue(key)
+            self._enqueue(key, delay)
         return should_enqueue
 
     def _log_call(

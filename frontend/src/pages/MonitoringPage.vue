@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   Activity,
+  AudioLines,
   ArrowDown,
   ArrowDownUp,
   ArrowUp,
@@ -19,19 +20,21 @@ import {
   Save,
   Search,
   Server,
+  Video,
   Wifi,
   WifiOff,
   Workflow,
   X,
   Zap,
 } from "@lucide/vue";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import AnimatedNumber from "@/components/AnimatedNumber.vue";
 import AnimatedSuccessRing from "@/components/AnimatedSuccessRing.vue";
 import ReferenceImagePreview from "@/components/image/ReferenceImagePreview.vue";
+import { useVisibilityAwareInterval } from "@/composables/useVisibilityAwareInterval";
 import {
   fetchMonitoringSummary,
   fetchMonitoringTasks,
@@ -43,8 +46,10 @@ import {
   type MonitoringTaskDetail,
   type MonitoringTaskReferenceImage,
   type MonitoringTaskDetails,
+  type MonitoringSource,
   type MonitoringUserStat,
 } from "@/lib/api";
+import { storageKey } from "@/lib/storage-namespace";
 
 const summary = ref<MonitoringSummary | null>(null);
 const query = ref("");
@@ -53,10 +58,11 @@ const refreshing = ref(false);
 const lastUpdated = ref("");
 const loadError = ref("");
 const autoRefresh = ref(true);
-let timer = 0;
 let requestSequence = 0;
 const route = useRoute();
 const router = useRouter();
+const MONITORING_AUTO_REFRESH_STORAGE_KEY = storageKey("raw-monitoring-auto-refresh");
+const { restart: restartAutoRefresh } = useVisibilityAwareInterval(() => load(true), 15_000);
 
 type SortDirection = "asc" | "desc";
 type UserSortKey = "success" | "failed" | "running" | "queued" | "total" | "cost" | "load";
@@ -65,6 +71,13 @@ type UserScope = "with-output" | "online" | "all";
 type DetailStatus = "all" | "success" | "error";
 
 const rangePreset = ref<RangePreset>("today");
+const monitoringSource = ref<MonitoringSource>("image");
+
+const sourceOptions = [
+  { value: "image" as const, label: "生图监控", icon: Images },
+  { value: "video" as const, label: "生视频监控", icon: Video },
+  { value: "audio" as const, label: "音频监控", icon: AudioLines },
+];
 
 function startOfToday() {
   const value = new Date();
@@ -115,23 +128,27 @@ const userScope = ref<UserScope>("with-output");
 const userPage = ref(1);
 const selectedDetails = ref<MonitoringTaskDetails | null>(null);
 const detailLoading = ref(false);
+const detailLoadingMore = ref(false);
 const detailError = ref("");
 const detailPanelOpen = ref(false);
 const selectedDetailStatus = ref<DetailStatus>("all");
 const selectedDetailUser = ref<MonitoringUserStat | null>(null);
 const imageGalleryOpen = ref(false);
 const imageGalleryLoading = ref(false);
+const imageGalleryLoadingMore = ref(false);
 const imageGalleryError = ref("");
 const imageGalleryDetails = ref<MonitoringTaskDetails | null>(null);
 const imageGalleryUser = ref<MonitoringUserStat | null>(null);
 const referenceGalleryOpen = ref(false);
 const referenceGalleryLoading = ref(false);
+const referenceGalleryLoadingMore = ref(false);
 const referenceGalleryError = ref("");
 const referenceGalleryDetails = ref<MonitoringTaskDetails | null>(null);
 const referenceGalleryUser = ref<MonitoringUserStat | null>(null);
 const expandedMobileUserId = ref("");
 const referencePreview = ref<{ previewUrl: string; label: string; subtitle: string } | null>(null);
 const USER_PAGE_SIZE = 20;
+const MONITORING_DETAIL_PAGE_SIZE = 60;
 
 const userSortColumns: { key: UserSortKey; label: string }[] = [
   { key: "success", label: "成功" },
@@ -248,7 +265,12 @@ function isValidRangePreset(value: unknown): value is RangePreset {
   return ["today", "7d", "30d", "all", "custom"].includes(String(value));
 }
 
+function isValidMonitoringSource(value: unknown): value is MonitoringSource {
+  return value === "image" || value === "video" || value === "audio";
+}
+
 function restoreRangeFromUrl() {
+  monitoringSource.value = isValidMonitoringSource(route.query.source) ? route.query.source : "image";
   const preset = String(route.query.range || "today");
   rangePreset.value = isValidRangePreset(preset) ? preset : "today";
   if (rangePreset.value !== "custom") return;
@@ -265,7 +287,7 @@ function restoreRangeFromUrl() {
 }
 
 function syncRangeUrl() {
-  const nextQuery = { ...route.query, range: rangePreset.value } as Record<string, string | undefined>;
+  const nextQuery = { ...route.query, range: rangePreset.value, source: monitoringSource.value } as Record<string, string | undefined>;
   if (rangePreset.value === "custom") {
     nextQuery.start = preciseTime.value ? customStart.value : customStartDate.value;
     nextQuery.end = preciseTime.value ? customEnd.value : customEndDate.value;
@@ -277,6 +299,45 @@ function syncRangeUrl() {
     delete nextQuery.precise;
   }
   void router.replace({ query: nextQuery });
+}
+
+function sourceLabel() {
+  return {
+    image: "生图",
+    video: "生视频",
+    audio: "音频生成",
+  }[monitoringSource.value];
+}
+
+function sourceUnit() {
+  return {
+    image: "图",
+    video: "视频",
+    audio: "音频",
+  }[monitoringSource.value];
+}
+
+function sourceCountUnit() {
+  return {
+    image: "张图",
+    video: "个视频",
+    audio: "条音频",
+  }[monitoringSource.value];
+}
+
+function selectMonitoringSource(value: MonitoringSource) {
+  if (monitoringSource.value === value) return;
+  monitoringSource.value = value;
+  selectedDetails.value = null;
+  detailPanelOpen.value = false;
+  imageGalleryOpen.value = false;
+  referenceGalleryOpen.value = false;
+  imageGalleryDetails.value = null;
+  referenceGalleryDetails.value = null;
+  referencePreview.value = null;
+  userPage.value = 1;
+  syncRangeUrl();
+  void load(true);
 }
 
 function rangeForSelection() {
@@ -337,7 +398,7 @@ async function load(silent = false) {
   const sequence = ++requestSequence;
   silent ? (refreshing.value = true) : (loading.value = true);
   try {
-    const nextSummary = await fetchMonitoringSummary(selectedRange());
+    const nextSummary = await fetchMonitoringSummary({ ...selectedRange(), source: monitoringSource.value });
     if (sequence !== requestSequence) return;
     summary.value = nextSummary;
     loadError.value = "";
@@ -379,19 +440,14 @@ function applyCustomRange() {
   void load(true);
 }
 
-function restartRefreshTimer() {
-  window.clearInterval(timer);
-  timer = autoRefresh.value ? window.setInterval(() => void load(true), 15000) : 0;
-}
-
 function toggleAutoRefresh() {
   autoRefresh.value = !autoRefresh.value;
   try {
-    window.localStorage.setItem("raw-monitoring-auto-refresh", String(autoRefresh.value));
+    window.localStorage.setItem(MONITORING_AUTO_REFRESH_STORAGE_KEY, String(autoRefresh.value));
   } catch {
     // Local storage can be unavailable in private or embedded browser contexts.
   }
-  restartRefreshTimer();
+  restartAutoRefresh(autoRefresh.value);
 }
 
 function taskStatusLabel(status: DetailStatus) {
@@ -411,13 +467,15 @@ async function openTaskDetails(user: MonitoringUserStat | null, status: DetailSt
   selectedDetailStatus.value = status;
   selectedDetails.value = null;
   detailError.value = "";
+  detailLoadingMore.value = false;
   detailLoading.value = true;
   try {
     selectedDetails.value = await fetchMonitoringTasks({
       ...selectedRange(),
+      source: monitoringSource.value,
       ownerId: user?.user_id,
       status,
-      limit: 100,
+      limit: MONITORING_DETAIL_PAGE_SIZE,
       includeReferences: true,
     });
   } catch (error) {
@@ -428,10 +486,47 @@ async function openTaskDetails(user: MonitoringUserStat | null, status: DetailSt
   }
 }
 
+function monitoringDetailsHasMore(details: MonitoringTaskDetails | null) {
+  return Boolean(details && (details.has_more ?? details.truncated));
+}
+
+function mergeMonitoringDetails(current: MonitoringTaskDetails, next: MonitoringTaskDetails): MonitoringTaskDetails {
+  const seen = new Set(current.items.map((item) => item.row_key));
+  return {
+    ...next,
+    items: [...current.items, ...next.items.filter((item) => !seen.has(item.row_key))],
+    offset: 0,
+  };
+}
+
+async function loadMoreTaskDetails() {
+  const current = selectedDetails.value;
+  if (!current || !monitoringDetailsHasMore(current) || detailLoadingMore.value) return;
+  detailLoadingMore.value = true;
+  try {
+    const next = await fetchMonitoringTasks({
+      ...selectedRange(),
+      source: monitoringSource.value,
+      ownerId: selectedDetailUser.value?.user_id,
+      status: selectedDetailStatus.value,
+      limit: MONITORING_DETAIL_PAGE_SIZE,
+      cursor: current.next_cursor,
+      includeReferences: true,
+    });
+    selectedDetails.value = mergeMonitoringDetails(current, next);
+  } catch (error) {
+    detailError.value = error instanceof Error ? error.message : "读取更多任务明细失败";
+    toast.error(detailError.value);
+  } finally {
+    detailLoadingMore.value = false;
+  }
+}
+
 function closeTaskDetails() {
   detailPanelOpen.value = false;
   selectedDetails.value = null;
   detailError.value = "";
+  detailLoadingMore.value = false;
 }
 
 function taskDetailReferenceItems(item: MonitoringTaskDetail) {
@@ -478,13 +573,15 @@ async function openUserImageGallery(user: MonitoringUserStat) {
   imageGalleryUser.value = user;
   imageGalleryDetails.value = null;
   imageGalleryError.value = "";
+  imageGalleryLoadingMore.value = false;
   imageGalleryLoading.value = true;
   try {
     imageGalleryDetails.value = await fetchMonitoringTasks({
       ...selectedRange(),
+      source: "image",
       ownerId: user.user_id,
       status: "success",
-      limit: 500,
+      limit: MONITORING_DETAIL_PAGE_SIZE,
     });
   } catch (error) {
     imageGalleryError.value = error instanceof Error ? error.message : "读取生成图片失败";
@@ -494,13 +591,38 @@ async function openUserImageGallery(user: MonitoringUserStat) {
   }
 }
 
+async function loadMoreUserImages() {
+  const current = imageGalleryDetails.value;
+  const user = imageGalleryUser.value;
+  if (!current || !user || !monitoringDetailsHasMore(current) || imageGalleryLoadingMore.value) return;
+  imageGalleryLoadingMore.value = true;
+  try {
+    const next = await fetchMonitoringTasks({
+      ...selectedRange(),
+      source: "image",
+      ownerId: user.user_id,
+      status: "success",
+      limit: MONITORING_DETAIL_PAGE_SIZE,
+      cursor: current.next_cursor,
+    });
+    imageGalleryDetails.value = mergeMonitoringDetails(current, next);
+  } catch (error) {
+    imageGalleryError.value = error instanceof Error ? error.message : "读取更多生成图片失败";
+    toast.error(imageGalleryError.value);
+  } finally {
+    imageGalleryLoadingMore.value = false;
+  }
+}
+
 function closeUserImageGallery() {
   imageGalleryOpen.value = false;
   imageGalleryDetails.value = null;
   imageGalleryError.value = "";
+  imageGalleryLoadingMore.value = false;
   referenceGalleryOpen.value = false;
   referenceGalleryDetails.value = null;
   referenceGalleryError.value = "";
+  referenceGalleryLoadingMore.value = false;
 }
 
 function referenceGalleryTitle() {
@@ -551,13 +673,15 @@ async function openUserReferenceGallery(user: MonitoringUserStat) {
   referenceGalleryUser.value = user;
   referenceGalleryDetails.value = null;
   referenceGalleryError.value = "";
+  referenceGalleryLoadingMore.value = false;
   referenceGalleryLoading.value = true;
   try {
     referenceGalleryDetails.value = await fetchMonitoringTasks({
       ...selectedRange(),
+      source: "image",
       ownerId: user.user_id,
       status: "all",
-      limit: 500,
+      limit: MONITORING_DETAIL_PAGE_SIZE,
       includeReferences: true,
     });
   } catch (error) {
@@ -568,10 +692,35 @@ async function openUserReferenceGallery(user: MonitoringUserStat) {
   }
 }
 
+async function loadMoreUserReferences() {
+  const current = referenceGalleryDetails.value;
+  const user = referenceGalleryUser.value;
+  if (!current || !user || !monitoringDetailsHasMore(current) || referenceGalleryLoadingMore.value) return;
+  referenceGalleryLoadingMore.value = true;
+  try {
+    const next = await fetchMonitoringTasks({
+      ...selectedRange(),
+      source: "image",
+      ownerId: user.user_id,
+      status: "all",
+      limit: MONITORING_DETAIL_PAGE_SIZE,
+      cursor: current.next_cursor,
+      includeReferences: true,
+    });
+    referenceGalleryDetails.value = mergeMonitoringDetails(current, next);
+  } catch (error) {
+    referenceGalleryError.value = error instanceof Error ? error.message : "读取更多上传参考图失败";
+    toast.error(referenceGalleryError.value);
+  } finally {
+    referenceGalleryLoadingMore.value = false;
+  }
+}
+
 function closeUserReferenceGallery() {
   referenceGalleryOpen.value = false;
   referenceGalleryDetails.value = null;
   referenceGalleryError.value = "";
+  referenceGalleryLoadingMore.value = false;
 }
 
 function detailOwnerName(item: MonitoringTaskDetail) {
@@ -590,7 +739,7 @@ function csvCell(value: unknown) {
 
 function exportUsersCsv() {
   const rows = [
-    ["用户", "用户名", "角色", "在线状态", "成功图数", "失败图数", "合计图数", "费用", "计费次数", "平均费用", "运行中", "排队中", "当前负载"],
+    ["用户", "用户名", "角色", "在线状态", `成功${sourceUnit()}`, `失败${sourceUnit()}`, `合计${sourceUnit()}`, "费用", "计费次数", "平均费用", "运行中", "排队中", "当前负载"],
     ...sortedUsers.value.map((user) => [
       user.name || user.username,
       user.username,
@@ -621,6 +770,9 @@ const queue = computed<MonitoringQueueSummary | null>(() => summary.value?.task_
 const agentQueue = computed<MonitoringAgentQueueSummary | null>(() => summary.value?.agent_queue || null);
 const latency = computed<MonitoringLatencySummary | null>(() => summary.value?.task_latency || null);
 const stageLatency = computed(() => summary.value?.stage_latency || null);
+const isImageSource = computed(() => monitoringSource.value === "image");
+const isVideoSource = computed(() => monitoringSource.value === "video");
+const isAudioSource = computed(() => monitoringSource.value === "audio");
 
 function formatDuration(value: number) {
   if (value >= 1000) return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}s`;
@@ -753,9 +905,9 @@ const stageMetrics = computed(() => {
   const stages = stageLatency.value;
   if (!stages) return [];
   return [
-    { label: "参考图上传", value: stages.upload, icon: CloudUpload, tone: "text-sky-600" },
+    { label: isAudioSource.value ? "文本提交" : "参考图上传", value: stages.upload, icon: CloudUpload, tone: "text-sky-600" },
     { label: "队列等待", value: stages.queue, icon: Workflow, tone: "text-amber-600" },
-    { label: "上游生成", value: stages.generation, icon: Zap, tone: "text-[#4F7CFF]" },
+    { label: isVideoSource.value ? "视频生成" : isAudioSource.value ? "音频生成" : "上游生成", value: stages.generation, icon: Zap, tone: "text-[#4F7CFF]" },
     { label: "结果保存", value: stages.save, icon: Save, tone: "text-emerald-600" },
   ].filter((item) => item.value.sample_size > 0);
 });
@@ -764,12 +916,12 @@ onMounted(() => {
   restoreRangeFromUrl();
   commitRangeSelection();
   try {
-    autoRefresh.value = window.localStorage.getItem("raw-monitoring-auto-refresh") !== "false";
+    autoRefresh.value = window.localStorage.getItem(MONITORING_AUTO_REFRESH_STORAGE_KEY) !== "false";
   } catch {
     autoRefresh.value = true;
   }
   void load();
-  restartRefreshTimer();
+  restartAutoRefresh(autoRefresh.value);
 });
 
 watch([query, userScope, userSortKey, userSortDirection], () => {
@@ -780,7 +932,6 @@ watch(userTotalPages, (totalPages) => {
   if (userPage.value > totalPages) userPage.value = totalPages;
 });
 
-onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
 <template>
@@ -795,8 +946,22 @@ onBeforeUnmount(() => window.clearInterval(timer));
             </div>
             <h1 class="text-[30px] font-semibold text-slate-950 dark:text-stone-50">运行监控</h1>
             <p class="max-w-3xl text-[15px] leading-7 text-slate-600 dark:text-stone-300">
-              运行状态每 15 秒刷新，生成量与耗时按所选日期统计。最近更新 {{ lastUpdated || "暂无" }}。
+              {{ sourceLabel() }}运行状态每 15 秒刷新，生成量与耗时按所选日期统计。最近更新 {{ lastUpdated || "暂无" }}。
             </p>
+            <div class="inline-flex max-w-full overflow-x-auto rounded-xl bg-[#F1F5F9] p-1 dark:bg-white/[0.06]" aria-label="监控来源">
+              <button
+                v-for="option in sourceOptions"
+                :key="option.value"
+                type="button"
+                class="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg px-3 text-[13px] font-medium text-slate-500 transition-colors"
+                :class="monitoringSource === option.value ? 'bg-white text-[#315be8] shadow-sm dark:bg-white/10 dark:text-white' : 'hover:text-slate-900 dark:hover:text-white'"
+                :aria-pressed="monitoringSource === option.value"
+                @click="selectMonitoringSource(option.value)"
+              >
+                <component :is="option.icon" class="size-4" />
+                {{ option.label }}
+              </button>
+            </div>
           </div>
 
           <div class="flex flex-wrap items-center gap-3">
@@ -893,7 +1058,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
               </div>
               <p class="mt-1 max-w-2xl text-[13px] leading-5 text-slate-500">
                 {{ queueState.detail }}。{{ queue?.executor || "inline" }} 模式，worker {{ formatNumber(queue?.active_workers || 0) }}，心跳 {{ formatNumber(queue?.worker_heartbeat_secs || 0) }}s。
-                <span v-if="queue?.queue_depths">标准 {{ formatNumber(queue.queue_depths.standard || 0) }} / 智能体 {{ formatNumber(queue.queue_depths.agent || 0) }} / 批量 {{ formatNumber(queue.queue_depths.batch || 0) }}。</span>
+                <span v-if="queue?.queue_depths && Object.keys(queue.queue_depths).length">标准 {{ formatNumber(queue.queue_depths.standard || 0) }} / 智能体 {{ formatNumber(queue.queue_depths.agent || 0) }} / 批量 {{ formatNumber(queue.queue_depths.batch || 0) }}。</span>
               </p>
             </div>
             <div class="text-right text-xs text-slate-500">
@@ -919,7 +1084,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
             </div>
           </div>
 
-          <div v-if="agentQueue" class="mt-4 border-t border-black/[0.06] pt-4 dark:border-white/10">
+          <div v-if="agentQueue && isImageSource" class="mt-4 border-t border-black/[0.06] pt-4 dark:border-white/10">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div class="flex min-w-0 items-start gap-2.5">
                 <Bot class="mt-0.5 size-4 shrink-0 text-[#4F7CFF]" />
@@ -1044,14 +1209,14 @@ onBeforeUnmount(() => window.clearInterval(timer));
         <div class="studio-card bg-white p-4 dark:bg-[#171a21] xl:col-span-2">
           <div class="flex items-center justify-between gap-4">
             <div>
-              <h2 class="text-[20px] font-semibold">生图数量</h2>
+              <h2 class="text-[20px] font-semibold">{{ sourceLabel() }}数量</h2>
               <p class="mt-1 text-[13px] text-slate-500">统计范围：{{ activeRangeLabel }}。</p>
             </div>
             <span class="rounded-full bg-[#4F7CFF]/10 px-3 py-1 text-xs font-semibold text-[#315be8]">每 15 秒更新</span>
           </div>
           <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <button type="button" class="rounded-xl bg-[#F1F5F9] px-4 py-5 text-left transition-colors hover:bg-slate-200 dark:bg-white/[0.05] dark:hover:bg-white/[0.09]" @click="openTaskDetails(null, 'all')">
-              <p class="text-xs font-medium text-slate-500">总处理图数</p>
+              <p class="text-xs font-medium text-slate-500">总处理{{ sourceUnit() }}数</p>
               <p class="mt-2 text-[30px] font-semibold tabular-nums text-slate-950 dark:text-stone-50">
                 <AnimatedNumber :value="totalGenerated" :formatter="formatNumber" />
               </p>
@@ -1098,8 +1263,8 @@ onBeforeUnmount(() => window.clearInterval(timer));
       <div class="studio-card bg-white p-5 dark:bg-[#171a21]">
         <div class="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
-            <h2 class="text-[22px] font-semibold">用户生成统计</h2>
-            <p class="mt-1 text-[13px] text-slate-500">成功、失败和合计图数按 {{ activeRangeLabel }} 统计；运行与排队为当前实时状态。</p>
+            <h2 class="text-[22px] font-semibold">用户{{ sourceLabel() }}统计</h2>
+            <p class="mt-1 text-[13px] text-slate-500">成功、失败和合计{{ sourceUnit() }}数按 {{ activeRangeLabel }} 统计；运行与排队为当前实时状态。</p>
           </div>
           <div class="flex w-full flex-col gap-2 xl:w-auto xl:items-end">
             <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -1200,25 +1365,38 @@ onBeforeUnmount(() => window.clearInterval(timer));
                 <div class="min-w-0">
                   <div class="flex min-w-0 items-center gap-2">
                     <span class="truncate text-[15px] font-semibold text-slate-950 dark:text-stone-50">{{ user.name || user.username }}</span>
+                    <template v-if="isImageSource">
+                      <button
+                        type="button"
+                        class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+                        :disabled="!user.success_count"
+                        :aria-label="`查看${user.name || user.username || '用户'}生成的图片`"
+                        title="查看生成图片"
+                        @click="openUserImageGallery(user)"
+                      >
+                        <Images class="size-4" />
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+                        :disabled="!userHasTaskHistory(user)"
+                        :aria-label="`查看${user.name || user.username || '用户'}上传的参考图`"
+                        title="查看上传参考图"
+                        @click="openUserReferenceGallery(user)"
+                      >
+                        <CloudUpload class="size-4" />
+                      </button>
+                    </template>
                     <button
+                      v-else
                       type="button"
-                      class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
+                      class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35"
                       :disabled="!user.success_count"
-                      :aria-label="`查看${user.name || user.username || '用户'}生成的图片`"
-                      title="查看生成图片"
-                      @click="openUserImageGallery(user)"
+                      :aria-label="`查看${user.name || user.username || '用户'}生成的${sourceUnit()}任务`"
+                      :title="`查看生成${sourceUnit()}任务`"
+                      @click="openTaskDetails(user, 'success')"
                     >
-                      <Images class="size-4" />
-                    </button>
-                    <button
-                      type="button"
-                      class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35 disabled:hover:bg-transparent disabled:hover:text-slate-400"
-                      :disabled="!userHasTaskHistory(user)"
-                      :aria-label="`查看${user.name || user.username || '用户'}上传的参考图`"
-                      title="查看上传参考图"
-                      @click="openUserReferenceGallery(user)"
-                    >
-                      <CloudUpload class="size-4" />
+                      <component :is="isAudioSource ? AudioLines : Video" class="size-4" />
                     </button>
                     <span class="shrink-0 rounded-full bg-white px-2 py-1 text-[11px] text-slate-500 dark:bg-white/[0.08] dark:text-stone-300">
                       {{ roleLabel(user.role) }}
@@ -1303,25 +1481,38 @@ onBeforeUnmount(() => window.clearInterval(timer));
                   </div>
                   <component :is="expandedMobileUserId === user.user_id ? ChevronUp : ChevronDown" class="size-4 shrink-0 text-slate-400" />
                 </button>
+                <template v-if="isImageSource">
+                  <button
+                    type="button"
+                    class="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35"
+                    :disabled="!user.success_count"
+                    :aria-label="`查看${user.name || user.username || '用户'}生成的图片`"
+                    title="查看生成图片"
+                    @click="openUserImageGallery(user)"
+                  >
+                    <Images class="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35"
+                    :disabled="!userHasTaskHistory(user)"
+                    :aria-label="`查看${user.name || user.username || '用户'}上传的参考图`"
+                    title="查看上传参考图"
+                    @click="openUserReferenceGallery(user)"
+                  >
+                    <CloudUpload class="size-4" />
+                  </button>
+                </template>
                 <button
+                  v-else
                   type="button"
                   class="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35"
                   :disabled="!user.success_count"
-                  :aria-label="`查看${user.name || user.username || '用户'}生成的图片`"
-                  title="查看生成图片"
-                  @click="openUserImageGallery(user)"
+                  :aria-label="`查看${user.name || user.username || '用户'}生成的${sourceUnit()}任务`"
+                  :title="`查看生成${sourceUnit()}任务`"
+                  @click="openTaskDetails(user, 'success')"
                 >
-                  <Images class="size-4" />
-                </button>
-                <button
-                  type="button"
-                  class="inline-flex size-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-[#4F7CFF]/10 hover:text-[#315be8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 disabled:cursor-default disabled:opacity-35"
-                  :disabled="!userHasTaskHistory(user)"
-                  :aria-label="`查看${user.name || user.username || '用户'}上传的参考图`"
-                  title="查看上传参考图"
-                  @click="openUserReferenceGallery(user)"
-                >
-                  <CloudUpload class="size-4" />
+                  <component :is="isAudioSource ? AudioLines : Video" class="size-4" />
                 </button>
               </div>
 
@@ -1439,19 +1630,27 @@ onBeforeUnmount(() => window.clearInterval(timer));
             <template v-else-if="selectedDetails">
               <div class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-[#F8FAFC] px-4 py-3 dark:bg-white/[0.04]">
                 <div class="text-sm text-slate-500">
-                  共 <strong class="tabular-nums text-slate-950 dark:text-stone-50"><AnimatedNumber :value="selectedDetails.image_count" :formatter="formatNumber" /></strong> 张，<AnimatedNumber :value="selectedDetails.record_count" :formatter="formatNumber" /> 条记录
+                  共 <strong class="tabular-nums text-slate-950 dark:text-stone-50"><AnimatedNumber :value="selectedDetails.media_count ?? selectedDetails.image_count" :formatter="formatNumber" /></strong> {{ sourceCountUnit() }}，<AnimatedNumber :value="selectedDetails.record_count" :formatter="formatNumber" /> 条记录
                 </div>
                 <div v-if="selectedDetails.cost_count" class="text-sm text-slate-500">
                   费用 <strong class="tabular-nums text-slate-950 dark:text-stone-50"><AnimatedNumber :value="selectedDetails.cost_total" :formatter="formatCost" /></strong>，<AnimatedNumber :value="selectedDetails.cost_count" :formatter="formatNumber" /> 次计费
                 </div>
-                <span v-if="selectedDetails.truncated" class="text-xs text-amber-600">仅显示最近 {{ selectedDetails.limit }} 条</span>
+                <span v-if="monitoringDetailsHasMore(selectedDetails)" class="text-xs text-amber-600">
+                  已加载 {{ formatNumber(selectedDetails.items.length) }} / {{ formatNumber(selectedDetails.record_count) }} 条
+                </span>
               </div>
 
               <div v-if="selectedDetails.items.length" class="divide-y divide-black/[0.06] dark:divide-white/10">
                 <article v-for="item in selectedDetails.items" :key="item.row_key" class="flex gap-3 py-4 first:pt-0">
-                  <button v-if="item.image_url" type="button" class="size-16 shrink-0 overflow-hidden rounded-lg bg-slate-100 text-left transition-colors hover:ring-2 hover:ring-[#4F7CFF]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 dark:bg-white/[0.06]" @click="openGeneratedPreview(item)">
-                    <img :src="item.image_url" alt="生成结果缩略图" class="size-full object-cover" />
+                  <button v-if="item.image_url && isImageSource" type="button" class="size-16 shrink-0 overflow-hidden rounded-lg bg-slate-100 text-left transition-colors hover:ring-2 hover:ring-[#4F7CFF]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 dark:bg-white/[0.06]" @click="openGeneratedPreview(item)">
+                    <img :src="resolveApiAssetUrl(item.image_url)" alt="生成结果缩略图" class="size-full object-cover" />
                   </button>
+                  <a v-else-if="item.video_url" :href="resolveApiAssetUrl(item.video_url)" target="_blank" rel="noreferrer" class="size-16 shrink-0 overflow-hidden rounded-lg bg-slate-100 text-left transition-colors hover:ring-2 hover:ring-[#4F7CFF]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4F7CFF]/35 dark:bg-white/[0.06]" :aria-label="`打开${sourceLabel()}结果`">
+                    <video :src="resolveApiAssetUrl(item.video_url)" :poster="resolveApiAssetUrl(item.cover_url)" class="size-full object-cover" muted preload="metadata" />
+                  </a>
+                  <div v-else-if="item.audio_url" class="grid size-16 shrink-0 place-items-center rounded-lg bg-[#4F7CFF]/10 text-[#315be8] dark:bg-[#4F7CFF]/15 dark:text-[#8CA7FF]">
+                    <AudioLines class="size-6" />
+                  </div>
                   <div v-else class="grid size-16 shrink-0 place-items-center rounded-lg" :class="item.status === 'error' ? 'bg-rose-50 text-rose-600 dark:bg-rose-400/10' : 'bg-emerald-50 text-emerald-600 dark:bg-emerald-400/10'">
                     <X v-if="item.status === 'error'" class="size-5" />
                     <CheckCircle2 v-else class="size-5" />
@@ -1462,7 +1661,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
                         {{ item.status === 'error' ? '失败' : '成功' }}
                       </span>
                       <span class="text-xs text-slate-500">{{ detailOwnerName(item) }}</span>
-                      <span class="text-xs tabular-nums text-slate-400"><AnimatedNumber :value="item.image_count" :formatter="formatNumber" /> 张</span>
+                      <span class="text-xs tabular-nums text-slate-400"><AnimatedNumber :value="item.media_count ?? item.image_count" :formatter="formatNumber" /> {{ sourceUnit() }}</span>
                       <span v-if="hasCost(item.cost)" class="rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700 dark:bg-white/[0.08] dark:text-stone-200">
                         费用 <AnimatedNumber :value="item.cost" :formatter="formatCost" />
                       </span>
@@ -1475,6 +1674,13 @@ onBeforeUnmount(() => window.clearInterval(timer));
                       <span v-if="item.upstream_task_id" class="max-w-[180px] truncate" :title="item.upstream_task_id">上游 {{ item.upstream_task_id }}</span>
                       <span v-if="item.duration_ms">{{ formatDuration(item.duration_ms) }}</span>
                     </div>
+                    <audio
+                      v-if="item.audio_url"
+                      :src="resolveApiAssetUrl(item.audio_url)"
+                      class="mt-3 h-9 w-full max-w-xl"
+                      controls
+                      preload="none"
+                    />
                     <div v-if="taskDetailReferenceItems(item).length" class="mt-3 flex gap-2 overflow-x-auto pb-1">
                       <button
                         v-for="reference in taskDetailReferenceItems(item)"
@@ -1491,6 +1697,17 @@ onBeforeUnmount(() => window.clearInterval(timer));
                     </div>
                   </div>
                 </article>
+                <div v-if="monitoringDetailsHasMore(selectedDetails)" class="flex justify-center pt-4">
+                  <button
+                    type="button"
+                    class="studio-button inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-black/[0.08] px-4 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:text-stone-200"
+                    :disabled="detailLoadingMore"
+                    @click="loadMoreTaskDetails"
+                  >
+                    <RefreshCw class="size-4" :class="detailLoadingMore ? 'animate-spin' : ''" />
+                    {{ detailLoadingMore ? '加载中' : '加载更多' }}
+                  </button>
+                </div>
               </div>
               <div v-else class="grid min-h-48 place-items-center text-center text-sm text-slate-500">
                 当前筛选范围没有任务明细。
@@ -1524,7 +1741,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
             <template v-else-if="imageGalleryDetails">
               <div class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-[#F8FAFC] px-4 py-3 dark:bg-white/[0.04]">
                 <div class="text-sm text-slate-500">
-                  共 <strong class="text-slate-950 dark:text-stone-50">{{ formatNumber(imageGalleryItems.length) }}</strong> 张可预览图片
+                  已加载 <strong class="text-slate-950 dark:text-stone-50">{{ formatNumber(imageGalleryItems.length) }}</strong> 张可预览图片
                 </div>
                 <button
                   type="button"
@@ -1554,6 +1771,16 @@ onBeforeUnmount(() => window.clearInterval(timer));
                       <span v-if="item.model" class="shrink-0">{{ item.model }}</span>
                     </div>
                   </div>
+                </button>
+                <button
+                  v-if="monitoringDetailsHasMore(imageGalleryDetails)"
+                  type="button"
+                  class="studio-button col-span-full mx-auto mt-2 inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-black/[0.08] px-4 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:text-stone-200"
+                  :disabled="imageGalleryLoadingMore"
+                  @click="loadMoreUserImages"
+                >
+                  <RefreshCw class="size-4" :class="imageGalleryLoadingMore ? 'animate-spin' : ''" />
+                  {{ imageGalleryLoadingMore ? '加载中' : '加载更多图片' }}
                 </button>
               </div>
               <div v-else class="grid min-h-56 place-items-center rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-500 dark:border-white/10">
@@ -1588,7 +1815,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
             <template v-else-if="referenceGalleryDetails">
               <div class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-[#F8FAFC] px-4 py-3 dark:bg-white/[0.04]">
                 <div class="text-sm text-slate-500">
-                  共 <strong class="text-slate-950 dark:text-stone-50">{{ formatNumber(referenceGalleryItems.length) }}</strong> 张上传参考图，来自 {{ formatNumber(referenceGalleryDetails.record_count) }} 条任务
+                  已加载 <strong class="text-slate-950 dark:text-stone-50">{{ formatNumber(referenceGalleryItems.length) }}</strong> 张上传参考图，筛选范围共 {{ formatNumber(referenceGalleryDetails.record_count) }} 条任务
                 </div>
                 <button
                   type="button"
@@ -1623,6 +1850,16 @@ onBeforeUnmount(() => window.clearInterval(timer));
                       <span v-if="item.model" class="shrink-0">{{ item.model }}</span>
                     </div>
                   </div>
+                </button>
+                <button
+                  v-if="monitoringDetailsHasMore(referenceGalleryDetails)"
+                  type="button"
+                  class="studio-button col-span-full mx-auto mt-2 inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-black/[0.08] px-4 text-sm font-semibold text-slate-700 disabled:cursor-not-allowed disabled:opacity-50 dark:border-white/10 dark:text-stone-200"
+                  :disabled="referenceGalleryLoadingMore"
+                  @click="loadMoreUserReferences"
+                >
+                  <RefreshCw class="size-4" :class="referenceGalleryLoadingMore ? 'animate-spin' : ''" />
+                  {{ referenceGalleryLoadingMore ? '加载中' : '加载更多参考图' }}
                 </button>
               </div>
               <div v-else class="grid min-h-56 place-items-center rounded-xl border border-dashed border-slate-300 text-center text-sm text-slate-500 dark:border-white/10">

@@ -7,6 +7,7 @@ import base64
 import atexit
 import os
 import socket
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -14,10 +15,15 @@ from pathlib import Path
 from typing import Any
 
 from services.providers import openai_relay_service
+from services.providers.openai_relay_pool import (
+    RelaySubmissionUnknownHTTPException,
+    RelaySubmittedHTTPException,
+)
 from services.platform.config import DATA_DIR, config
 from services.platform.content_filter import request_text
 from services.image.generation_monitoring_service import generation_monitoring_service
 from services.platform.log_service import LOG_TYPE_CALL, log_service
+from services.platform.realtime_event_service import realtime_event_service
 from services.image.image_library_service import image_library_service
 from services.image.image_prompt_compliance import (
     SUBJECT_POLICY_MUTATE,
@@ -28,14 +34,20 @@ from services.image.image_prompt_compliance import (
     sanitize_image_prompt,
     standard_edit_allows_product_mutation,
 )
-from services.image.image_size import normalize_image_size
+from services.image.image_size import canvas_expected_size, canvas_media_request_size, normalize_image_size
 from services.image.image_task_assets import (
+    ImageAspectRatioMismatchError,
     decode_task_payload,
     download_result_image,
     normalize_task_result,
     prepare_task_payload,
 )
-from services.image.image_task_queue import CeleryImageTaskQueue, ImageTaskQueue, RedisImageTaskQueue
+from services.image.image_task_queue import (
+    CeleryImageTaskQueue,
+    ImageTaskDelivery,
+    ImageTaskQueue,
+    RedisImageTaskQueue,
+)
 from services.image.image_task_store import DatabaseImageTaskStore, ImageTaskStore, JsonImageTaskStore, can_claim_task_fairly
 from services.image.product_image_compositor import build_preserve_subject_mask, build_preserve_subject_prompt
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -149,6 +161,63 @@ def _is_content_policy_error_message(value: object) -> bool:
     return bool(text and any(marker in text for marker in CONTENT_POLICY_ERROR_MARKERS))
 
 
+def _is_submission_uncertain_error(exc: Exception) -> bool:
+    if isinstance(exc, RelaySubmissionUnknownHTTPException):
+        return True
+    if isinstance(exc, RelaySubmittedHTTPException):
+        return bool(getattr(exc, "submission_uncertain", True))
+    return bool(getattr(exc, "submission_uncertain", False))
+
+
+def _is_retryable_provider_error(exc: Exception) -> bool:
+    if (
+        _is_submission_uncertain_error(exc)
+        or bool(getattr(exc, "upstream_finished", False))
+        or _is_content_policy_error_message(exc)
+    ):
+        return False
+    try:
+        status = int(getattr(exc, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status:
+        return status == 429 or status >= 500 or status in {408}
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    text_value = _clean(exc).lower()
+    return any(
+        marker in text_value
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "temporary",
+            "temporarily unavailable",
+            "upstream failure",
+            "429",
+            "rate limit",
+            "overloaded",
+        )
+    )
+
+
+def _reconciliation_details(exc: Exception) -> dict[str, Any]:
+    details = getattr(exc, "reconciliation", None)
+    result = dict(details) if isinstance(details, dict) else {}
+    upstream_task_ids = getattr(exc, "upstream_task_ids", None)
+    if isinstance(upstream_task_ids, list):
+        result["accepted_task_ids"] = [str(item) for item in upstream_task_ids if str(item).strip()]
+    return result
+
+
+def _submitted_upstream_task_ids(exc: Exception) -> list[str]:
+    values = getattr(exc, "upstream_task_ids", None)
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(_clean(item) for item in values if _clean(item)))
+
+
 def _owner_id(identity: dict[str, object]) -> str:
     return _clean(identity.get("id")) or "anonymous"
 
@@ -244,9 +313,11 @@ def _public_task(
         "model": task.get("model"),
         "size": task.get("size"),
         "quality": task.get("quality"),
+        "image_count": task.get("image_count") or 1,
         "queue_priority": task.get("queue_priority"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
+        "turn_id": task.get("turn_id") or "",
     }
     if task.get("batch_id"):
         item["batch_id"] = task.get("batch_id")
@@ -268,6 +339,9 @@ def _public_task(
         item["cost"] = task.get("cost")
     if task.get("upstream_task_id"):
         item["upstream_task_id"] = task.get("upstream_task_id")
+    if task.get("reconciliation_required"):
+        item["reconciliation_required"] = True
+        item["reconciliation"] = task.get("reconciliation") or {}
     if task.get("error"):
         item["error"] = task.get("error")
     if task.get("progress"):
@@ -295,6 +369,7 @@ def _public_task(
 def _monitoring_event_task(task: dict[str, Any]) -> dict[str, Any]:
     event = {
         "id": task.get("id"),
+        "task_id": task.get("id"),
         "owner_id": task.get("owner_id"),
         "status": task.get("status"),
         "mode": task.get("mode"),
@@ -307,12 +382,43 @@ def _monitoring_event_task(task: dict[str, Any]) -> dict[str, Any]:
         "error": task.get("error"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
+        "progress": task.get("progress"),
     }
     if "cost" in task:
         event["cost"] = task.get("cost")
     if "upstream_task_id" in task:
         event["upstream_task_id"] = task.get("upstream_task_id")
     return event
+
+
+def _realtime_task_event(task: dict[str, Any]) -> dict[str, Any]:
+    public = _public_task(task)
+    status = str(public.get("status") or "").strip().lower()
+    data = public.get("data") if isinstance(public.get("data"), list) else []
+    first = data[0] if data and isinstance(data[0], dict) else {}
+    result_url = str(first.get("url") or "").strip()
+    return {
+        "task_id": public.get("id"),
+        "state": status,
+        "status": {
+            TASK_STATUS_QUEUED: "排队中",
+            TASK_STATUS_RUNNING: "进行中",
+            TASK_STATUS_SUCCESS: "已完成",
+            TASK_STATUS_ERROR: "失败",
+            TASK_STATUS_CANCELED: "已取消",
+        }.get(status, status),
+        "status_group": "已完成" if status == TASK_STATUS_SUCCESS else "失败" if status in {TASK_STATUS_ERROR, TASK_STATUS_CANCELED} else "进行中",
+        "is_final": status in TERMINAL_STATUSES,
+        "progress": public.get("progress"),
+        "result_url": result_url,
+        "result_type": "image" if result_url else "",
+        "error": public.get("error") or "",
+        "cost": public.get("cost", 0),
+        "model": public.get("model"),
+        "conversation_id": public.get("conversation_id") or "",
+        "turn_id": public.get("turn_id") or "",
+        "updated_at": public.get("updated_at"),
+    }
 
 
 class ImageTaskService:
@@ -383,15 +489,6 @@ class ImageTaskService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             if self._row_level_store:
-                if self._recover_on_start:
-                    self.task_store.recover_unfinished(
-                        requeue=not self.run_inline,
-                        message=(
-                            "worker restarted, unfinished image task was requeued"
-                            if not self.run_inline
-                            else "worker restarted, unfinished image task was interrupted"
-                        ),
-                    )
                 try:
                     retention_days = max(1, int(self.retention_days_getter()))
                 except Exception:
@@ -406,7 +503,14 @@ class ImageTaskService:
                 if changed:
                     self._save_locked()
         if self.task_queue is not None and not self.run_inline and self._recover_on_start:
+            # Queued database rows are the durable dispatch outbox. Redis
+            # enqueue is idempotent, while running rows are recovered only
+            # after their stale timeout by the elected maintenance worker.
             self.requeue_unfinished()
+        try:
+            self.flush_pending_projections()
+        except Exception:
+            pass
 
     def submit_generation(
         self,
@@ -417,6 +521,10 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        aspect_ratio: str = "",
+        image_size: str = "",
+        thinking_level: str = "",
+        n: int = 1,
         prompt_engine_mode: str = "professional",
         base_url: str = "",
         conversation_id: str = "",
@@ -431,18 +539,34 @@ class ImageTaskService:
         queue_priority: str = QUEUE_PRIORITY_STANDARD,
         agent_run_id: str = "",
     ) -> dict[str, Any]:
+        try:
+            requested_count = int(n or 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("n must be an integer") from exc
+        if requested_count < 1 or requested_count > 4:
+            raise ValueError("n must be between 1 and 4")
         safe_prompt = sanitize_image_prompt(
             prompt,
-            image_count=batch_total,
+            image_count=max(requested_count, batch_total),
             image_index=batch_index,
             prompt_engine_mode=prompt_engine_mode,
+        )
+        normalized_size = normalize_image_size(size)
+        expected_size = (
+            canvas_media_request_size(aspect_ratio, image_size)
+            or canvas_expected_size(aspect_ratio, image_size)
+            or normalized_size
         )
         payload = {
             "prompt": safe_prompt,
             "model": model,
-            "n": 1,
-            "size": normalize_image_size(size),
+            "n": requested_count,
+            "size": normalized_size,
+            "expected_size": expected_size,
             "quality": quality,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+            "thinking_level": thinking_level,
             "prompt_engine_mode": prompt_engine_mode,
             "response_format": "url",
             "base_url": base_url,
@@ -469,6 +593,10 @@ class ImageTaskService:
         model: str,
         size: str | None,
         quality: str = "auto",
+        aspect_ratio: str = "",
+        image_size: str = "",
+        thinking_level: str = "",
+        n: int = 1,
         prompt_engine_mode: str = "professional",
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
@@ -501,9 +629,15 @@ class ImageTaskService:
             and not (engine_mode == "standard" and standard_edit_allows_product_mutation(reference_edit_intent))
             and not professional_allows_mutation
         )
+        try:
+            requested_count = int(n or 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("n must be an integer") from exc
+        if requested_count < 1 or requested_count > 4:
+            raise ValueError("n must be between 1 and 4")
         safe_prompt = sanitize_image_prompt(
             prompt,
-            image_count=batch_total,
+            image_count=max(requested_count, batch_total),
             image_index=batch_index,
             has_reference=bool(image_inputs or image_urls),
             preserve_subject=effective_preserve_subject,
@@ -522,15 +656,25 @@ class ImageTaskService:
             preserve_mask = build_preserve_subject_mask(image_inputs[0])
             if preserve_mask is not None:
                 effective_masks.append(preserve_mask)
+        normalized_size = normalize_image_size(size)
+        expected_size = (
+            canvas_media_request_size(aspect_ratio, image_size)
+            or canvas_expected_size(aspect_ratio, image_size)
+            or normalized_size
+        )
         payload = {
             "prompt": effective_prompt,
             "images": image_inputs,
             "mask": effective_masks,
             "image_urls": image_urls or [],
             "model": model,
-            "n": 1,
-            "size": normalize_image_size(size),
+            "n": requested_count,
+            "size": normalized_size,
+            "expected_size": expected_size,
             "quality": quality,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+            "thinking_level": thinking_level,
             "prompt_engine_mode": prompt_engine_mode,
             "response_format": "url",
             "base_url": base_url,
@@ -664,6 +808,11 @@ class ImageTaskService:
                     "data": [],
                     "progress": "canceled",
                     "duration_ms": duration_ms,
+                    "monitoring_pending": True,
+                    "library_pending": False,
+                    "projection_attempts": 0,
+                    "projection_next_attempt_at": None,
+                    "projection_last_error": "",
                     "updated_at": _now_iso(),
                     "updated_ts": time.time(),
                 }
@@ -674,69 +823,8 @@ class ImageTaskService:
                 self._save_locked()
             public = _public_task(task)
             self._notify_task_update(key)
-        self._record_monitoring_event(key)
+        self.flush_task_projection(key)
         return public
-
-    def monitoring_task_events(self) -> list[dict[str, Any]]:
-        with self._lock:
-            self._refresh_locked()
-            if self._row_level_store:
-                return [_monitoring_event_task(task) for task in self.task_store.list_terminal()]
-            return [
-                _monitoring_event_task(task)
-                for task in self._tasks.values()
-                if task.get("status") in TERMINAL_STATUSES
-            ]
-
-    def sync_successful_library_results(self, identity: dict[str, object], base_url: str = "") -> int:
-        requester_id = _owner_id(identity)
-        include_all_owners = _clean(identity.get("role")) == "admin"
-        with self._lock:
-            self._refresh_locked()
-            if self._row_level_store:
-                tasks = self.task_store.list_terminal()
-            else:
-                tasks = list(self._tasks.values())
-        synced = 0
-        for task in tasks:
-            if task.get("status") != TASK_STATUS_SUCCESS:
-                continue
-            task_id = _clean(task.get("id"))
-            if not task_id:
-                continue
-            if not include_all_owners and _clean(task.get("owner_id")) != requester_id:
-                continue
-            task_identity = task.get("identity") if isinstance(task.get("identity"), dict) else {}
-            task_owner_id = _clean(task.get("owner_id")) or _clean(task_identity.get("id")) or requester_id
-            sync_identity = _identity_snapshot({**task_identity, "id": task_owner_id})
-            prompt = request_text(task.get("prompt"))
-            payload = task.get("payload")
-            if not prompt and isinstance(payload, dict):
-                prompt = request_text(payload.get("prompt"))
-            try:
-                if image_library_service.has_task_result(task_id):
-                    continue
-                image_library_service.record_task_result(
-                    identity=sync_identity,
-                    task=task,
-                    prompt=prompt,
-                    base_url=base_url or config.base_url,
-                )
-                synced += 1
-            except Exception as exc:
-                try:
-                    log_service.add(
-                        LOG_TYPE_CALL,
-                        "历史图库同步失败",
-                        {
-                            "task_key": _task_key(task_owner_id, task_id),
-                            "owner_id": task_owner_id,
-                            "error": str(exc) or exc.__class__.__name__,
-                        },
-                    )
-                except Exception:
-                    pass
-        return synced
 
     def _enqueue_task(self, key: str, task: dict[str, Any] | None = None) -> None:
         if self.task_queue is None:
@@ -772,11 +860,8 @@ class ImageTaskService:
     def requeue_orphaned_queued_tasks(self) -> int:
         if self.task_queue is None or self.run_inline:
             return 0
-        try:
-            if int(getattr(self.task_queue, "queue_depth", lambda: 0)() or 0) > 0:
-                return 0
-        except Exception:
-            return 0
+        # Redis enqueue is de-duplicated against both pending and processing
+        # tasks, so each queued database row can be repaired independently.
         return self.requeue_unfinished()
 
     def recover_stale_unfinished(self) -> int:
@@ -798,6 +883,17 @@ class ImageTaskService:
                     "error": "" if requeue else "image task timed out",
                     "progress": "stale_requeued" if requeue else "stale_timeout",
                     "duration_ms": None if requeue else duration_ms,
+                    **(
+                        {
+                            "monitoring_pending": True,
+                            "library_pending": False,
+                            "projection_attempts": 0,
+                            "projection_next_attempt_at": None,
+                            "projection_last_error": "",
+                        }
+                        if not requeue
+                        else {}
+                    ),
                     "started_ts": None if requeue else task.get("started_ts"),
                     "started_at": "" if requeue else task.get("started_at"),
                     "updated_at": _now_iso(),
@@ -811,6 +907,8 @@ class ImageTaskService:
                     queued_keys.append(key)
         for key in queued_keys:
             self._enqueue_task(key)
+        if recovered and not queued_keys:
+            self.flush_pending_projections(limit=recovered)
         return recovered
 
     def process_queued_task(self, task_key: str) -> dict[str, Any] | None:
@@ -834,8 +932,13 @@ class ImageTaskService:
                 error="queued image task is missing payload",
                 data=[],
                 duration_ms=0,
+                monitoring_pending=True,
+                library_pending=False,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
             )
-            self._record_monitoring_event(key)
+            self.flush_task_projection(key)
             return self.list_tasks(identity, [_clean(task.get("id"))])["items"][0]
         self._run_task(key, mode, payload, identity, model)
         result = self.list_tasks(identity, [_clean(task.get("id"))])
@@ -844,10 +947,59 @@ class ImageTaskService:
     def work_once(self, timeout_secs: int = 5) -> dict[str, Any] | None:
         if self.task_queue is None:
             raise RuntimeError("image task queue is not configured")
-        task_key = self.task_queue.dequeue(timeout_secs)
-        if not task_key:
+        reserve = getattr(self.task_queue, "reserve", None)
+        if not callable(reserve):
+            task_key = self.task_queue.dequeue(timeout_secs)
+            if not task_key:
+                return None
+            return self.process_queued_task(task_key)
+
+        delivery = reserve(timeout_secs=timeout_secs, lease_secs=90)
+        if delivery is None:
             return None
-        return self.process_queued_task(task_key)
+        if not isinstance(delivery, ImageTaskDelivery):
+            delivery = ImageTaskDelivery(
+                key=_clean(getattr(delivery, "key", delivery)),
+                token=_clean(getattr(delivery, "token", "")),
+                priority=_normalize_queue_priority(getattr(delivery, "priority", "agent")),
+            )
+
+        heartbeat_done = threading.Event()
+
+        def renew_delivery() -> None:
+            renew = getattr(self.task_queue, "renew_delivery", None)
+            if not callable(renew):
+                return
+            while not heartbeat_done.wait(20):
+                try:
+                    if not renew(delivery, lease_secs=90):
+                        return
+                except Exception:
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=renew_delivery,
+            name="image-delivery-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        try:
+            return self.process_queued_task(delivery.key)
+        finally:
+            heartbeat_done.set()
+            heartbeat_thread.join(timeout=2)
+            current = self.task_store.get_task(delivery.key) if self._row_level_store else self._tasks.get(delivery.key)
+            try:
+                if current is not None and current.get("status") == TASK_STATUS_QUEUED:
+                    self.task_queue.retry(
+                        delivery,
+                        priority=_normalize_queue_priority(current.get("queue_priority")),
+                    )
+                else:
+                    self.task_queue.ack(delivery)
+            except Exception:
+                # An unsettled delivery remains recoverable after its lease.
+                pass
 
     def _worker_thread_count(self) -> int:
         return max(1, min(self._worker_concurrency, self._total_concurrency))
@@ -906,7 +1058,19 @@ class ImageTaskService:
             while not shutdown_event.is_set():
                 if shutdown_event.wait(timeout=maintenance_interval):
                     return
+                maintenance_token = f"{worker_id}:{uuid.uuid4().hex}"
+                acquire_maintenance = getattr(self.task_queue, "acquire_maintenance_lock", None)
+                release_maintenance = getattr(self.task_queue, "release_maintenance_lock", None)
+                if callable(acquire_maintenance):
+                    try:
+                        if not acquire_maintenance(maintenance_token, timeout_secs=max(60, maintenance_interval * 2)):
+                            continue
+                    except Exception:
+                        continue
                 try:
+                    recover_deliveries = getattr(self.task_queue, "recover_deliveries", None)
+                    if callable(recover_deliveries):
+                        recover_deliveries()
                     recovered = self.recover_stale_unfinished()
                     if recovered:
                         try:
@@ -930,11 +1094,18 @@ class ImageTaskService:
                             )
                         except Exception:
                             pass
+                    self.flush_pending_projections()
                 except Exception as exc:
                     try:
                         log_service.add(LOG_TYPE_CALL, "image worker maintenance failed", {"error": str(exc)})
                     except Exception:
                         pass
+                finally:
+                    if callable(release_maintenance):
+                        try:
+                            release_maintenance(maintenance_token)
+                        except Exception:
+                            pass
 
         worker_count = self._worker_thread_count()
 
@@ -973,14 +1144,6 @@ class ImageTaskService:
                     pass
 
     def monitoring_snapshot(self) -> dict[str, Any]:
-        try:
-            self.recover_stale_unfinished()
-        except Exception:
-            pass
-        try:
-            self.requeue_orphaned_queued_tasks()
-        except Exception:
-            pass
         with self._lock:
             self._refresh_locked()
             items = self.task_store.list_unfinished() if self._row_level_store else list(self._tasks.items())
@@ -1103,9 +1266,7 @@ class ImageTaskService:
                     self._save_locked()
                 return _public_task(task)
             if self._row_level_store:
-                unfinished_items = self.task_store.list_unfinished()
-                active_owner_count = _active_owner_count(unfinished_items, owner)
-                active_count = self.task_store.count_tasks(owner, {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING})
+                active_owner_count = max(1, self.task_store.count_active_owners())
                 running_count = self.task_store.count_tasks(owner, {TASK_STATUS_RUNNING})
             else:
                 unfinished_items = list(self._tasks.items())
@@ -1121,8 +1282,8 @@ class ImageTaskService:
                     for task_item in self._tasks.values()
                     if task_item.get("owner_id") == owner and task_item.get("status") == TASK_STATUS_RUNNING
                 )
-            if active_count >= self._owner_pending_limit:
-                raise ValueError("user task queue is full; wait for existing tasks to finish")
+                if active_count >= self._owner_pending_limit:
+                    raise ValueError("user task queue is full; wait for existing tasks to finish")
             effective_owner_concurrency = self._effective_owner_concurrency(active_owner_count)
             if running_count >= effective_owner_concurrency:
                 payload["progress"] = "waiting_for_user_concurrency"
@@ -1165,12 +1326,17 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             if self._row_level_store:
-                task, created = self.task_store.create_task(key, task)
+                task, created = self.task_store.create_task(
+                    key,
+                    task,
+                    owner_pending_limit=self._owner_pending_limit,
+                )
                 if not created:
                     return _public_task(task)
             else:
                 self._tasks[key] = task
                 self._save_locked()
+            self._publish_task_event(task)
             should_enqueue = self.task_queue is not None and not self.run_inline
             should_start = not should_enqueue
 
@@ -1194,6 +1360,55 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
+        with self._lock:
+            self._refresh_locked()
+            pending = dict(self._get_task_locked(key) or {})
+        if not pending or pending.get("status") != TASK_STATUS_QUEUED:
+            return
+
+        owner_id = _clean(pending.get("owner_id"), "anonymous")
+        if self._row_level_store:
+            active_owner_count = max(1, self.task_store.count_active_owners())
+        else:
+            active_owner_count = _active_owner_count(list(self._tasks.items()), owner_id)
+        owner_limit = self._effective_owner_concurrency(active_owner_count)
+        owner_slot_token = f"{os.getpid()}:{threading.get_ident()}:{key}:owner"
+        acquire_owner_slot = getattr(self.task_queue, "acquire_owner_slot", None)
+        release_owner_slot = getattr(self.task_queue, "release_owner_slot", None)
+        owner_slot = False
+        if callable(acquire_owner_slot):
+            try:
+                owner_slot = bool(
+                    acquire_owner_slot(
+                        owner_id,
+                        owner_slot_token,
+                        owner_limit,
+                        timeout_secs=1.0,
+                    )
+                )
+            except Exception:
+                owner_slot = False
+            if not owner_slot:
+                self._update_task_unless_canceled(key, progress="waiting_for_user_concurrency")
+                self._enqueue_task(key, pending)
+                return
+        try:
+            self._execute_task(key, mode, payload, identity, model)
+        finally:
+            if owner_slot and callable(release_owner_slot):
+                try:
+                    release_owner_slot(owner_id, owner_slot_token)
+                except Exception:
+                    pass
+
+    def _execute_task(
+        self,
+        key: str,
+        mode: str,
+        payload: dict[str, Any],
+        identity: dict[str, object],
+        model: str,
+    ) -> None:
         started = time.time()
         if not self._start_task(key):
             if self.task_queue is not None and not self.run_inline:
@@ -1209,6 +1424,8 @@ class ImageTaskService:
         stage_timings = dict(running_task.get("stage_timings_ms") or {})
         generation_started = time.time()
         generation_recorded = False
+        provider_completed = False
+        provider_checkpointed = isinstance(running_task.get("provider_result"), dict)
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
@@ -1233,59 +1450,62 @@ class ImageTaskService:
         }
         payload_with_progress = {**handler_payload, "progress_callback": progress_callback}
         try:
-            if self.relay_enabled_getter():
-                handler = openai_relay_service.image_edits if mode == "edit" else openai_relay_service.image_generations
-            else:
-                handler = self.edit_handler if mode == "edit" else self.generation_handler
-            self._run_semaphore.acquire()
-            slot_token = f"{os.getpid()}:{threading.get_ident()}:{key}"
-            acquire_slot = getattr(self.task_queue, "acquire_slot", None)
-            release_slot = getattr(self.task_queue, "release_slot", None)
-            distributed_slot = False
-            requeue_due_to_slots = False
-            try:
-                if callable(acquire_slot):
-                    distributed_slot = bool(acquire_slot(slot_token, timeout_secs=max(5, min(15, self._worker_heartbeat_secs))))
-                    if not distributed_slot:
-                        requeue_due_to_slots = True
-                if not requeue_due_to_slots:
+            stored_provider_result = running_task.get("provider_result")
+            result = dict(stored_provider_result) if isinstance(stored_provider_result, dict) else None
+            if result is None:
+                if self.relay_enabled_getter():
+                    handler = openai_relay_service.image_edits if mode == "edit" else openai_relay_service.image_generations
+                else:
+                    handler = self.edit_handler if mode == "edit" else self.generation_handler
+                self._run_semaphore.acquire()
+                slot_token = f"{os.getpid()}:{threading.get_ident()}:{key}"
+                acquire_slot = getattr(self.task_queue, "acquire_slot", None)
+                release_slot = getattr(self.task_queue, "release_slot", None)
+                distributed_slot = False
+                requeue_due_to_slots = False
+                try:
+                    if callable(acquire_slot):
+                        distributed_slot = bool(acquire_slot(slot_token, timeout_secs=max(5, min(15, self._worker_heartbeat_secs))))
+                        if not distributed_slot:
+                            requeue_due_to_slots = True
+                    if not requeue_due_to_slots:
+                        with self._lock:
+                            self._refresh_locked()
+                            task = self._get_task_locked(key)
+                            if task is None or task.get("status") == TASK_STATUS_CANCELED:
+                                return
+                        try:
+                            result = handler(payload_with_progress)
+                        except Exception as provider_exc:
+                            recorder = getattr(self.task_queue, "record_provider_result", None)
+                            if callable(recorder):
+                                recorder(success=False, throttled=_is_provider_throttle_error(provider_exc))
+                            raise
+                        else:
+                            recorder = getattr(self.task_queue, "record_provider_result", None)
+                            if callable(recorder):
+                                recorder(success=True, throttled=False)
+                finally:
+                    if distributed_slot and callable(release_slot):
+                        release_slot(slot_token)
+                    self._run_semaphore.release()
+                if requeue_due_to_slots:
                     with self._lock:
                         self._refresh_locked()
-                        task = self._get_task_locked(key)
-                        if task is None or task.get("status") == TASK_STATUS_CANCELED:
-                            return
-                    try:
-                        result = handler(payload_with_progress)
-                    except Exception as provider_exc:
-                        recorder = getattr(self.task_queue, "record_provider_result", None)
-                        if callable(recorder):
-                            recorder(success=False, throttled=_is_provider_throttle_error(provider_exc))
-                        raise
-                    else:
-                        recorder = getattr(self.task_queue, "record_provider_result", None)
-                        if callable(recorder):
-                            recorder(success=True, throttled=False)
-            finally:
-                if distributed_slot and callable(release_slot):
-                    release_slot(slot_token)
-                self._run_semaphore.release()
-            if requeue_due_to_slots:
-                with self._lock:
-                    self._refresh_locked()
-                    pending = self._get_task_locked(key)
-                    if pending is not None and pending.get("status") == TASK_STATUS_RUNNING and self.task_queue is not None and not self.run_inline:
-                        updated = self._update_task_unless_canceled(
-                            key,
-                            status=TASK_STATUS_QUEUED,
-                            error="",
-                            progress="waiting_for_slot",
-                            started_ts=None,
-                            started_at="",
-                            duration_ms=None,
-                        )
-                        if updated:
-                            self._enqueue_task(key, pending)
-                return
+                        pending = self._get_task_locked(key)
+                        if pending is not None and pending.get("status") == TASK_STATUS_RUNNING and self.task_queue is not None and not self.run_inline:
+                            updated = self._update_task_unless_canceled(
+                                key,
+                                status=TASK_STATUS_QUEUED,
+                                error="",
+                                progress="waiting_for_slot",
+                                started_ts=None,
+                                started_at="",
+                                duration_ms=None,
+                            )
+                            if updated:
+                                self._enqueue_task(key, pending)
+                    return
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -1300,9 +1520,24 @@ class ImageTaskService:
                 if account_email:
                     setattr(error, "account_email", account_email)
                 raise error
+            provider_completed = True
             generation_ms = int((time.time() - generation_started) * 1000)
             stage_timings["generation"] = max(0, int(stage_timings.get("generation") or 0)) + generation_ms
             generation_recorded = True
+            if not provider_checkpointed:
+                checkpoint = json.loads(json.dumps(result, ensure_ascii=False, default=str))
+                if not self._update_task_unless_canceled(
+                    key,
+                    provider_result=checkpoint,
+                    upstream_task_id=_clean(result.get("_media_task_id") or result.get("upstream_task_id")),
+                    cost=result.get("cost"),
+                    submission_state="completed",
+                    progress="provider_completed",
+                    reconciliation_required=False,
+                    reconciliation={},
+                ):
+                    return
+                provider_checkpointed = True
             if self._postprocess_executor is not None:
                 self._update_task_unless_canceled(key, progress="saving_result")
                 self._postprocess_executor.submit(
@@ -1344,7 +1579,7 @@ class ImageTaskService:
                     base_url=_clean(payload.get("base_url")),
                     remote_loader=self.result_url_loader,
                     strict_remote=bool(self.result_url_loader),
-                    expected_size=payload.get("size"),
+                    expected_size=payload.get("expected_size") or payload.get("size"),
                     aspect_policy=aspect_policy,
                 )
             usage = result.get("usage")
@@ -1359,13 +1594,22 @@ class ImageTaskService:
                 usage=usage,
                 cost=cost,
                 upstream_task_id=upstream_task_id,
+                provider_result=None,
+                submission_state="completed",
+                reconciliation_required=False,
+                reconciliation={},
                 error="",
                 duration_ms=duration_ms,
                 stage_timings_ms=stage_timings,
+                monitoring_pending=True,
+                library_pending=True,
+                projection_base_url=_clean(payload.get("base_url")) or config.base_url,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
             ):
                 return
-            self._record_monitoring_event(key)
-            self._record_library_result(key, identity, request_text(payload.get("prompt")), _clean(payload.get("base_url")))
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,
@@ -1384,7 +1628,21 @@ class ImageTaskService:
             if not generation_recorded:
                 generation_ms = int((time.time() - generation_started) * 1000)
                 stage_timings["generation"] = max(0, int(stage_timings.get("generation") or 0)) + generation_ms
-            if self._retry_task(key, error_message, duration_ms, stage_timings, payload=payload):
+            submission_uncertain = _is_submission_uncertain_error(exc)
+            persistence_uncertain = provider_completed and not provider_checkpointed
+            intentional_regeneration = isinstance(exc, ImageAspectRatioMismatchError)
+            if intentional_regeneration:
+                self._update_task_unless_canceled(
+                    key,
+                    provider_result=None,
+                    submission_state="",
+                )
+            safe_to_retry = (
+                intentional_regeneration
+                or provider_checkpointed
+                or (not provider_completed and _is_retryable_provider_error(exc))
+            ) and not submission_uncertain
+            if safe_to_retry and self._retry_task(key, error_message, duration_ms, stage_timings, payload=payload):
                 self._log_call(
                     identity,
                     mode,
@@ -1397,17 +1655,44 @@ class ImageTaskService:
                     account_email=account_email,
                 )
                 return
+            reconciliation = _reconciliation_details(exc)
+            submitted_task_ids = _submitted_upstream_task_ids(exc)
+            if persistence_uncertain and isinstance(result, dict):
+                reconciliation.update(
+                    {
+                        "reason": "provider_result_persistence_failed",
+                        "upstream_task_id": _clean(result.get("_media_task_id") or result.get("upstream_task_id")),
+                        "cost": result.get("cost"),
+                    }
+                )
+            reconciliation_required = submission_uncertain or persistence_uncertain
             if not self._update_task_unless_canceled(
                 key,
                 status=TASK_STATUS_ERROR,
                 error=error_message,
                 data=[],
+                progress="submission_uncertain" if reconciliation_required else "failed",
+                reconciliation_required=reconciliation_required,
+                reconciliation=reconciliation,
+                **(
+                    {
+                        "upstream_task_id": submitted_task_ids[0],
+                        "upstream_task_ids": submitted_task_ids,
+                    }
+                    if submitted_task_ids
+                    else {}
+                ),
                 duration_ms=duration_ms,
                 stage_timings_ms=stage_timings,
                 **({"conversation_id": conversation_id} if conversation_id else {}),
+                monitoring_pending=True,
+                library_pending=False,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
             ):
                 return
-            self._record_monitoring_event(key)
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,
@@ -1454,7 +1739,7 @@ class ImageTaskService:
                     base_url=_clean(payload.get("base_url")),
                     remote_loader=self.result_url_loader,
                     strict_remote=bool(self.result_url_loader),
-                    expected_size=payload.get("size"),
+                    expected_size=payload.get("expected_size") or payload.get("size"),
                     aspect_policy=aspect_policy,
                 )
             stage_timings["save"] = max(0, int(stage_timings.get("save") or 0)) + int(
@@ -1468,19 +1753,23 @@ class ImageTaskService:
                 usage=result.get("usage"),
                 cost=result.get("cost"),
                 upstream_task_id=_clean(result.get("_media_task_id") or result.get("upstream_task_id")),
+                provider_result=None,
+                submission_state="completed",
+                reconciliation_required=False,
+                reconciliation={},
                 error="",
                 progress="completed",
                 duration_ms=duration_ms,
                 stage_timings_ms=stage_timings,
+                monitoring_pending=True,
+                library_pending=True,
+                projection_base_url=_clean(payload.get("base_url")) or config.base_url,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
             ):
                 return
-            self._record_monitoring_event(key)
-            self._record_library_result(
-                key,
-                identity,
-                request_text(payload.get("prompt")),
-                _clean(payload.get("base_url")),
-            )
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,
@@ -1494,6 +1783,14 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "image result post-processing failed"
             duration_ms = int((time.time() - started) * 1000)
+            if isinstance(exc, ImageAspectRatioMismatchError):
+                # Aspect-ratio retries intentionally request a fresh image.
+                # All other post-processing retries reuse provider_result.
+                self._update_task_unless_canceled(
+                    key,
+                    provider_result=None,
+                    submission_state="",
+                )
             if self._retry_task(key, error_message, duration_ms, stage_timings, payload=payload):
                 self._log_call(
                     identity,
@@ -1514,9 +1811,14 @@ class ImageTaskService:
                 data=[],
                 duration_ms=duration_ms,
                 stage_timings_ms=stage_timings,
+                monitoring_pending=True,
+                library_pending=False,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
             ):
                 return
-            self._record_monitoring_event(key)
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,
@@ -1608,11 +1910,14 @@ class ImageTaskService:
                 effective_owner_concurrency = self._effective_owner_concurrency(
                     _active_owner_count(self.task_store.list_unfinished(), owner_id),
                 )
-                return self.task_store.claim_task(
+                updated = self.task_store.claim_task(
                     key,
                     owner_concurrency=effective_owner_concurrency,
                     updates=updates,
-                ) is not None
+                )
+                if updated is not None:
+                    self._publish_task_event(updated)
+                return updated is not None
             return self._persist_updates_locked(key, updates, expected_status=TASK_STATUS_QUEUED) is not None
 
     def _update_task(self, key: str, **updates: Any) -> None:
@@ -1629,24 +1934,94 @@ class ImageTaskService:
             updates["updated_ts"] = time.time()
             return self._persist_updates_locked(key, updates, reject_status=TASK_STATUS_CANCELED) is not None
 
-    def _record_monitoring_event(self, key: str) -> None:
-        try:
-            with self._lock:
-                self._refresh_locked()
-                task = dict(self._get_task_locked(key) or {})
-            generation_monitoring_service.record_task_event(_monitoring_event_task(task))
-        except Exception as exc:
+    def _save_projection_state(self, key: str, updates: dict[str, Any]) -> None:
+        with self._lock:
+            self._refresh_locked()
+            updated = self.task_store.merge_projection_state(key, updates)
+            if not self._row_level_store and updated is not None:
+                self._tasks[key] = updated
+
+    def flush_task_projection(self, key: str) -> bool:
+        with self._lock:
+            self._refresh_locked()
+            task = dict(self._get_task_locked(key) or {})
+        if not task or task.get("status") not in TERMINAL_STATUSES:
+            return True
+
+        monitoring_pending = bool(task.get("monitoring_pending"))
+        library_pending = bool(task.get("library_pending")) and task.get("status") == TASK_STATUS_SUCCESS
+        if not monitoring_pending and not library_pending:
+            return True
+
+        errors: list[str] = []
+        if monitoring_pending:
+            try:
+                generation_monitoring_service.record_task_event(_monitoring_event_task(task))
+                monitoring_pending = False
+            except Exception as exc:
+                errors.append(f"monitoring: {str(exc) or exc.__class__.__name__}")
+
+        if library_pending:
+            identity = task.get("identity") if isinstance(task.get("identity"), dict) else {}
+            identity = _identity_snapshot({**identity, "id": task.get("owner_id") or identity.get("id")})
+            try:
+                image_library_service.record_task_result(
+                    identity=identity,
+                    task=task,
+                    prompt=_clean(task.get("prompt")),
+                    base_url=_clean(task.get("projection_base_url")) or config.base_url,
+                )
+                library_pending = False
+            except Exception as exc:
+                errors.append(f"library: {str(exc) or exc.__class__.__name__}")
+
+        attempts = max(0, int(task.get("projection_attempts") or 0)) + (1 if errors else 0)
+        next_attempt_at = None
+        if errors:
+            retry_delay = min(300, 5 * (2 ** min(max(0, attempts - 1), 6)))
+            next_attempt_at = datetime.fromtimestamp(time.time() + retry_delay).strftime("%Y-%m-%d %H:%M:%S")
+        self._save_projection_state(
+            key,
+            {
+                "monitoring_pending": monitoring_pending,
+                "library_pending": library_pending,
+                "projection_attempts": attempts if errors else 0,
+                "projection_next_attempt_at": next_attempt_at,
+                "projection_last_error": "; ".join(errors)[:1000],
+            },
+        )
+        if errors:
             try:
                 log_service.add(
                     LOG_TYPE_CALL,
-                    "监控事件记录失败",
-                    {
-                        "task_key": key,
-                        "error": str(exc) or exc.__class__.__name__,
-                    },
+                    "image task projection delivery failed",
+                    {"task_key": key, "attempts": attempts, "error": "; ".join(errors)[:1000]},
                 )
             except Exception:
                 pass
+        return not monitoring_pending and not library_pending
+
+    def flush_pending_projections(self, *, limit: int = 100) -> int:
+        try:
+            pending = self.task_store.list_projection_pending(limit=max(1, min(500, int(limit or 100))))
+        except Exception:
+            return 0
+        completed = 0
+        for key, _task in pending:
+            if self.flush_task_projection(key):
+                completed += 1
+        return completed
+
+    def _publish_task_event(self, task: dict[str, Any]) -> None:
+        try:
+            realtime_event_service.publish(
+                "image_task_progress",
+                _realtime_task_event(task),
+                owner_id=_clean(task.get("owner_id"), "anonymous"),
+            )
+        except Exception:
+            # Realtime delivery must never fail a task state transition.
+            pass
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         try:
@@ -1700,6 +2075,16 @@ class ImageTaskService:
                 task["cost"] = item.get("cost")
             if item.get("upstream_task_id"):
                 task["upstream_task_id"] = _clean(item.get("upstream_task_id"))
+            for field in (
+                "monitoring_pending",
+                "library_pending",
+                "projection_base_url",
+                "projection_attempts",
+                "projection_next_attempt_at",
+                "projection_last_error",
+            ):
+                if field in item:
+                    task[field] = item.get(field)
             identity = item.get("identity")
             if isinstance(identity, dict):
                 task["identity"] = _identity_snapshot(identity)
@@ -1717,39 +2102,6 @@ class ImageTaskService:
                 task["error"] = error
             tasks[_task_key(owner, task_id)] = task
         return tasks
-
-    def _record_library_result(
-        self,
-        key: str,
-        identity: dict[str, object],
-        prompt: str,
-        base_url: str,
-        ) -> None:
-        try:
-            with self._lock:
-                self._refresh_locked()
-                task = dict(self._get_task_locked(key) or {})
-            image_library_service.record_task_result(
-                identity=identity,
-                task=task,
-                prompt=prompt,
-                base_url=base_url or config.base_url,
-            )
-        except Exception as exc:
-            try:
-                log_service.add(
-                    LOG_TYPE_CALL,
-                    "历史图库记录失败",
-                    {
-                        "key_id": identity.get("id"),
-                        "key_name": identity.get("name"),
-                        "role": identity.get("role"),
-                        "task_key": key,
-                        "error": str(exc) or exc.__class__.__name__,
-                    },
-                )
-            except Exception:
-                pass
 
     def _retry_task(
         self,
@@ -1793,7 +2145,7 @@ class ImageTaskService:
                     max_retries=max_retries,
                     updates={
                         "error": error_message,
-                        "progress": retry_progress,
+                "progress": retry_progress,
                         "duration_ms": duration_ms,
                         "stage_timings_ms": dict(stage_timings_ms or {}),
                         "updated_at": _now_iso(),
@@ -1801,6 +2153,8 @@ class ImageTaskService:
                         **({"payload": retry_payload} if retry_payload is not None else {}),
                     },
                 )
+                if updated is not None:
+                    self._publish_task_event(updated)
                 should_enqueue = updated is not None
             else:
                 attempts = int(task.get("attempts") or 0) + 1
@@ -1820,6 +2174,7 @@ class ImageTaskService:
                     }
                 )
                 self._save_locked()
+                self._publish_task_event(task)
                 should_enqueue = True
         if should_enqueue and self.task_queue is not None:
             self._enqueue_task(key)
@@ -1865,10 +2220,21 @@ class ImageTaskService:
             self._save_locked()
             updated = task
         if updated is not None:
+            self._publish_task_event(updated)
             self._notify_task_update(key)
         return updated
 
     def _notify_task_update(self, key: str) -> None:
+        try:
+            task = self._get_task_locked(key)
+            if task is not None:
+                realtime_event_service.publish(
+                    "image_task_progress",
+                    _realtime_task_event(task),
+                    owner_id=_clean(task.get("owner_id"), "anonymous"),
+                )
+        except Exception:
+            pass
         if self.task_queue is None:
             return
         try:
@@ -1937,7 +2303,10 @@ class ImageTaskService:
         removed_keys = [
             key
             for key, task in self._tasks.items()
-            if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
+            if task.get("status") in TERMINAL_STATUSES
+            and not task.get("monitoring_pending")
+            and not task.get("library_pending")
+            and _timestamp(task.get("updated_at")) < cutoff
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
@@ -2034,10 +2403,21 @@ class ImageTaskService:
                 "",
                 int(time.time()),
             )["data"]
-            if not self._update_task_unless_canceled(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000)):
+            if not self._update_task_unless_canceled(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                error="",
+                duration_ms=int((time.time() - started) * 1000),
+                monitoring_pending=True,
+                library_pending=True,
+                projection_base_url=config.base_url,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
+            ):
                 return
-            self._record_monitoring_event(key)
-            self._record_library_result(key, identity, "", config.base_url)
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,
@@ -2050,9 +2430,20 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
-            if not self._update_task_unless_canceled(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms):
+            if not self._update_task_unless_canceled(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                data=[],
+                duration_ms=duration_ms,
+                monitoring_pending=True,
+                library_pending=False,
+                projection_attempts=0,
+                projection_next_attempt_at=None,
+                projection_last_error="",
+            ):
                 return
-            self._record_monitoring_event(key)
+            self.flush_task_projection(key)
             self._log_call(
                 identity,
                 mode,

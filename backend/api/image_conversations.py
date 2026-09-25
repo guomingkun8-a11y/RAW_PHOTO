@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -19,27 +20,57 @@ class ImageConversationRenameRequest(BaseModel):
     title: str = Field(default="", max_length=191)
 
 
+def _require_storage_namespace(namespace: str | None, client: str | None) -> None:
+    required = str(os.getenv("GMKRAW_REQUIRED_STORAGE_NAMESPACE") or "").strip()
+    if required and str(namespace or "").strip() != required:
+        raise HTTPException(status_code=409, detail={"error": "storage namespace mismatch"})
+    required_client = str(os.getenv("GMKRAW_REQUIRED_STORAGE_CLIENT") or "").strip()
+    if required_client and str(client or "").strip() != required_client:
+        raise HTTPException(status_code=409, detail={"error": "storage client mismatch"})
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/image-conversations")
     async def list_image_conversations(
-        limit: int = Query(default=500, ge=1, le=1000),
+        limit: int = Query(default=50, ge=1, le=200),
+        cursor_at: str = Query(default="", alias="cursorAt", max_length=40),
+        cursor_id: str = Query(default="", alias="cursorId", max_length=191),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        return await run_in_threadpool(
-            image_conversation_service.list_conversations,
+        try:
+            return await run_in_threadpool(
+                image_conversation_service.list_conversations,
+                identity=identity,
+                limit=limit,
+                cursor_at=cursor_at,
+                cursor_id=cursor_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/image-conversations/count")
+    async def count_image_conversations(
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        count = await run_in_threadpool(
+            image_conversation_service.count_conversations,
             identity=identity,
-            limit=limit,
         )
+        return {"count": count}
 
     @router.put("/api/image-conversations/{conversation_id}")
     async def upsert_image_conversation(
         conversation_id: str,
         body: ImageConversationUpsertRequest,
         authorization: str | None = Header(default=None),
+        x_gmkraw_storage_namespace: str | None = Header(default=None),
+        x_gmkraw_storage_client: str | None = Header(default=None),
     ):
+        _require_storage_namespace(x_gmkraw_storage_namespace, x_gmkraw_storage_client)
         identity = require_identity(authorization)
         try:
             return await run_in_threadpool(
@@ -56,7 +87,10 @@ def create_router() -> APIRouter:
         conversation_id: str,
         body: ImageConversationRenameRequest,
         authorization: str | None = Header(default=None),
+        x_gmkraw_storage_namespace: str | None = Header(default=None),
+        x_gmkraw_storage_client: str | None = Header(default=None),
     ):
+        _require_storage_namespace(x_gmkraw_storage_namespace, x_gmkraw_storage_client)
         identity = require_identity(authorization)
         try:
             item = await run_in_threadpool(
@@ -75,7 +109,10 @@ def create_router() -> APIRouter:
     async def delete_image_conversation(
         conversation_id: str,
         authorization: str | None = Header(default=None),
+        x_gmkraw_storage_namespace: str | None = Header(default=None),
+        x_gmkraw_storage_client: str | None = Header(default=None),
     ):
+        _require_storage_namespace(x_gmkraw_storage_namespace, x_gmkraw_storage_client)
         identity = require_identity(authorization)
         deleted = await run_in_threadpool(
             image_conversation_service.delete_conversation,
@@ -92,7 +129,12 @@ def create_router() -> APIRouter:
         return {"ok": True}
 
     @router.delete("/api/image-conversations")
-    async def clear_image_conversations(authorization: str | None = Header(default=None)):
+    async def clear_image_conversations(
+        authorization: str | None = Header(default=None),
+        x_gmkraw_storage_namespace: str | None = Header(default=None),
+        x_gmkraw_storage_client: str | None = Header(default=None),
+    ):
+        _require_storage_namespace(x_gmkraw_storage_namespace, x_gmkraw_storage_client)
         identity = require_identity(authorization)
         deleted = await run_in_threadpool(
             image_conversation_service.clear_conversations,

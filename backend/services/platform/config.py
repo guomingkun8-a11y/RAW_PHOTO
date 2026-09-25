@@ -133,6 +133,30 @@ DEFAULT_VIDEO_GENERATION = {
     "stale_running_timeout_secs": 3600,
 }
 
+DEFAULT_AUDIO_GENERATION = {
+    "enabled": False,
+    "base_url": "",
+    "api_key": "",
+    "api_keys": [],
+    "submit_path": "/v1/media/generate",
+    "status_path": "/v1/media/status",
+    "download_results": True,
+    "result_storage_prefix": "raw-photo/audio-results",
+    "poll_interval_secs": 2,
+    "poll_timeout_secs": 900,
+    "queue_enabled": True,
+    "redis_url": "redis://127.0.0.1:6379/0",
+    "queue_name": "ai_audio_generation_tasks",
+    "database_url": "",
+    "max_retries": 1,
+    "worker_concurrency": 20,
+    "total_concurrency": 20,
+    "owner_concurrency": 2,
+    "owner_pending_limit": 8,
+    "slot_lease_secs": 1800,
+    "stale_running_timeout_secs": 1800,
+}
+
 DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -179,6 +203,7 @@ DEFAULT_OPENAI_RELAY = {
     "api_key_pool_cooldown_secs": 60,
     "api_key_pool_max_attempts": 3,
     "prompt_analysis_model": "gpt-5.6-sol",
+    "video_agent_model": "tt-5.6-sol",
     "embedding_model": "text-embedding-3-small",
 }
 
@@ -970,6 +995,125 @@ def _normalize_video_generation_settings(value: object, queue_reference: dict[st
     }
 
 
+def _normalize_audio_generation_settings(
+    value: object,
+    queue_reference: dict[str, object] | None = None,
+) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    image_queue = queue_reference or {}
+    default_redis_url = str(image_queue.get("redis_url") or DEFAULT_AUDIO_GENERATION["redis_url"])
+    enabled_env = os.getenv("AUDIO_GENERATION_ENABLED") or os.getenv("GMKRAW_AUDIO_GENERATION_ENABLED")
+    queue_enabled_env = os.getenv("AUDIO_GENERATION_QUEUE_ENABLED") or os.getenv("GMKRAW_AUDIO_GENERATION_QUEUE_ENABLED")
+    return {
+        "enabled": _normalize_bool(
+            enabled_env if enabled_env is not None else source.get("enabled"),
+            bool(DEFAULT_AUDIO_GENERATION["enabled"]),
+        ),
+        "base_url": str(
+            os.getenv("AUDIO_GENERATION_BASE_URL")
+            or os.getenv("GMKRAW_AUDIO_GENERATION_BASE_URL")
+            or source.get("base_url")
+            or ""
+        ).strip().rstrip("/"),
+        "api_key": str(
+            os.getenv("AUDIO_GENERATION_API_KEY")
+            or os.getenv("GMKRAW_AUDIO_GENERATION_API_KEY")
+            or source.get("api_key")
+            or ""
+        ).strip(),
+        "api_keys": _normalize_string_list(
+            os.getenv("AUDIO_GENERATION_API_KEYS")
+            or os.getenv("GMKRAW_AUDIO_GENERATION_API_KEYS")
+            or source.get("api_keys")
+        ),
+        "submit_path": str(
+            os.getenv("AUDIO_GENERATION_SUBMIT_PATH")
+            or source.get("submit_path")
+            or DEFAULT_AUDIO_GENERATION["submit_path"]
+        ).strip() or str(DEFAULT_AUDIO_GENERATION["submit_path"]),
+        "status_path": str(
+            os.getenv("AUDIO_GENERATION_STATUS_PATH")
+            or source.get("status_path")
+            or DEFAULT_AUDIO_GENERATION["status_path"]
+        ).strip() or str(DEFAULT_AUDIO_GENERATION["status_path"]),
+        "download_results": _normalize_bool(
+            os.getenv("AUDIO_GENERATION_DOWNLOAD_RESULTS") or source.get("download_results"),
+            bool(DEFAULT_AUDIO_GENERATION["download_results"]),
+        ),
+        "result_storage_prefix": str(
+            os.getenv("AUDIO_GENERATION_RESULT_STORAGE_PREFIX")
+            or source.get("result_storage_prefix")
+            or DEFAULT_AUDIO_GENERATION["result_storage_prefix"]
+        ).strip().strip("/"),
+        "poll_interval_secs": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_POLL_INTERVAL_SECS") or source.get("poll_interval_secs"),
+            int(DEFAULT_AUDIO_GENERATION["poll_interval_secs"]),
+            1,
+        ),
+        "poll_timeout_secs": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_POLL_TIMEOUT_SECS") or source.get("poll_timeout_secs"),
+            int(DEFAULT_AUDIO_GENERATION["poll_timeout_secs"]),
+            30,
+        ),
+        "queue_enabled": _normalize_bool(
+            queue_enabled_env if queue_enabled_env is not None else source.get("queue_enabled"),
+            bool(DEFAULT_AUDIO_GENERATION["queue_enabled"]),
+        ),
+        "redis_url": str(
+            os.getenv("AUDIO_GENERATION_REDIS_URL")
+            or os.getenv("GMKRAW_AUDIO_GENERATION_REDIS_URL")
+            or source.get("redis_url")
+            or default_redis_url
+        ).strip() or default_redis_url,
+        "queue_name": str(
+            os.getenv("AUDIO_GENERATION_QUEUE_NAME")
+            or source.get("queue_name")
+            or DEFAULT_AUDIO_GENERATION["queue_name"]
+        ).strip() or str(DEFAULT_AUDIO_GENERATION["queue_name"]),
+        "database_url": str(
+            os.getenv("AUDIO_GENERATION_DATABASE_URL")
+            or os.getenv("MYSQL_DATABASE_URL")
+            or source.get("database_url")
+            or ""
+        ).strip(),
+        "max_retries": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_MAX_RETRIES") or source.get("max_retries"),
+            int(DEFAULT_AUDIO_GENERATION["max_retries"]),
+            0,
+        ),
+        "worker_concurrency": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_WORKER_CONCURRENCY") or source.get("worker_concurrency"),
+            int(DEFAULT_AUDIO_GENERATION["worker_concurrency"]),
+            1,
+        ),
+        "total_concurrency": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_TOTAL_CONCURRENCY") or source.get("total_concurrency"),
+            int(DEFAULT_AUDIO_GENERATION["total_concurrency"]),
+            1,
+        ),
+        "owner_concurrency": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_OWNER_CONCURRENCY") or source.get("owner_concurrency"),
+            int(DEFAULT_AUDIO_GENERATION["owner_concurrency"]),
+            1,
+        ),
+        "owner_pending_limit": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_OWNER_PENDING_LIMIT") or source.get("owner_pending_limit"),
+            int(DEFAULT_AUDIO_GENERATION["owner_pending_limit"]),
+            1,
+        ),
+        "slot_lease_secs": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_SLOT_LEASE_SECS") or source.get("slot_lease_secs"),
+            int(DEFAULT_AUDIO_GENERATION["slot_lease_secs"]),
+            60,
+        ),
+        "stale_running_timeout_secs": _normalize_positive_int(
+            os.getenv("AUDIO_GENERATION_STALE_RUNNING_TIMEOUT_SECS") or source.get("stale_running_timeout_secs"),
+            int(DEFAULT_AUDIO_GENERATION["stale_running_timeout_secs"]),
+            60,
+        ),
+    }
+
+
 def _normalize_status_codes(value: object) -> list[int]:
     items = value if isinstance(value, list) else DEFAULT_PROXY_RUNTIME["reset_session_status_codes"]
     normalized: list[int] = []
@@ -1110,6 +1254,7 @@ def _normalize_openai_relay_settings(value: object) -> dict[str, object]:
     pool_cooldown_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_COOLDOWN_SECS")
     pool_max_attempts_env = os.getenv("GMKRAW_OPENAI_RELAY_POOL_MAX_ATTEMPTS")
     prompt_analysis_model_env = os.getenv("GMKRAW_PROMPT_ANALYSIS_MODEL")
+    video_agent_model_env = os.getenv("GMKRAW_VIDEO_AGENT_MODEL")
     embedding_model_env = os.getenv("GMKRAW_EMBEDDING_MODEL")
     return {
         "enabled": _normalize_bool(
@@ -1154,6 +1299,11 @@ def _normalize_openai_relay_settings(value: object) -> dict[str, object]:
             prompt_analysis_model_env
             or source.get("prompt_analysis_model")
             or DEFAULT_OPENAI_RELAY["prompt_analysis_model"]
+        ).strip(),
+        "video_agent_model": str(
+            video_agent_model_env
+            or source.get("video_agent_model")
+            or DEFAULT_OPENAI_RELAY["video_agent_model"]
         ).strip(),
         "embedding_model": str(
             embedding_model_env
@@ -1614,6 +1764,7 @@ class ConfigStore:
         data["video_upload"] = self.get_public_video_upload_settings()
         data["video_analysis"] = self.get_public_video_analysis_settings()
         data["video_generation"] = self.get_public_video_generation_settings()
+        data["audio_generation"] = self.get_public_audio_generation_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data["openai_relay"] = self.get_public_openai_relay_settings()
@@ -1715,6 +1866,44 @@ class ConfigStore:
 
     def get_public_video_generation_settings(self) -> dict[str, object]:
         settings = dict(self.get_video_generation_settings())
+        from services.video.video_generation_models import public_video_generation_models
+
+        api_key = str(settings.get("api_key") or "").strip()
+        api_keys = _normalize_string_list(settings.get("api_keys"))
+        settings["api_key"] = ""
+        settings["api_keys"] = []
+        settings["has_api_key"] = bool({key for key in [api_key, *api_keys] if key})
+        settings["api_key_count"] = len({key for key in [api_key, *api_keys] if key})
+        settings["models"] = public_video_generation_models()
+        settings["redis_url"] = _mask_url_password(str(settings.get("redis_url") or ""))
+        settings["database_url"] = _mask_url_password(str(settings.get("database_url") or ""))
+        return settings
+
+    def get_audio_generation_settings(self) -> dict[str, object]:
+        settings = _normalize_audio_generation_settings(
+            self.data.get("audio_generation"),
+            self.get_image_task_queue_settings(),
+        )
+        relay = self.get_openai_relay_settings()
+        if not str(settings.get("base_url") or "").strip() and str(relay.get("base_url") or "").strip():
+            settings["base_url"] = str(relay.get("base_url") or "").strip().rstrip("/")
+            settings["credential_source"] = "openai_relay"
+        api_key = str(settings.get("api_key") or "").strip()
+        api_keys = _normalize_string_list(settings.get("api_keys"))
+        if not api_key and not api_keys:
+            relay_api_key = str(relay.get("api_key") or "").strip()
+            relay_api_keys = _normalize_string_list(relay.get("api_keys"))
+            if relay_api_key:
+                settings["api_key"] = relay_api_key
+            if relay_api_keys:
+                settings["api_keys"] = relay_api_keys
+            if relay_api_key or relay_api_keys:
+                settings["credential_source"] = "openai_relay"
+        settings["credential_source"] = str(settings.get("credential_source") or "audio_generation")
+        return settings
+
+    def get_public_audio_generation_settings(self) -> dict[str, object]:
+        settings = dict(self.get_audio_generation_settings())
         api_key = str(settings.get("api_key") or "").strip()
         api_keys = _normalize_string_list(settings.get("api_keys"))
         settings["api_key"] = ""

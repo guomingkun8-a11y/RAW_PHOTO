@@ -16,6 +16,7 @@ Base = declarative_base()
 
 DEFAULT_DATABASE_URL = "mysql+pymysql://root:root@127.0.0.1:3306/raw_photo?charset=utf8mb4"
 ONLINE_WINDOW_MINUTES = 5
+LATENCY_SAMPLE_LIMIT = 5000
 
 
 def _database_url() -> str:
@@ -75,15 +76,21 @@ def _parse_datetime(value: object) -> datetime | None:
     text_value = _clean(value)
     if not text_value:
         return None
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(text_value[:19], fmt)
         except ValueError:
             continue
-    try:
-        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
-    except Exception:
-        return None
+    return None
+
+
+def _cursor_datetime(value: object) -> str:
+    parsed = _parse_datetime(value)
+    return parsed.isoformat(timespec="microseconds") if parsed else ""
 
 
 def _format_datetime(value: object) -> str:
@@ -291,7 +298,8 @@ class GenerationMonitoringService:
         self.engine = None
         self.Session = None
         self._init_error = ""
-        self._summary_cache = TTLCache[str, dict[str, Any]](ttl_seconds=3.0, max_items=16)
+        self._summary_cache = TTLCache[str, dict[str, Any]](ttl_seconds=10.0, max_items=16)
+        self._detail_totals_cache = TTLCache[str, dict[str, dict[str, Any]]](ttl_seconds=10.0, max_items=128)
         self._init_engine()
 
     def _init_engine(self) -> None:
@@ -345,6 +353,8 @@ class GenerationMonitoringService:
                 "CREATE INDEX idx_generation_events_status_updated ON generation_task_events (status, task_updated_at)",
                 "CREATE INDEX idx_generation_events_reported_failure ON generation_task_events (status, failure_reported_at, owner_id)",
                 "CREATE INDEX idx_generation_events_owner_updated ON generation_task_events (owner_id, task_updated_at)",
+                "CREATE INDEX idx_generation_events_owner_status_time_id ON generation_task_events (owner_id, status, task_updated_at, id)",
+                "CREATE INDEX idx_generation_events_status_time_owner_id ON generation_task_events (status, task_updated_at, owner_id, id)",
                 "CREATE INDEX idx_generation_events_upstream_task ON generation_task_events (upstream_task_id)",
             ):
                 try:
@@ -420,8 +430,10 @@ class GenerationMonitoringService:
             row.error = _clean(task.get("error")) or None
             if status != "error":
                 row.failure_reported_at = None
-            row.task_created_at = _parse_datetime(task.get("created_at"))
-            row.task_updated_at = _parse_datetime(task.get("updated_at"))
+            parsed_created_at = _parse_datetime(task.get("created_at"))
+            parsed_updated_at = _parse_datetime(task.get("updated_at"))
+            row.task_created_at = parsed_created_at or row.task_created_at or datetime.now()
+            row.task_updated_at = parsed_updated_at or row.task_updated_at or row.task_created_at
             current = (
                 row.status,
                 row.mode,
@@ -445,7 +457,6 @@ class GenerationMonitoringService:
                 return
             row.updated_at = datetime.now()
             session.commit()
-            self._summary_cache.clear()
         except Exception:
             session.rollback()
             raise
@@ -516,7 +527,6 @@ class GenerationMonitoringService:
                 row.task_updated_at = row.task_updated_at or now
                 row.updated_at = now
                 session.commit()
-                self._summary_cache.clear()
                 return {"ok": True, "ignored": True, "reason": "canceled"}
             row.status = "error"
             row.mode = "edit" if mode == "edit" else "generate"
@@ -543,7 +553,6 @@ class GenerationMonitoringService:
                 return
             row.updated_at = now
             session.commit()
-            self._summary_cache.clear()
             return {"ok": True}
         except Exception:
             session.rollback()
@@ -551,23 +560,14 @@ class GenerationMonitoringService:
         finally:
             session.close()
 
-    def sync_task_events(self, tasks: list[dict[str, Any]]) -> None:
-        for task in tasks:
-            try:
-                self.record_task_event(task)
-            except Exception:
-                continue
-
     @staticmethod
     def _summary_cache_key(
-        queue_snapshot: dict[str, Any] | None,
         start_at: datetime | None = None,
         end_at: datetime | None = None,
     ) -> str:
         try:
             return json.dumps(
                 {
-                    "queue": queue_snapshot or {},
                     "start_at": _format_datetime(start_at),
                     "end_at": _format_datetime(end_at),
                 },
@@ -577,7 +577,116 @@ class GenerationMonitoringService:
                 separators=(",", ":"),
             )
         except Exception:
-            return f"{queue_snapshot or {}}|{start_at}|{end_at}"
+            return f"{start_at}|{end_at}"
+
+    @staticmethod
+    def _detail_totals_cache_key(
+        *,
+        start_at: datetime | None,
+        end_at: datetime | None,
+        owner_id: str,
+        status: str,
+        query_text: str,
+        cost_only: bool,
+    ) -> str:
+        return json.dumps(
+            {
+                "start_at": start_at.isoformat(timespec="microseconds") if start_at else "",
+                "end_at": end_at.isoformat(timespec="microseconds") if end_at else "",
+                "owner_id": owner_id,
+                "status": status,
+                "query": query_text,
+                "cost_only": bool(cost_only),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _merge_queue_snapshot(
+        historical: dict[str, Any],
+        queue_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        queue_data = dict(queue_snapshot or {})
+        owner_activity_rows = queue_data.get("owner_activity") if isinstance(queue_data.get("owner_activity"), list) else []
+        owner_activity_map: dict[str, dict[str, int]] = {}
+        for row in owner_activity_rows:
+            if not isinstance(row, dict):
+                continue
+            owner_id = _clean(row.get("owner_id"))
+            if not owner_id:
+                continue
+            queued_tasks = int(row.get("queued_tasks") or 0)
+            running_tasks = int(row.get("running_tasks") or 0)
+            owner_activity_map[owner_id] = {
+                "queued_tasks": queued_tasks,
+                "running_tasks": running_tasks,
+                "active_tasks": int(row.get("active_tasks") or queued_tasks + running_tasks),
+            }
+
+        users = [dict(item) for item in historical.get("users") or [] if isinstance(item, dict)]
+        users_by_id = {_clean(item.get("user_id")): item for item in users if _clean(item.get("user_id"))}
+        for owner_id, activity in owner_activity_map.items():
+            user = users_by_id.get(owner_id)
+            if user is None:
+                user = {
+                    "user_id": owner_id,
+                    "username": owner_id,
+                    "name": owner_id,
+                    "role": "unknown",
+                    "enabled": True,
+                    "online": False,
+                    "active_sessions": 0,
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "total_count": 0,
+                    "cost_total": 0,
+                    "cost_count": 0,
+                    "cost_average": 0,
+                    "last_login_at": "",
+                    "last_seen_at": "",
+                }
+                users.append(user)
+                users_by_id[owner_id] = user
+            user.update(activity)
+        for owner_id, user in users_by_id.items():
+            if owner_id in owner_activity_map:
+                continue
+            user.update({"queued_tasks": 0, "running_tasks": 0, "active_tasks": 0})
+        users.sort(key=lambda item: (not item.get("online"), -int(item.get("total_count") or 0), _clean(item.get("username"))))
+
+        result = dict(historical)
+        result["users"] = users
+        result["task_queue"] = {
+            "enabled": bool(queue_data.get("enabled")),
+            "executor": str(queue_data.get("executor") or "inline"),
+            "queue_depth": int(queue_data.get("queue_depth") or 0),
+            "queue_depths": dict(queue_data.get("queue_depths") or {}),
+            "queued_tasks": int(queue_data.get("queued_tasks") or 0),
+            "running_tasks": int(queue_data.get("running_tasks") or 0),
+            "stale_running_tasks": int(queue_data.get("stale_running_tasks") or 0),
+            "active_slots": int(queue_data.get("active_slots") or 0),
+            "slot_limit": int(queue_data.get("slot_limit") or 0),
+            "adaptive_concurrency": dict(queue_data.get("adaptive_concurrency") or {}),
+            "active_workers": int(queue_data.get("active_workers") or 0),
+            "worker_concurrency": int(queue_data.get("worker_concurrency") or 0),
+            "local_concurrency_limit": int(queue_data.get("local_concurrency_limit") or 0),
+            "postprocess_concurrency": int(queue_data.get("postprocess_concurrency") or 0),
+            "async_postprocess_enabled": bool(queue_data.get("async_postprocess_enabled")),
+            "configured_total_concurrency": int(queue_data.get("configured_total_concurrency") or 0),
+            "total_concurrency": int(queue_data.get("total_concurrency") or 0),
+            "owner_concurrency": int(queue_data.get("owner_concurrency") or 0),
+            "effective_owner_concurrency": int(queue_data.get("effective_owner_concurrency") or 0),
+            "dynamic_owner_concurrency_enabled": bool(queue_data.get("dynamic_owner_concurrency_enabled")),
+            "dynamic_owner_concurrency_threshold": int(queue_data.get("dynamic_owner_concurrency_threshold") or 0),
+            "dynamic_owner_concurrency_max": int(queue_data.get("dynamic_owner_concurrency_max") or 0),
+            "active_owner_count": int(queue_data.get("active_owner_count") or 0),
+            "owner_pending_limit": int(queue_data.get("owner_pending_limit") or 0),
+            "stale_running_timeout_secs": int(queue_data.get("stale_running_timeout_secs") or 0),
+            "worker_heartbeat_secs": int(queue_data.get("worker_heartbeat_secs") or 0),
+        }
+        return result
 
     def summary(
         self,
@@ -586,18 +695,18 @@ class GenerationMonitoringService:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
     ) -> dict[str, Any]:
-        cache_key = self._summary_cache_key(queue_snapshot, start_at, end_at)
+        cache_key = self._summary_cache_key(start_at, end_at)
         cached = self._summary_cache.get(cache_key)
         if cached is not None:
-            return cached
+            return self._merge_queue_snapshot(cached, queue_snapshot)
 
         session = self._session()
         now = datetime.now()
         online_cutoff = now - timedelta(minutes=ONLINE_WINDOW_MINUTES)
-        range_params: dict[str, datetime] = {}
+        range_params: dict[str, Any] = {"latency_limit": LATENCY_SAMPLE_LIMIT}
         generated_range_sql = ""
         event_range_sql = ""
-        event_time_sql = "COALESCE(task_updated_at, updated_at, task_created_at, created_at)"
+        event_time_sql = "task_updated_at"
         if start_at is not None:
             range_params["start_at"] = start_at
             generated_range_sql += " AND created_at >= :start_at"
@@ -694,27 +803,22 @@ class GenerationMonitoringService:
                     range_params,
                 ).mappings()
             ]
-            duration_rows = [
-                int(row.get("duration_ms") or 0)
-                for row in session.execute(
-                    text(
-                        "SELECT duration_ms FROM generation_task_events "
-                        "WHERE status IN ('success', 'error') AND duration_ms IS NOT NULL AND duration_ms > 0 "
-                        f"{event_range_sql}"
-                    ),
-                    range_params,
-                ).mappings()
-            ]
             stage_rows = [
                 dict(row)
                 for row in session.execute(
                     text(
-                        "SELECT upload_duration_ms, queue_duration_ms, generation_duration_ms, save_duration_ms "
+                        "SELECT duration_ms, upload_duration_ms, queue_duration_ms, generation_duration_ms, save_duration_ms "
                         "FROM generation_task_events WHERE status IN ('success', 'error') "
-                        f"{event_range_sql}"
+                        f"{event_range_sql} "
+                        "ORDER BY id DESC LIMIT :latency_limit"
                     ),
                     range_params,
                 ).mappings()
+            ]
+            duration_rows = [
+                int(row["duration_ms"])
+                for row in stage_rows
+                if row.get("duration_ms") is not None and int(row["duration_ms"]) > 0
             ]
 
             user_map: dict[str, dict[str, Any]] = {
@@ -770,24 +874,7 @@ class GenerationMonitoringService:
                 model_items.append(model_item)
             model_items.sort(key=lambda item: (-float(item.get("cost_total") or 0), item["model"]))
 
-            queue_data = dict(queue_snapshot or {})
-            owner_activity_rows = queue_data.get("owner_activity") if isinstance(queue_data.get("owner_activity"), list) else []
-            owner_activity_map: dict[str, dict[str, int]] = {}
-            for row in owner_activity_rows:
-                if not isinstance(row, dict):
-                    continue
-                owner_id = _clean(row.get("owner_id"))
-                if not owner_id:
-                    continue
-                queued_tasks = int(row.get("queued_tasks") or 0)
-                running_tasks = int(row.get("running_tasks") or 0)
-                owner_activity_map[owner_id] = {
-                    "queued_tasks": queued_tasks,
-                    "running_tasks": running_tasks,
-                    "active_tasks": int(row.get("active_tasks") or queued_tasks + running_tasks),
-                }
-
-            owner_ids = set(user_map) | set(online_map) | set(success_map) | set(failed_map) | set(cost_map) | set(owner_activity_map)
+            owner_ids = set(user_map) | set(online_map) | set(success_map) | set(failed_map) | set(cost_map)
             items = []
             for owner_id in owner_ids:
                 user = user_map.get(owner_id) or {}
@@ -797,7 +884,6 @@ class GenerationMonitoringService:
                 cost_info = cost_map.get(owner_id, {})
                 cost_count = int(cost_info.get("cost_count") or 0)
                 cost_total = float(cost_info.get("cost_total") or 0)
-                activity = owner_activity_map.get(owner_id, {"queued_tasks": 0, "running_tasks": 0, "active_tasks": 0})
                 items.append(
                     {
                         "user_id": owner_id,
@@ -813,9 +899,9 @@ class GenerationMonitoringService:
                         "cost_total": round(cost_total, 6),
                         "cost_count": cost_count,
                         "cost_average": round(cost_total / cost_count, 6) if cost_count else 0,
-                        "queued_tasks": int(activity.get("queued_tasks") or 0),
-                        "running_tasks": int(activity.get("running_tasks") or 0),
-                        "active_tasks": int(activity.get("active_tasks") or 0),
+                        "queued_tasks": 0,
+                        "running_tasks": 0,
+                        "active_tasks": 0,
                         "last_login_at": _format_datetime(user.get("last_login_at")),
                         "last_seen_at": _format_datetime(online_map.get(owner_id, {}).get("last_seen_at")),
                     }
@@ -842,34 +928,7 @@ class GenerationMonitoringService:
                     "end_at": _format_datetime(end_at),
                     "end_exclusive": True,
                 },
-                "task_queue": {
-                    "enabled": bool(queue_data.get("enabled")),
-                    "executor": str(queue_data.get("executor") or "inline"),
-                    "queue_depth": int(queue_data.get("queue_depth") or 0),
-                    "queue_depths": dict(queue_data.get("queue_depths") or {}),
-                    "queued_tasks": int(queue_data.get("queued_tasks") or 0),
-                    "running_tasks": int(queue_data.get("running_tasks") or 0),
-                    "stale_running_tasks": int(queue_data.get("stale_running_tasks") or 0),
-                    "active_slots": int(queue_data.get("active_slots") or 0),
-                    "slot_limit": int(queue_data.get("slot_limit") or 0),
-                    "adaptive_concurrency": dict(queue_data.get("adaptive_concurrency") or {}),
-                    "active_workers": int(queue_data.get("active_workers") or 0),
-                    "worker_concurrency": int(queue_data.get("worker_concurrency") or 0),
-                    "local_concurrency_limit": int(queue_data.get("local_concurrency_limit") or 0),
-                    "postprocess_concurrency": int(queue_data.get("postprocess_concurrency") or 0),
-                    "async_postprocess_enabled": bool(queue_data.get("async_postprocess_enabled")),
-                    "configured_total_concurrency": int(queue_data.get("configured_total_concurrency") or 0),
-                    "total_concurrency": int(queue_data.get("total_concurrency") or 0),
-                    "owner_concurrency": int(queue_data.get("owner_concurrency") or 0),
-                    "effective_owner_concurrency": int(queue_data.get("effective_owner_concurrency") or 0),
-                    "dynamic_owner_concurrency_enabled": bool(queue_data.get("dynamic_owner_concurrency_enabled")),
-                    "dynamic_owner_concurrency_threshold": int(queue_data.get("dynamic_owner_concurrency_threshold") or 0),
-                    "dynamic_owner_concurrency_max": int(queue_data.get("dynamic_owner_concurrency_max") or 0),
-                    "active_owner_count": int(queue_data.get("active_owner_count") or 0),
-                    "owner_pending_limit": int(queue_data.get("owner_pending_limit") or 0),
-                    "stale_running_timeout_secs": int(queue_data.get("stale_running_timeout_secs") or 0),
-                    "worker_heartbeat_secs": int(queue_data.get("worker_heartbeat_secs") or 0),
-                },
+                "task_queue": {},
                 "task_latency": _latency_summary(duration_rows),
                 "stage_latency": {
                     "upload": _latency_summary([int(row["upload_duration_ms"]) for row in stage_rows if row.get("upload_duration_ms") is not None]),
@@ -879,7 +938,8 @@ class GenerationMonitoringService:
                 },
                 "users": items,
             }
-            return self._summary_cache.set(cache_key, result)
+            historical = self._summary_cache.set(cache_key, result)
+            return self._merge_queue_snapshot(historical, queue_snapshot)
         finally:
             session.close()
 
@@ -891,14 +951,34 @@ class GenerationMonitoringService:
         owner_id: str = "",
         status: str = "all",
         limit: int = 100,
+        offset: int = 0,
+        query_text: str = "",
+        cost_only: bool = False,
         include_references: bool = False,
+        cursor: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         normalized_status = status if status in {"success", "error"} else "all"
         normalized_owner_id = _clean(owner_id)
+        normalized_query = _clean(query_text).lower()
         safe_limit = max(1, min(500, int(limit or 100)))
-        params: dict[str, Any] = {"limit": safe_limit}
+        safe_offset = max(0, int(offset or 0))
+        params: dict[str, Any] = {"limit": safe_limit + 1, "offset": safe_offset}
+        cursor_time = None
+        cursor_source_type = ""
+        cursor_source_id = 0
+        if cursor is not None:
+            cursor_time = _parse_datetime(cursor.get("event_at"))
+            cursor_key = _clean(cursor.get("task_key"))
+            cursor_parts = cursor_key.rsplit(":", 1)
+            try:
+                cursor_source_id = int(cursor_parts[1]) if len(cursor_parts) == 2 else 0
+            except (TypeError, ValueError):
+                cursor_source_id = 0
+            cursor_source_type = cursor_parts[0] if len(cursor_parts) == 2 else ""
+            if cursor_time is None or cursor_source_type not in {"event", "image"} or cursor_source_id <= 0:
+                raise ValueError("invalid image monitoring cursor")
 
-        def filters(alias: str, timestamp_sql: str) -> str:
+        def filters(alias: str, timestamp_sql: str, *, include_upstream: bool = True) -> str:
             clauses = []
             if start_at is not None:
                 params["start_at"] = start_at
@@ -909,51 +989,83 @@ class GenerationMonitoringService:
             if normalized_owner_id:
                 params["owner_id"] = normalized_owner_id
                 clauses.append(f"{alias}.owner_id = :owner_id")
+            if normalized_query:
+                params["query_text"] = f"%{normalized_query}%"
+                query_fields = [
+                    f"{alias}.task_id LIKE :query_text",
+                    f"{alias}.owner_id LIKE :query_text",
+                    f"COALESCE({alias}.model, '') LIKE :query_text",
+                    f"COALESCE({alias}.mode, '') LIKE :query_text",
+                ]
+                if include_upstream:
+                    query_fields.append(f"COALESCE({alias}.upstream_task_id, '') LIKE :query_text")
+                clauses.append(f"({' OR '.join(query_fields)})")
             return "".join(f" AND {clause}" for clause in clauses)
 
         sources: list[str] = []
         if normalized_status in {"all", "success"}:
-            generated_filters = filters("g", "g.created_at")
-            sources.append(
-                "SELECT g.id AS source_id, 'image' AS source_type, g.task_id, g.owner_id, 'success' AS status, "
-                "1 AS image_count, g.mode, g.model, g.duration_ms, e.cost, "
-                "e.upstream_task_id, NULL AS error, g.created_at AS completed_at, g.image_url "
-                "FROM generated_images g "
-                "LEFT JOIN generation_task_events e ON e.owner_id = g.owner_id AND e.task_id = g.task_id "
-                "WHERE g.deleted_at IS NULL"
-                f"{generated_filters}"
-            )
+            if not cost_only:
+                generated_filters = filters("g", "g.created_at", include_upstream=False)
+                sources.append(
+                    "SELECT g.id AS source_id, 'image' AS source_type, g.task_id, g.owner_id, 'success' AS status, "
+                    "1 AS image_count, g.mode, g.model, g.duration_ms, e.cost, "
+                    "e.upstream_task_id, NULL AS error, g.created_at AS completed_at, g.image_url "
+                    "FROM generated_images g "
+                    "LEFT JOIN generation_task_events e ON e.owner_id = g.owner_id AND e.task_id = g.task_id "
+                    "WHERE g.deleted_at IS NULL"
+                    f"{generated_filters}"
+                )
             event_success_filters = filters(
                 "e",
-                "COALESCE(e.task_updated_at, e.updated_at, e.task_created_at, e.created_at)",
+                "e.task_updated_at",
             )
             sources.append(
                 "SELECT e.id AS source_id, 'event' AS source_type, e.task_id, e.owner_id, 'success' AS status, "
                 "COALESCE(NULLIF(e.image_count, 0), 1) AS image_count, e.mode, e.model, e.duration_ms, "
                 "e.cost, e.upstream_task_id, NULL AS error, "
-                "COALESCE(e.task_updated_at, e.updated_at, e.task_created_at, e.created_at) AS completed_at, "
+                "e.task_updated_at AS completed_at, "
                 "NULL AS image_url FROM generation_task_events e WHERE e.status = 'success'"
                 f"{event_success_filters}"
-                " AND NOT EXISTS ("
-                "SELECT 1 FROM generated_images g WHERE g.owner_id = e.owner_id AND g.task_id = e.task_id"
-                ")"
+                + (
+                    " AND NOT EXISTS ("
+                    "SELECT 1 FROM generated_images g WHERE g.owner_id = e.owner_id AND g.task_id = e.task_id"
+                    ")"
+                    if not cost_only
+                    else " AND e.cost IS NOT NULL"
+                )
             )
         if normalized_status in {"all", "error"}:
             event_error_filters = filters(
                 "e",
-                "COALESCE(e.task_updated_at, e.updated_at, e.task_created_at, e.created_at)",
+                "e.task_updated_at",
             )
             sources.append(
                 "SELECT e.id AS source_id, 'event' AS source_type, e.task_id, e.owner_id, 'error' AS status, "
                 "COALESCE(NULLIF(e.image_count, 0), 1) AS image_count, e.mode, e.model, e.duration_ms, "
                 "e.cost, e.upstream_task_id, e.error, "
-                "COALESCE(e.task_updated_at, e.updated_at, e.task_created_at, e.created_at) AS completed_at, "
+                "e.task_updated_at AS completed_at, "
                 "NULL AS image_url FROM generation_task_events e "
                 "WHERE e.status = 'error' AND e.failure_reported_at IS NOT NULL"
                 f"{event_error_filters}"
             )
         union_sql = " UNION ALL ".join(sources)
-        cost_filters = filters("e", "COALESCE(e.task_updated_at, e.updated_at, e.task_created_at, e.created_at)")
+        detail_filters = ["cost IS NOT NULL"] if cost_only else []
+        if cursor_time is not None:
+            params.update(
+                {
+                    "cursor_at": cursor_time,
+                    "cursor_source_type": cursor_source_type,
+                    "cursor_source_id": cursor_source_id,
+                }
+            )
+            detail_filters.append(
+                "(completed_at < :cursor_at OR (completed_at = :cursor_at AND "
+                "(source_type < :cursor_source_type OR "
+                "(source_type = :cursor_source_type AND source_id < :cursor_source_id))))"
+            )
+        details_filter_sql = f" WHERE {' AND '.join(detail_filters)}" if detail_filters else ""
+        totals_filter_sql = " WHERE cost IS NOT NULL" if cost_only else ""
+        cost_filters = filters("e", "e.task_updated_at")
         if normalized_status == "success":
             cost_status_sql = "AND e.status = 'success' "
         elif normalized_status == "error":
@@ -962,37 +1074,57 @@ class GenerationMonitoringService:
             cost_status_sql = "AND e.status IN ('success', 'error') "
         session = self._session()
         try:
-            totals = dict(
-                session.execute(
-                    text(
-                        "SELECT COUNT(*) AS record_count, COALESCE(SUM(image_count), 0) AS image_count "
-                        f"FROM ({union_sql}) AS monitoring_details"
-                    ),
-                    params,
-                ).mappings().one()
+            totals_cache_key = self._detail_totals_cache_key(
+                start_at=start_at,
+                end_at=end_at,
+                owner_id=normalized_owner_id,
+                status=normalized_status,
+                query_text=normalized_query,
+                cost_only=cost_only,
             )
-            image_cost_totals = dict(
-                session.execute(
-                    text(
-                        "SELECT COUNT(e.cost) AS cost_count, COALESCE(SUM(e.cost), 0) AS cost_total "
-                        "FROM generation_task_events e "
-                        f"WHERE e.cost IS NOT NULL {cost_status_sql}{cost_filters}"
+
+            def load_totals() -> dict[str, dict[str, Any]]:
+                return {
+                    "records": dict(
+                        session.execute(
+                            text(
+                                "SELECT COUNT(*) AS record_count, COALESCE(SUM(image_count), 0) AS image_count "
+                                f"FROM ({union_sql}) AS monitoring_details{totals_filter_sql}"
+                            ),
+                            params,
+                        ).mappings().one()
                     ),
-                    params,
-                ).mappings().one()
-            )
+                    "costs": dict(
+                        session.execute(
+                            text(
+                                "SELECT COUNT(e.cost) AS cost_count, COALESCE(SUM(e.cost), 0) AS cost_total "
+                                "FROM generation_task_events e "
+                                f"WHERE e.cost IS NOT NULL {cost_status_sql}{cost_filters}"
+                            ),
+                            params,
+                        ).mappings().one()
+                    ),
+                }
+
+            cached_totals = self._detail_totals_cache.get_or_set(totals_cache_key, load_totals)
+            totals = cached_totals["records"]
+            image_cost_totals = cached_totals["costs"]
             rows = [
                 dict(row)
                 for row in session.execute(
                     text(
                         "SELECT source_id, source_type, task_id, owner_id, status, image_count, mode, model, duration_ms, "
                         "cost, upstream_task_id, error, completed_at, image_url "
-                        f"FROM ({union_sql}) AS monitoring_details "
-                        "ORDER BY completed_at DESC LIMIT :limit"
+                        f"FROM ({union_sql}) AS monitoring_details{details_filter_sql} "
+                        "ORDER BY completed_at DESC, source_type DESC, source_id DESC LIMIT :limit"
+                        + ("" if cursor_time is not None else " OFFSET :offset")
                     ),
                     params,
                 ).mappings()
             ]
+            has_more = len(rows) > safe_limit
+            rows = rows[:safe_limit]
+            last_row = rows[-1] if rows else None
             reference_images_by_task = _reference_images_by_task(rows) if include_references else {}
             items = [
                 {
@@ -1032,7 +1164,17 @@ class GenerationMonitoringService:
                 "cost_total": round(total_cost_value, 6),
                 "cost_count": total_cost_count,
                 "limit": safe_limit,
-                "truncated": int(totals.get("record_count") or 0) > len(items),
+                "offset": 0 if cursor_time is not None else safe_offset,
+                "truncated": has_more,
+                "has_more": has_more,
+                "next_cursor": (
+                    {
+                        "event_at": _cursor_datetime(last_row.get("completed_at")),
+                        "task_key": f"{_clean(last_row.get('source_type'))}:{int(last_row.get('source_id') or 0)}",
+                    }
+                    if has_more and last_row is not None
+                    else None
+                ),
                 "range": {
                     "start_at": _format_datetime(start_at),
                     "end_at": _format_datetime(end_at),
@@ -1040,6 +1182,8 @@ class GenerationMonitoringService:
                 },
                 "owner_id": normalized_owner_id,
                 "status": normalized_status,
+                "query": normalized_query,
+                "cost_only": cost_only,
             }
         finally:
             session.close()

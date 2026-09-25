@@ -48,7 +48,36 @@ class RelayLease:
 
 
 class RelaySubmittedHTTPException(HTTPException):
-    pass
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        detail: Any = None,
+        headers: dict[str, str] | None = None,
+        upstream_task_ids: list[str] | None = None,
+        submission_uncertain: bool = True,
+        upstream_finished: bool = False,
+        reconciliation: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
+        self.upstream_task_ids = [
+            str(task_id).strip()
+            for task_id in upstream_task_ids or []
+            if str(task_id).strip()
+        ]
+        self.submission_uncertain = bool(submission_uncertain)
+        self.upstream_finished = bool(upstream_finished)
+        self.reconciliation = dict(reconciliation or {})
+
+
+class RelaySubmissionUnknownHTTPException(RelaySubmittedHTTPException):
+    def __init__(self, *, detail: Any, reconciliation: dict[str, Any]):
+        super().__init__(
+            status_code=502,
+            detail=detail,
+            submission_uncertain=True,
+            reconciliation=reconciliation,
+        )
 
 
 def current_relay_account() -> RelayAccount | None:

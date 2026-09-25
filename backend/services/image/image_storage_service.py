@@ -17,10 +17,15 @@ from minio import Minio
 from minio.error import S3Error
 from PIL import Image
 
+from services.image.image_asset_repository import (
+    ImageAssetRepository,
+    create_default_image_asset_repository,
+)
 from services.platform.config import DATA_DIR, config
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
+MEMORY_INDEXES: dict[str, dict[str, dict[str, object]]] = {}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
 REMOTE_PROVIDERS = {"webdav", "minio"}
 REMOTE_MODES = {"webdav", "minio", "both"}
@@ -104,13 +109,6 @@ def _read_json_object(path: Path) -> dict[str, object]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _write_json_object(path: Path, data: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
 
 
 def _remote_object_path(root_path: str, rel: str) -> str:
@@ -352,9 +350,18 @@ class MinIOClient:
 
 
 class ImageStorageService:
-    def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
+    def __init__(
+        self,
+        index_file: Path = IMAGE_INDEX_FILE,
+        *,
+        asset_repository: ImageAssetRepository | None = None,
+    ):
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
+        self.asset_repository = asset_repository
+        memory_key = str(index_file.resolve())
+        with self._index_lock:
+            self._memory_index = MEMORY_INDEXES.setdefault(memory_key, {})
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
@@ -381,16 +388,68 @@ class ImageStorageService:
     def _load_index(self) -> dict[str, dict[str, object]]:
         raw = _read_json_object(self.index_file)
         items = raw.get("items")
-        if not isinstance(items, dict):
-            return {}
-        return {str(key): value for key, value in items.items() if isinstance(value, dict)}
+        legacy = (
+            {str(key): value for key, value in items.items() if isinstance(value, dict)}
+            if isinstance(items, dict)
+            else {}
+        )
+        database_items: dict[str, dict[str, object]] = {}
+        if self.asset_repository is not None:
+            database_items = {
+                str(item.get("rel") or item.get("path")): item
+                for item in self.asset_repository.list_items()
+                if isinstance(item, dict) and str(item.get("rel") or item.get("path")).strip()
+            }
+        return {**legacy, **database_items, **self._memory_index}
 
     def _load_clean_index(self) -> dict[str, dict[str, object]]:
         items = self._load_index()
         return {rel: item for rel, item in items.items() if _is_image_rel(rel)}
 
-    def _save_index(self, items: dict[str, dict[str, object]]) -> None:
-        _write_json_object(self.index_file, {"items": items})
+    def _remember_item(
+        self,
+        item: dict[str, object],
+        *,
+        owner_id: str = "",
+        task_id: str = "",
+        asset_index: str = "",
+        mime_type: str = "",
+        digest: str = "",
+        batch_id: str = "",
+    ) -> None:
+        rel = _safe_relative_path(str(item.get("rel") or item.get("path") or ""))
+        normalized = {**item, "rel": rel, "path": rel}
+        self._memory_index[rel] = normalized
+        if self.asset_repository is None:
+            return
+        resolved_owner = _clean(owner_id or normalized.get("owner_id")) or "system"
+        resolved_task = _clean(task_id or normalized.get("task_id"))
+        if not resolved_task:
+            resolved_task = f"object-{hashlib.sha256(rel.encode('utf-8')).hexdigest()[:32]}"
+        resolved_index = _clean(asset_index or normalized.get("image_index")) or "0"
+        remote_url = _clean(normalized.get("remote_url"))
+        self.asset_repository.upsert(
+            owner_id=resolved_owner,
+            task_id=resolved_task,
+            batch_id=_clean(batch_id or normalized.get("batch_id")),
+            asset_type=_clean(normalized.get("asset_type")) or "generated",
+            image_index=resolved_index,
+            storage_provider=_clean(normalized.get("storage")) or "local",
+            object_key=rel,
+            url=remote_url or self._public_url(rel),
+            mime_type=mime_type,
+            width=int(normalized["width"]) if normalized.get("width") is not None else None,
+            height=int(normalized["height"]) if normalized.get("height") is not None else None,
+            file_size=int(normalized["size"]) if normalized.get("size") is not None else None,
+            digest=digest,
+            metadata=normalized,
+        )
+
+    def _forget_item(self, rel: str) -> None:
+        safe_rel = _safe_relative_path(rel)
+        self._memory_index.pop(safe_rel, None)
+        if self.asset_repository is not None:
+            self.asset_repository.delete(safe_rel)
 
     def _public_url(self, rel: str, base_url: str | None = None, *, prefer_remote: bool = True) -> str:
         settings = self.settings()
@@ -413,6 +472,11 @@ class ImageStorageService:
         relative_path: str | None = None,
         asset_type: str = "generated",
         cleanup: bool = True,
+        owner_id: str = "",
+        task_id: str = "",
+        asset_index: str = "",
+        batch_id: str = "",
+        mime_type: str = "image/png",
     ) -> StoredImage:
         if cleanup:
             self.cleanup_old_images()
@@ -462,9 +526,15 @@ class ImageStorageService:
         if dimensions:
             item["width"], item["height"] = dimensions
         with self._index_lock:
-            items = self._load_clean_index()
-            items[rel] = item
-            self._save_index(items)
+            self._remember_item(
+                item,
+                owner_id=owner_id,
+                task_id=task_id,
+                asset_index=asset_index,
+                batch_id=batch_id,
+                mime_type=mime_type,
+                digest=hashlib.sha256(image_data).hexdigest(),
+            )
         return StoredImage(rel=rel, url=self._public_url(rel, base_url, prefer_remote=stored_remote), storage=str(item["storage"]), size=len(image_data))
 
     def save_task_asset(
@@ -492,6 +562,10 @@ class ImageStorageService:
             relative_path=relative_path,
             asset_type=_clean(asset_type) or "input",
             cleanup=False,
+            owner_id=owner_id,
+            task_id=task_id,
+            asset_index=str(asset_index),
+            mime_type=mime_type,
         )
 
     def get_bytes(self, rel: str) -> bytes:
@@ -583,9 +657,11 @@ class ImageStorageService:
                             "webdav": provider == "webdav",
                             "minio": provider == "minio",
                         }
+                        self._remember_item(indexed[rel])
                         changed = True
                         continue
                 indexed.pop(rel, None)
+                self._forget_item(rel)
                 changed = True
             for path in config.images_dir.rglob("*"):
                 if not path.is_file() or not _is_image_rel(path.name):
@@ -604,8 +680,6 @@ class ImageStorageService:
                 except Exception:
                     pass
                 changed = True
-            if changed:
-                self._save_index(indexed)
         _cleanup_empty_dirs(config.images_dir)
         return removed
 
@@ -640,12 +714,14 @@ class ImageStorageService:
                     "minio": False,
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 }
+                self._remember_item(indexed[rel])
                 changed = True
 
             items: list[dict[str, object]] = []
             for rel, item in list(indexed.items()):
                 if not _is_image_rel(rel):
                     indexed.pop(rel, None)
+                    self._forget_item(rel)
                     changed = True
                     continue
                 local = _local_image_path(rel).is_file()
@@ -653,6 +729,7 @@ class ImageStorageService:
                 remote = _has_remote(item)
                 if not local and not remote:
                     indexed.pop(rel, None)
+                    self._forget_item(rel)
                     changed = True
                     continue
                 if str(item.get("asset_type") or "generated") in {"task_input", "task_mask", "task_result"}:
@@ -674,6 +751,7 @@ class ImageStorageService:
                         "minio": remote and provider == "minio",
                     }
                     indexed[rel] = item
+                    self._remember_item(item)
                     changed = True
                 day = str(item.get("date") or "")
                 if start_date and day < start_date:
@@ -686,8 +764,6 @@ class ImageStorageService:
                     "path": rel,
                     "url": self._public_url(rel, base_url),
                 })
-            if changed:
-                self._save_index(indexed)
         items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return items
 
@@ -714,7 +790,7 @@ class ImageStorageService:
                         raise
             if safe_rel in items:
                 items.pop(safe_rel, None)
-                self._save_index(items)
+                self._forget_item(safe_rel)
         return removed
 
     def sync_all(self, workers: int = 1) -> dict[str, int]:
@@ -772,7 +848,7 @@ class ImageStorageService:
                         existing = current.get(rel, {})
                         uploaded_item["created_at"] = str(existing.get("created_at") or uploaded_item["created_at"])
                         current[rel] = {**existing, **uploaded_item}
-                        self._save_index(current)
+                        self._remember_item(current[rel])
                     uploaded += 1
                 except Exception:
                     failed += 1
@@ -785,4 +861,6 @@ class ImageStorageService:
         return MinIOClient(self.settings()).test()
 
 
-image_storage_service = ImageStorageService()
+image_storage_service = ImageStorageService(
+    asset_repository=create_default_image_asset_repository(),
+)

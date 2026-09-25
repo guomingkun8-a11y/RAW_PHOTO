@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import json
 from datetime import datetime
+import time
 from typing import Callable
 
 from sqlalchemy import BigInteger, Column, DateTime, Float, Integer, MetaData, String, Table, Text, UniqueConstraint, create_engine, inspect, text
@@ -8,10 +11,13 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 
+from services.billing.upstream_usage_models import BillingBase
 from services.platform.enterprise_schema import EnterpriseBase
 from services.image.image_task_store import Base as ImageTaskBase
 
 MIGRATION_TABLE = "schema_migrations"
+MIGRATION_LOCK_NAME = "gmkraw_schema_migrations"
+MIGRATION_LOCK_KEY = 0x474D4B524157
 
 
 def _migration_table(metadata: MetaData) -> Table:
@@ -48,6 +54,52 @@ def _ensure_migration_table(engine: Engine, table: Table) -> None:
         # check and CREATE. Re-inspect before deciding this is a real error.
         if MIGRATION_TABLE not in inspect(engine).get_table_names():
             raise
+
+
+@contextmanager
+def _migration_lock(engine: Engine, timeout_secs: int = 60):
+    dialect = engine.dialect.name
+    if dialect not in {"mysql", "postgresql"}:
+        yield
+        return
+
+    connection = engine.connect()
+    acquired = False
+    try:
+        if dialect == "mysql":
+            acquired = connection.execute(
+                text("SELECT GET_LOCK(:name, :timeout)"),
+                {"name": MIGRATION_LOCK_NAME, "timeout": max(1, int(timeout_secs))},
+            ).scalar() == 1
+        else:
+            deadline = time.monotonic() + max(1, int(timeout_secs))
+            while time.monotonic() < deadline:
+                acquired = bool(connection.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    {"key": MIGRATION_LOCK_KEY},
+                ).scalar())
+                if acquired:
+                    break
+                time.sleep(0.25)
+        if not acquired:
+            raise RuntimeError("timed out waiting for the database migration lock")
+        yield
+    finally:
+        if acquired:
+            try:
+                if dialect == "mysql":
+                    connection.execute(
+                        text("SELECT RELEASE_LOCK(:name)"),
+                        {"name": MIGRATION_LOCK_NAME},
+                    )
+                else:
+                    connection.execute(
+                        text("SELECT pg_advisory_unlock(:key)"),
+                        {"key": MIGRATION_LOCK_KEY},
+                    )
+            except Exception:
+                pass
+        connection.close()
 
 
 def _apply_base_schema(engine: Engine) -> None:
@@ -163,6 +215,191 @@ def _apply_operational_indexes(engine: Engine) -> None:
                     connection.execute(text(statement))
                 except Exception:
                     pass
+
+
+def _apply_image_task_projection_outbox(engine: Engine) -> None:
+    if not _table_exists(engine, "image_tasks"):
+        return
+    with engine.begin() as connection:
+        columns = _column_names(connection, "image_tasks")
+        for name, definition in {
+            "projection_pending": "INTEGER NOT NULL DEFAULT 0",
+            "projection_next_attempt_at": "TIMESTAMP NULL",
+        }.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE image_tasks ADD COLUMN {name} {definition}"))
+        try:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_image_tasks_projection_due "
+                    "ON image_tasks (projection_pending, projection_next_attempt_at)"
+                )
+            )
+        except Exception:
+            pass
+
+
+def _apply_history_query_indexes(engine: Engine) -> None:
+    statements = {
+        "generated_images": [
+            "CREATE INDEX idx_generated_images_owner_task ON generated_images (owner_id, task_id)",
+        ],
+        "generation_task_events": [
+            "CREATE INDEX idx_generation_events_status_time_owner "
+            "ON generation_task_events (status, task_updated_at, owner_id)",
+            "CREATE INDEX idx_generation_events_status_cost_time "
+            "ON generation_task_events (status, cost, task_updated_at)",
+        ],
+    }
+    with engine.begin() as connection:
+        for table_name, table_statements in statements.items():
+            if not _table_exists(engine, table_name):
+                continue
+            for statement in table_statements:
+                try:
+                    connection.execute(text(statement))
+                except Exception:
+                    pass
+
+
+def _apply_generation_event_query_path(engine: Engine) -> None:
+    if not _table_exists(engine, "generation_task_events"):
+        return
+    statements = (
+        "CREATE INDEX idx_generation_events_owner_status_time_id "
+        "ON generation_task_events (owner_id, status, task_updated_at, id)",
+        "CREATE INDEX idx_generation_events_status_time_owner_id "
+        "ON generation_task_events (status, task_updated_at, owner_id, id)",
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE generation_task_events "
+                "SET task_created_at = COALESCE(task_created_at, created_at, updated_at, CURRENT_TIMESTAMP), "
+                "task_updated_at = COALESCE(task_updated_at, updated_at, task_created_at, created_at, CURRENT_TIMESTAMP) "
+                "WHERE task_created_at IS NULL OR task_updated_at IS NULL"
+            )
+        )
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _apply_image_asset_database_index(engine: Engine) -> None:
+    table_name = "image_assets"
+    ImageTaskBase.metadata.tables["image_task_owner_guards"].create(engine, checkfirst=True)
+    EnterpriseBase.metadata.tables[table_name].create(engine, checkfirst=True)
+    if engine.dialect.name not in {"mysql", "postgresql"}:
+        return
+
+    inspector = inspect(engine)
+    unique_constraints = {
+        str(item.get("name") or "")
+        for item in inspector.get_unique_constraints(table_name)
+    }
+    with engine.begin() as connection:
+        if engine.dialect.name == "mysql":
+            connection.execute(
+                text("ALTER TABLE image_assets MODIFY COLUMN image_index VARCHAR(191) NOT NULL")
+            )
+            if "uq_image_asset_task_index" in unique_constraints:
+                connection.execute(text("ALTER TABLE image_assets DROP INDEX uq_image_asset_task_index"))
+            if "uq_image_asset_owner_task_type_index" not in unique_constraints:
+                connection.execute(
+                    text(
+                        "ALTER TABLE image_assets ADD CONSTRAINT "
+                        "uq_image_asset_owner_task_type_index UNIQUE "
+                        "(owner_id, task_id, asset_type, image_index)"
+                    )
+                )
+        else:
+            connection.execute(
+                text(
+                    "ALTER TABLE image_assets ALTER COLUMN image_index TYPE VARCHAR(191) "
+                    "USING image_index::VARCHAR"
+                )
+            )
+            if "uq_image_asset_task_index" in unique_constraints:
+                connection.execute(
+                    text("ALTER TABLE image_assets DROP CONSTRAINT uq_image_asset_task_index")
+                )
+            if "uq_image_asset_owner_task_type_index" not in unique_constraints:
+                connection.execute(
+                    text(
+                        "ALTER TABLE image_assets ADD CONSTRAINT "
+                        "uq_image_asset_owner_task_type_index UNIQUE "
+                        "(owner_id, task_id, asset_type, image_index)"
+                    )
+                )
+
+
+def _apply_upstream_usage_ledger(engine: Engine) -> None:
+    BillingBase.metadata.create_all(engine)
+    with engine.begin() as connection:
+        existing = connection.execute(
+            text("SELECT provider FROM upstream_usage_sync_state WHERE provider = :provider"),
+            {"provider": "lk888"},
+        ).scalar()
+        if existing is None:
+            connection.execute(
+                text(
+                    "INSERT INTO upstream_usage_sync_state "
+                    "(provider, status, last_error, records_seen, records_upserted, lease_owner, updated_at) "
+                    "VALUES (:provider, 'idle', '', 0, 0, '', :updated_at)"
+                ),
+                {"provider": "lk888", "updated_at": datetime.now()},
+            )
+
+
+def _apply_upstream_usage_event_index(engine: Engine) -> None:
+    if not _table_exists(engine, "upstream_usage_records"):
+        _apply_upstream_usage_ledger(engine)
+    with engine.begin() as connection:
+        try:
+            connection.execute(
+                text("CREATE INDEX idx_upstream_usage_event ON upstream_usage_records (event_at, id)")
+            )
+        except Exception:
+            pass
+
+
+def _apply_upstream_usage_model_attribution(engine: Engine) -> None:
+    if not _table_exists(engine, "upstream_usage_records"):
+        _apply_upstream_usage_ledger(engine)
+    definitions = {
+        "requested_model": "VARCHAR(191) NOT NULL DEFAULT ''",
+        "model_version": "VARCHAR(64) NOT NULL DEFAULT ''",
+    }
+    with engine.begin() as connection:
+        columns = _column_names(connection, "upstream_usage_records")
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(text(
+                    f"ALTER TABLE upstream_usage_records ADD COLUMN {name} {definition}"
+                ))
+        try:
+            connection.execute(text(
+                "CREATE INDEX idx_upstream_usage_requested_model_event "
+                "ON upstream_usage_records (requested_model, event_at, id)"
+            ))
+        except Exception:
+            pass
+
+
+def _apply_upstream_usage_chat_attribution(engine: Engine) -> None:
+    BillingBase.metadata.create_all(engine)
+    with engine.begin() as connection:
+        try:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_upstream_usage_attribution_source_task "
+                    "ON upstream_usage_attributions (local_source, local_task_id)"
+                )
+            )
+        except Exception:
+            pass
 
 
 def _apply_relational_constraints(engine: Engine) -> None:
@@ -649,6 +886,7 @@ def _apply_video_generation_task_schema(engine: Engine) -> None:
         Column("key", String(383), primary_key=True),
         Column("owner_id", String(191), nullable=False),
         Column("task_id", String(191), nullable=False),
+        Column("conversation_id", String(191), nullable=False, default=""),
         Column("status", String(32), nullable=False),
         Column("mode", String(32), nullable=False),
         Column("model", String(191), nullable=True),
@@ -660,6 +898,7 @@ def _apply_video_generation_task_schema(engine: Engine) -> None:
     metadata.create_all(engine)
     statements = [
         "CREATE INDEX idx_video_generation_owner_updated ON video_generation_tasks (owner_id, updated_at)",
+        "CREATE INDEX idx_video_generation_owner_conversation_updated ON video_generation_tasks (owner_id, conversation_id, updated_at)",
         "CREATE INDEX idx_video_generation_status_updated ON video_generation_tasks (status, updated_at)",
         "CREATE INDEX idx_video_generation_upstream_task ON video_generation_tasks (upstream_task_id)",
     ]
@@ -669,6 +908,292 @@ def _apply_video_generation_task_schema(engine: Engine) -> None:
                 connection.execute(text(statement))
             except Exception:
                 pass
+
+
+def _apply_canvas_workflow_schema(engine: Engine) -> None:
+    metadata = MetaData()
+    Table(
+        "canvas_workflows",
+        metadata,
+        Column("owner_id", String(191), primary_key=True),
+        Column("id", String(191), primary_key=True),
+        Column("title", String(191), nullable=False, default=""),
+        Column("cover_url", Text().with_variant(LONGTEXT, "mysql"), nullable=True),
+        Column("node_count", Integer, nullable=False, default=0),
+        Column("revision", Integer, nullable=False, default=1),
+        Column("payload_json", Text().with_variant(LONGTEXT, "mysql"), nullable=False),
+        Column("created_at", DateTime, nullable=False),
+        Column("updated_at", DateTime, nullable=False),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        for statement in (
+            "CREATE INDEX idx_canvas_workflows_owner_updated ON canvas_workflows (owner_id, updated_at)",
+            "CREATE INDEX idx_canvas_workflows_owner_title ON canvas_workflows (owner_id, title)",
+        ):
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _apply_video_generation_conversation_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "video_generation_tasks"):
+        _apply_video_generation_task_schema(engine)
+    with engine.begin() as connection:
+        columns = _column_names(connection, "video_generation_tasks")
+        if "conversation_id" not in columns:
+            connection.execute(
+                text("ALTER TABLE video_generation_tasks ADD COLUMN conversation_id VARCHAR(191) NOT NULL DEFAULT ''")
+            )
+        try:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_video_generation_owner_conversation_updated "
+                    "ON video_generation_tasks (owner_id, conversation_id, updated_at)"
+                )
+            )
+        except Exception:
+            pass
+
+
+def _apply_video_generation_reliability_schema(engine: Engine) -> None:
+    from sqlalchemy.orm import Session
+
+    from services.video.video_generation_records import RecordsBase, backfill_records
+    from services.video.video_generation_task_store import Base as VideoGenerationBase
+
+    VideoGenerationBase.metadata.create_all(engine)
+    RecordsBase.metadata.create_all(engine)
+    _ensure_video_generation_reconciliation_column(engine)
+    if not _table_exists(engine, "video_generation_tasks"):
+        return
+
+    cursor = ""
+    while True:
+        with Session(engine) as session, session.begin():
+            result = backfill_records(session, after_key=cursor, batch_size=500)
+        cursor = str(result["next_key"])
+        if bool(result["done"]):
+            break
+
+
+def _apply_video_generation_history_query_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "video_generation_tasks"):
+        _apply_video_generation_task_schema(engine)
+    prompt_type = "LONGTEXT NULL" if engine.dialect.name == "mysql" else "TEXT NULL"
+    with engine.begin() as connection:
+        if "prompt" not in _column_names(connection, "video_generation_tasks"):
+            connection.execute(text(
+                f"ALTER TABLE video_generation_tasks ADD COLUMN prompt {prompt_type}"
+            ))
+
+    task_key_column = _quoted_identifier(engine, "key")
+    cursor = ""
+    while True:
+        with engine.begin() as connection:
+            rows = connection.execute(
+                text(
+                    f"SELECT {task_key_column} AS task_key, task_json FROM video_generation_tasks "
+                    f"WHERE {task_key_column} > :cursor ORDER BY {task_key_column} LIMIT 500"
+                ),
+                {"cursor": cursor},
+            ).mappings().all()
+            updates = []
+            for row in rows:
+                try:
+                    task = json.loads(row["task_json"])
+                    prompt = str(task.get("prompt") or "")[:12000] if isinstance(task, dict) else ""
+                except (TypeError, ValueError):
+                    prompt = ""
+                updates.append({"key": row["task_key"], "prompt": prompt})
+            if updates:
+                connection.execute(
+                    text(
+                        f"UPDATE video_generation_tasks SET prompt = :prompt "
+                        f"WHERE {task_key_column} = :key"
+                    ),
+                    updates,
+                )
+        if not rows or len(rows) < 500:
+            break
+        cursor = str(rows[-1]["task_key"])
+
+    statements = (
+        "CREATE INDEX idx_video_generation_owner_status_created_key "
+        "ON video_generation_tasks (owner_id, status, created_at, key)",
+        "CREATE INDEX idx_video_generation_status_created_key "
+        "ON video_generation_tasks (status, created_at, key)",
+    )
+    with engine.begin() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _ensure_video_generation_reconciliation_column(engine: Engine) -> None:
+    if not _table_exists(engine, "video_generation_records"):
+        return
+    with engine.begin() as connection:
+        columns = _column_names(connection, "video_generation_records")
+        if "reconciliation_required" not in columns:
+            default = "FALSE" if engine.dialect.name == "postgresql" else "0"
+            connection.execute(text(
+                "ALTER TABLE video_generation_records ADD COLUMN "
+                f"reconciliation_required BOOLEAN NOT NULL DEFAULT {default}"
+            ))
+
+
+def _apply_video_generation_reconciliation_schema(engine: Engine) -> None:
+    from services.video.video_generation_records import RecordsBase
+
+    RecordsBase.metadata.create_all(engine)
+    _ensure_video_generation_reconciliation_column(engine)
+
+    if _table_exists(engine, "video_generation_tasks"):
+        task_key_column = _quoted_identifier(engine, "key")
+        cursor = ""
+        while True:
+            with engine.begin() as connection:
+                rows = connection.execute(
+                    text(
+                        f"SELECT {task_key_column} AS task_key, task_json FROM video_generation_tasks "
+                        f"WHERE {task_key_column} > :cursor ORDER BY {task_key_column} LIMIT 500"
+                    ),
+                    {"cursor": cursor},
+                ).mappings().all()
+                updates = []
+                for row in rows:
+                    try:
+                        task = json.loads(row["task_json"])
+                        required = bool(task.get("reconciliation_required")) if isinstance(task, dict) else False
+                    except (TypeError, ValueError):
+                        required = False
+                    updates.append({"key": row["task_key"], "required": required})
+                if updates:
+                    connection.execute(
+                        text(
+                            "UPDATE video_generation_records SET reconciliation_required = :required "
+                            "WHERE task_key = :key"
+                        ),
+                        updates,
+                    )
+            if not rows or len(rows) < 500:
+                break
+            cursor = str(rows[-1]["task_key"])
+
+    with engine.begin() as connection:
+        try:
+            connection.execute(text(
+                "CREATE INDEX idx_video_record_reconciliation_event "
+                "ON video_generation_records (reconciliation_required, event_at)"
+            ))
+        except Exception:
+            pass
+
+
+def _apply_audio_generation_schema(engine: Engine) -> None:
+    from services.audio.audio_generation_records import RecordsBase as AudioRecordsBase
+    from services.audio.audio_generation_task_store import Base as AudioGenerationBase
+
+    AudioGenerationBase.metadata.create_all(engine)
+    AudioRecordsBase.metadata.create_all(engine)
+
+
+def _apply_video_agent_message_schema(engine: Engine) -> None:
+    metadata = MetaData()
+    long_text = Text().with_variant(LONGTEXT, "mysql")
+    Table(
+        "video_agent_messages",
+        metadata,
+        Column("id", String(191), primary_key=True),
+        Column("owner_id", String(191), nullable=False),
+        Column("owner_username", String(191), nullable=False, default=""),
+        Column("owner_name", String(191), nullable=False, default=""),
+        Column("conversation_id", String(191), nullable=False),
+        Column("turn_id", String(191), nullable=False, default=""),
+        Column("prompt", long_text, nullable=False),
+        Column("message", long_text, nullable=False),
+        Column("chat_model", String(191), nullable=False, default=""),
+        Column("duration_ms", Integer, nullable=True),
+        Column("created_at", DateTime, nullable=False),
+    )
+    metadata.create_all(engine)
+    statements = [
+        "CREATE INDEX idx_video_agent_owner_conversation_created "
+        "ON video_agent_messages (owner_id, conversation_id, created_at)",
+        "CREATE INDEX idx_video_agent_owner_created ON video_agent_messages (owner_id, created_at)",
+    ]
+    with engine.begin() as connection:
+        for statement in statements:
+            try:
+                connection.execute(text(statement))
+            except Exception:
+                pass
+
+
+def _apply_video_agent_reasoning_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "video_agent_messages"):
+        _apply_video_agent_message_schema(engine)
+    summary_type = "LONGTEXT NULL" if engine.dialect.name == "mysql" else "TEXT NULL"
+    definitions = {
+        "reasoning_summary": summary_type,
+        "reasoning_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+    }
+    with engine.begin() as connection:
+        columns = _column_names(connection, "video_agent_messages")
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE video_agent_messages ADD COLUMN {name} {definition}"))
+
+
+def _apply_video_agent_attachment_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "video_agent_messages"):
+        _apply_video_agent_message_schema(engine)
+    attachment_type = "LONGTEXT NULL" if engine.dialect.name == "mysql" else "TEXT NULL"
+    with engine.begin() as connection:
+        columns = _column_names(connection, "video_agent_messages")
+        if "attachments_json" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE video_agent_messages "
+                    f"ADD COLUMN attachments_json {attachment_type}"
+                )
+            )
+
+
+def _apply_video_agent_async_schema(engine: Engine) -> None:
+    if not _table_exists(engine, "video_agent_messages"):
+        _apply_video_agent_message_schema(engine)
+    status_type = "VARCHAR(32) NOT NULL DEFAULT 'completed'"
+    error_type = "LONGTEXT NULL" if engine.dialect.name == "mysql" else "TEXT NULL"
+    with engine.begin() as connection:
+        columns = _column_names(connection, "video_agent_messages")
+        if "status" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE video_agent_messages "
+                    f"ADD COLUMN status {status_type}"
+                )
+            )
+        if "analysis_error" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE video_agent_messages "
+                    f"ADD COLUMN analysis_error {error_type}"
+                )
+            )
+        try:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_video_agent_owner_status_created "
+                    "ON video_agent_messages (owner_id, status, created_at)"
+                )
+            )
+        except Exception:
+            pass
 
 
 def _apply_professional_knowledge_schema(engine: Engine) -> None:
@@ -878,6 +1403,24 @@ MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("022_professional_agent_videos", _apply_professional_agent_video_schema),
     ("023_professional_agent_video_analysis", _apply_professional_agent_video_analysis_schema),
     ("024_video_generation_tasks", _apply_video_generation_task_schema),
+    ("025_video_generation_conversations", _apply_video_generation_conversation_schema),
+    ("026_video_agent_messages", _apply_video_agent_message_schema),
+    ("027_video_agent_reasoning", _apply_video_agent_reasoning_schema),
+    ("028_video_agent_attachments", _apply_video_agent_attachment_schema),
+    ("029_video_agent_async_processing", _apply_video_agent_async_schema),
+    ("031_video_generation_reliability", _apply_video_generation_reliability_schema),
+    ("032_video_generation_history_query", _apply_video_generation_history_query_schema),
+    ("033_video_generation_reconciliation_state", _apply_video_generation_reconciliation_schema),
+    ("034_image_task_projection_outbox", _apply_image_task_projection_outbox),
+    ("035_history_query_indexes", _apply_history_query_indexes),
+    ("036_generation_event_query_path", _apply_generation_event_query_path),
+    ("037_image_asset_database_index", _apply_image_asset_database_index),
+    ("038_upstream_usage_ledger", _apply_upstream_usage_ledger),
+    ("039_upstream_usage_event_index", _apply_upstream_usage_event_index),
+    ("040_upstream_usage_model_attribution", _apply_upstream_usage_model_attribution),
+    ("041_upstream_usage_chat_attribution", _apply_upstream_usage_chat_attribution),
+    ("042_audio_generation_tasks", _apply_audio_generation_schema),
+    ("043_canvas_workflows_production", _apply_canvas_workflow_schema),
 )
 
 
@@ -908,28 +1451,29 @@ def run_migrations(database_url: str, *, dry_run: bool = False) -> dict[str, obj
         metadata = MetaData()
         table = _migration_table(metadata)
         _ensure_migration_table(engine, table)
-        with engine.connect() as connection:
-            applied = {
-                str(row[0])
-                for row in connection.execute(text(f"SELECT version FROM {MIGRATION_TABLE}"))
-            }
-        pending = [version for version, _ in MIGRATIONS if version not in applied]
-        if dry_run:
-            return {"applied": sorted(applied), "pending": pending, "dry_run": True}
+        with _migration_lock(engine):
+            with engine.connect() as connection:
+                applied = {
+                    str(row[0])
+                    for row in connection.execute(text(f"SELECT version FROM {MIGRATION_TABLE}"))
+                }
+            pending = [version for version, _ in MIGRATIONS if version not in applied]
+            if dry_run:
+                return {"applied": sorted(applied), "pending": pending, "dry_run": True}
 
-        applied_now: list[str] = []
-        for version, handler in MIGRATIONS:
-            if version in applied:
-                continue
-            handler(engine)
-            with engine.begin() as connection:
-                connection.execute(table.insert().values(version=version, applied_at=datetime.now()))
-            applied_now.append(version)
-        return {
-            "applied": sorted(applied | set(applied_now)),
-            "applied_now": applied_now,
-            "pending": [],
-            "dry_run": False,
-        }
+            applied_now: list[str] = []
+            for version, handler in MIGRATIONS:
+                if version in applied:
+                    continue
+                handler(engine)
+                with engine.begin() as connection:
+                    connection.execute(table.insert().values(version=version, applied_at=datetime.now()))
+                applied_now.append(version)
+            return {
+                "applied": sorted(applied | set(applied_now)),
+                "applied_now": applied_now,
+                "pending": [],
+                "dry_run": False,
+            }
     finally:
         engine.dispose()

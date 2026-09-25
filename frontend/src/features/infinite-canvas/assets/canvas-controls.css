@@ -1,0 +1,185 @@
+@scope (.infinite-canvas-root) {
+  .canvas-controls {
+    left: 14px;
+    width: 136px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 3px;
+    max-width: calc(100% - 28px);
+    transform: none;
+  }
+
+  .canvas-control-group { display: flex; align-items: center; gap: 1px; }
+  .canvas-control-divider { display: none; }
+  .canvas-selection-count {
+    min-width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    margin: 0 3px;
+    border-radius: 4px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 750;
+  }
+
+  .canvas-selection-box {
+    position: absolute;
+    z-index: 7;
+    pointer-events: none;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    background: color-mix(in oklch, var(--accent) 10%, transparent);
+  }
+
+  .canvas-minimap {
+    position: absolute;
+    z-index: 4;
+    right: auto;
+    bottom: 14px;
+    left: 158px;
+    width: 184px;
+    height: 116px;
+    --minimap-image: #5b7ff5;
+    --minimap-video: #299b7e;
+    --minimap-text: #8791a2;
+    --minimap-node-stroke: rgb(30 41 59 / 0.2);
+    --minimap-viewport-fill: rgb(79 124 255 / 0.12);
+    --minimap-surface: #f7f8fa;
+  }
+
+  .canvas-minimap-shell {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border: 1px solid color-mix(in oklch, var(--line) 78%, transparent);
+    border-radius: 8px;
+    background: var(--floating-surface);
+    box-shadow: 0 2px 6px var(--shadow);
+    transition: border-color 160ms ease, box-shadow 160ms ease;
+  }
+
+  .canvas-minimap-shell:hover,
+  .canvas-minimap-shell:focus-within {
+    border-color: color-mix(in oklch, var(--accent) 38%, var(--line));
+    box-shadow: 0 3px 7px var(--shadow);
+  }
+
+  .canvas-minimap-map {
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: var(--minimap-surface);
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .canvas-minimap.is-navigating .canvas-minimap-map { cursor: grabbing; }
+  .canvas-minimap-map:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -3px;
+  }
+
+  .canvas-minimap-collapse,
+  .canvas-minimap-trigger {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid color-mix(in oklch, var(--line) 76%, transparent);
+    border-radius: 6px;
+    background: var(--floating-surface);
+    color: var(--muted-strong);
+  }
+
+  .canvas-minimap-collapse {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    opacity: 0;
+    transform: translateY(-2px);
+    transition: opacity 150ms ease, transform 150ms ease, background-color 150ms ease, color 150ms ease;
+  }
+
+  .canvas-minimap-shell:hover .canvas-minimap-collapse,
+  .canvas-minimap-shell:focus-within .canvas-minimap-collapse,
+  .canvas-minimap-collapse:focus-visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .canvas-minimap-collapse:hover,
+  .canvas-minimap-trigger:hover {
+    background: var(--surface-hover);
+    color: var(--ink);
+  }
+
+  .canvas-minimap-collapse:focus-visible,
+  .canvas-minimap-trigger:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .canvas-minimap.is-collapsed {
+    width: 36px;
+    height: 36px;
+  }
+
+  .canvas-minimap-trigger {
+    width: 36px;
+    height: 36px;
+    box-shadow: 0 2px 6px var(--shadow);
+  }
+
+  .canvas-node.is-selected:not(.is-active) {
+    border-color: color-mix(in oklch, var(--accent) 72%, var(--node-border));
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 45%, transparent);
+  }
+}
+
+.dark .infinite-canvas-root .canvas-minimap {
+  --minimap-image: #7895ff;
+  --minimap-video: #43b996;
+  --minimap-text: #919cab;
+  --minimap-node-stroke: rgb(255 255 255 / 0.2);
+  --minimap-viewport-fill: rgb(107 141 255 / 0.16);
+  --minimap-surface: #1d2027;
+}
+
+@media (max-width: 800px) {
+  @scope (.infinite-canvas-root) {
+    .canvas-minimap { top: 88px; right: auto; bottom: auto; left: 10px; }
+    .canvas-minimap.is-collapsed { top: 10px; right: auto; bottom: auto; left: 154px; }
+    .canvas-controls { top: 10px; bottom: auto; left: 10px; max-width: calc(100% - 60px); }
+    .assistant-dock:not(.is-open) { top: calc(var(--studio-nav-height) + 64px); bottom: auto; }
+  }
+}
+
+@media (hover: none) {
+  @scope (.infinite-canvas-root) {
+    .canvas-minimap-collapse {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+@media (max-width: 510px) {
+  @scope (.infinite-canvas-root) {
+    .canvas-controls { transform: scale(0.92); transform-origin: top left; }
+    .canvas-minimap.is-collapsed { left: 142px; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @scope (.infinite-canvas-root) {
+    .canvas-selection-box { transition: none; }
+    .canvas-minimap-shell,
+    .canvas-minimap-collapse { transition: none; }
+  }
+}

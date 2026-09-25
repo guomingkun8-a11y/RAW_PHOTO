@@ -17,6 +17,7 @@ import {
   resumeImagePoll,
   startImageAgentRun,
   streamAgentRunEvents,
+  streamRealtimeEvents,
   uploadAgentFolder,
   uploadAgentVideos,
   type AgentVideoAsset,
@@ -28,22 +29,25 @@ import {
   type ProfessionalSceneType,
   type PromptEngineMode,
   type ReferenceUploadItem,
+  type RealtimeImageTaskProgressEvent,
   type SettingsConfig,
 } from "@/lib/api";
 import { BUILTIN_IMAGE_MODELS, filterImageModels, formatImageModel, isImageModel } from "@/lib/image-models";
+import { PROMPT_TEMPLATE_USE_STORAGE_KEY, storageKey } from "@/lib/storage-namespace";
 import {
   clearImageConversations,
   deleteImageConversation,
   deleteImageConversations,
   getImageConversationStats,
   listLocalImageConversations,
-  refreshImageConversationsRemote,
+  refreshImageConversationsRemotePage,
   renameImageConversation,
   saveImageConversation,
   saveImageConversations,
   type ImageBatchFolderPlan,
   type ImageBatchReplacePlan,
   type ImageConversation,
+  type ImageConversationCursor,
   type ImageConversationMode,
   type ImagePromptEngineMetadata,
   type ImageTurn,
@@ -53,16 +57,16 @@ import {
 } from "@/stores/image-conversations";
 import { sessionState } from "@/stores/session";
 
-const ACTIVE_CONVERSATION_STORAGE_KEY = "gmkraw:image_single_active_conversation_id";
-const IMAGE_RATIO_STORAGE_KEY = "gmkraw:image_last_ratio";
-const IMAGE_TIER_STORAGE_KEY = "gmkraw:image_last_tier";
-const IMAGE_QUALITY_STORAGE_KEY = "gmkraw:image_last_quality";
-const IMAGE_MODEL_STORAGE_KEY = "gmkraw:image_last_model";
-const PRESERVE_SUBJECT_STORAGE_KEY = "gmkraw:image_preserve_subject";
-const PROMPT_ENGINE_MODE_STORAGE_KEY = "gmkraw:prompt_engine_mode";
-const LONG_TERM_MEMORY_STORAGE_PREFIX = "gmkraw:agent_long_term_memory";
-const IMAGE_COUNT_STORAGE_KEY = "gmkraw:image_last_count";
-const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = "gmkraw:image_count_default_one_applied";
+const ACTIVE_CONVERSATION_STORAGE_KEY = storageKey("gmkraw:image_single_active_conversation_id");
+const IMAGE_RATIO_STORAGE_KEY = storageKey("gmkraw:image_last_ratio");
+const IMAGE_TIER_STORAGE_KEY = storageKey("gmkraw:image_last_tier");
+const IMAGE_QUALITY_STORAGE_KEY = storageKey("gmkraw:image_last_quality");
+const IMAGE_MODEL_STORAGE_KEY = storageKey("gmkraw:image_last_model");
+const PRESERVE_SUBJECT_STORAGE_KEY = storageKey("gmkraw:image_preserve_subject");
+const PROMPT_ENGINE_MODE_STORAGE_KEY = storageKey("gmkraw:prompt_engine_mode");
+const LONG_TERM_MEMORY_STORAGE_PREFIX = storageKey("gmkraw:agent_long_term_memory");
+const IMAGE_COUNT_STORAGE_KEY = storageKey("gmkraw:image_last_count");
+const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = storageKey("gmkraw:image_count_default_one_applied");
 const DEFAULT_IMAGE_COUNT = "1";
 const REFERENCE_UPLOAD_CONCURRENCY = 2;
 const SCENE_IMAGE_OPTIMIZE_MIN_BYTES = 768 * 1024;
@@ -428,10 +432,6 @@ function resolveImageCountFromPrompt(prompt: string, selectedCount: number) {
   return hasMultiImageIntent(prompt) ? IMAGE_MULTI_COUNT_DEFAULT : current;
 }
 function sortConversations(items: ImageConversation[]) { return [...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); }
-function pickFallbackConversationId(items: ImageConversation[]) {
-  const active = items.find((conversation) => conversation.turns.some((turn) => turn.status === "queued" || turn.status === "generating"));
-  return active?.id || items[0]?.id || null;
-}
 function sleep(ms: number) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
 function positiveInteger(value: unknown, fallback: number) {
   const parsed = Math.floor(Number(value));
@@ -848,18 +848,6 @@ async function preuploadReferencesForHistory(
   };
 }
 
-function mergeStoredReferences(existing: StoredReferenceImage[], additions: StoredReferenceImage[]) {
-  const merged: StoredReferenceImage[] = [];
-  for (const image of [...existing, ...additions]) {
-    const duplicateIndex = merged.findIndex((current) =>
-      Boolean((image.url && image.url === current.url) || (image.dataUrl && image.dataUrl === current.dataUrl)),
-    );
-    if (duplicateIndex >= 0) merged.splice(duplicateIndex, 1);
-    merged.push(image);
-  }
-  return merged.slice(-4);
-}
-
 function progressLabel(progress?: string) {
   const value = String(progress || "").trim();
   if (!value) return "";
@@ -929,6 +917,72 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
   const batchProgress = batch ? `批次 ${batch.completed + batch.failed + batch.canceled}/${batch.total}` : "";
   return { ...image, taskId: task.id, status: "loading", taskStatus, progress: progressLabel(task.progress) || batchProgress || image.progress, error: undefined, startTime: taskStatus === "running" && !image.startTime ? Date.now() : image.startTime, elapsedSecs: taskStatus === "running" && typeof task.elapsed_secs === "number" ? task.elapsed_secs : undefined, elapsedUpdatedAt: typeof task.elapsed_secs === "number" ? Date.now() : undefined };
 }
+function applyRealtimeTaskToImage(image: StoredImage, event: RealtimeImageTaskProgressEvent): StoredImage {
+  const state = String(event.state || "").toLowerCase();
+  const progress = progressLabel(event.progress) || image.progress;
+  const base = {
+    ...image,
+    taskId: event.task_id,
+    progress,
+    cost: typeof event.cost === "number" && event.cost > 0 ? event.cost : image.cost,
+  };
+  if (state === "success") {
+    return {
+      ...base,
+      status: "success",
+      taskStatus: undefined,
+      progress: undefined,
+      url: event.result_url || image.url,
+      error: undefined,
+    };
+  }
+  if (state === "error") {
+    return { ...base, status: "error", taskStatus: undefined, progress: undefined, error: friendlyImageError(event.error) || "生成失败" };
+  }
+  if (state === "canceled") {
+    return { ...base, status: "canceled", taskStatus: undefined, progress: undefined, error: event.error || "任务已中止" };
+  }
+  return {
+    ...base,
+    status: "loading",
+    taskStatus: state === "queued" ? "queued" : "running",
+  };
+}
+
+async function applyRealtimeImageTaskProgress(
+  event: RealtimeImageTaskProgressEvent,
+  currentConversations: ImageConversation[],
+  replaceConversations: (items: ImageConversation[]) => void,
+  isUnmounted: () => boolean,
+  submittedTaskIds: Set<string>,
+) {
+  const taskId = String(event.task_id || "").trim();
+  if (!taskId || isUnmounted()) return;
+  const normalized = currentConversations.map((conversation) => {
+    let conversationChanged = false;
+    const turns = conversation.turns.map((turn) => {
+      let turnChanged = false;
+      const images = turn.images.map((image) => {
+        if (image.taskId !== taskId) return image;
+        const next = applyRealtimeTaskToImage(image, event);
+        turnChanged = true;
+        return next;
+      });
+      if (!turnChanged) return turn;
+      conversationChanged = true;
+      return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+    });
+    return conversationChanged ? { ...conversation, turns, updatedAt: new Date().toISOString() } : conversation;
+  });
+  if (!normalized.some((conversation, index) => conversation !== currentConversations[index])) return;
+  const sorted = sortConversations(normalized);
+  replaceConversations(sorted);
+  if (event.is_final || ["success", "error", "canceled"].includes(String(event.state).toLowerCase())) {
+    submittedTaskIds.delete(taskId);
+    await saveImageConversations(normalized);
+  }
+}
+
 function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> {
   const loading = turn.images.filter((image) => image.status === "loading").length;
   const failed = turn.images.filter((image) => image.status === "error").length;
@@ -1110,6 +1164,10 @@ export function useImageWorkspace(isAdmin: boolean) {
   const appendToSelectedConversation = ref(false);
   const isSubmitting = ref(false);
   const isLoadingHistory = ref(true);
+  const isLoadingMoreHistory = ref(false);
+  const hasMoreHistory = ref(false);
+  const historyCursor = ref<ImageConversationCursor | null>(null);
+  const historyTotal = ref(0);
   const availableQuota = ref("加载中...");
   const historyOpen = ref(false);
   const deleteConfirm = ref<DeleteConfirm | null>(null);
@@ -1118,8 +1176,10 @@ export function useImageWorkspace(isAdmin: boolean) {
   const lightboxIndex = ref(0);
   const lightboxImages = ref<Array<{ id: string; src: string; name?: string }>>([]);
   let unmounted = false;
-  let suppressSelectionAppend = false;
   let videoAnalysisPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let realtimeController: AbortController | null = null;
+  let realtimeReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let realtimeReconnectAttempt = 0;
 
   function resolveAllowedImageModel(model?: ImageModel | string): ImageModel {
     const candidate = String(model || "").trim();
@@ -1399,6 +1459,7 @@ export function useImageWorkspace(isAdmin: boolean) {
                     height: generated.height || undefined,
                     requestedSize: generated.requestedSize || undefined,
                     aspectRatioCorrected: generated.aspectRatioCorrected || undefined,
+                    cost: typeof generated.cost === "number" ? generated.cost : undefined,
                     qualityCheck: check,
                     error: undefined,
                   };
@@ -1420,6 +1481,7 @@ export function useImageWorkspace(isAdmin: boolean) {
                     height: generated.height || undefined,
                     requestedSize: generated.requestedSize || undefined,
                     aspectRatioCorrected: generated.aspectRatioCorrected || undefined,
+                    cost: typeof generated.cost === "number" ? generated.cost : undefined,
                     qualityCheck: check,
                   };
                 })
@@ -1594,10 +1656,8 @@ export function useImageWorkspace(isAdmin: boolean) {
     agentFolder.value = null;
   }
   function setSelectedConversationId(id: string | null, append: boolean) {
-    suppressSelectionAppend = true;
     selectedConversationId.value = id;
     appendToSelectedConversation.value = append;
-    void nextTick(() => { suppressSelectionAppend = false; });
   }
   function createDraft() {
     setSelectedConversationId(null, false);
@@ -1630,6 +1690,9 @@ export function useImageWorkspace(isAdmin: boolean) {
 
   async function loadHistory() {
     try {
+      historyCursor.value = null;
+      hasMoreHistory.value = false;
+      historyTotal.value = 0;
       const storedCount = localStorage.getItem(IMAGE_COUNT_STORAGE_KEY);
       if (storedCount === "3" && localStorage.getItem(IMAGE_COUNT_DEFAULT_MIGRATION_KEY) !== "true") {
         localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, DEFAULT_IMAGE_COUNT);
@@ -1656,12 +1719,36 @@ export function useImageWorkspace(isAdmin: boolean) {
         applyHistoryItems(recoveredLocalItems, !selectedConversationId.value);
         isLoadingHistory.value = false;
       }
-      const remoteItems = await recoverHistory(await refreshImageConversationsRemote(recoveredLocalItems));
+      const remotePage = await refreshImageConversationsRemotePage(recoveredLocalItems, { limit: 50 });
+      const remoteItems = await recoverHistory(remotePage.items);
       if (unmounted) return;
       applyHistoryItems(remoteItems, !localItems.length && !selectedConversationId.value);
+      historyCursor.value = remotePage.nextCursor;
+      hasMoreHistory.value = remotePage.hasMore;
+      historyTotal.value = remotePage.total;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "读取会话记录失败");
     } finally { isLoadingHistory.value = false; }
+  }
+
+  async function loadMoreHistory() {
+    if (unmounted || isLoadingMoreHistory.value || !hasMoreHistory.value || !historyCursor.value) return;
+    isLoadingMoreHistory.value = true;
+    try {
+      const page = await refreshImageConversationsRemotePage(conversations.value, {
+        limit: 50,
+        cursor: historyCursor.value,
+      });
+      if (unmounted) return;
+      applyHistoryItems(page.items, false);
+      historyCursor.value = page.nextCursor;
+      hasMoreHistory.value = page.hasMore;
+      historyTotal.value = page.total;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "读取更早的历史记录失败");
+    } finally {
+      isLoadingMoreHistory.value = false;
+    }
   }
 
   function syncStoredImageModel() {
@@ -2203,6 +2290,40 @@ export function useImageWorkspace(isAdmin: boolean) {
     scheduleVideoAnalysisPolling();
   }
 
+  function scheduleRealtimeReconnect() {
+    if (unmounted || realtimeReconnectTimer) return;
+    const delay = Math.min(30000, 3000 * (2 ** Math.min(realtimeReconnectAttempt, 3)));
+    realtimeReconnectAttempt += 1;
+    realtimeReconnectTimer = setTimeout(() => {
+      realtimeReconnectTimer = null;
+      void connectRealtimeEvents();
+    }, delay);
+  }
+
+  async function connectRealtimeEvents() {
+    if (unmounted || realtimeController) return;
+    const controller = new AbortController();
+    realtimeController = controller;
+    try {
+      await streamRealtimeEvents((event) => {
+        if (event.type !== "image_task_progress") return;
+        return applyRealtimeImageTaskProgress(
+          event.data,
+          conversations.value,
+          (items) => { conversations.value = items; },
+          () => unmounted,
+          submittedImageTaskIds,
+        );
+      }, { signal: controller.signal });
+      realtimeReconnectAttempt = 0;
+    } catch {
+      if (!controller.signal.aborted) scheduleRealtimeReconnect();
+    } finally {
+      if (realtimeController === controller) realtimeController = null;
+      if (!controller.signal.aborted) scheduleRealtimeReconnect();
+    }
+  }
+
   async function submit() {
     if (isSubmitting.value) return;
     const rawPrompt = imagePrompt.value.trim();
@@ -2463,6 +2584,7 @@ export function useImageWorkspace(isAdmin: boolean) {
               width: output.width,
               height: output.height,
               requestedSize: output.requested_size,
+              cost: typeof latest.cost === "number" ? latest.cost : undefined,
             }],
             agentBatchItems: candidate.agentBatchItems?.map((entry) => entry.id === itemId ? { ...entry, status: "success", error: undefined } : entry),
             agentBatchProgress: candidate.agentBatchProgress ? { ...candidate.agentBatchProgress, completed: candidate.agentBatchProgress.completed + 1, failed: Math.max(0, candidate.agentBatchProgress.failed - 1) } : candidate.agentBatchProgress,
@@ -2544,21 +2666,32 @@ export function useImageWorkspace(isAdmin: boolean) {
     deleteConfirm.value = { type: "many", ids: targetIds };
   }
   function requestClearHistory() { deleteConfirm.value = { type: "all" }; }
+  function applyDeletedHistoryCount(count: number) {
+    historyTotal.value = Math.max(conversations.value.length, historyTotal.value - Math.max(0, count));
+    if (historyTotal.value === 0) {
+      historyCursor.value = null;
+      hasMoreHistory.value = false;
+    }
+  }
   async function deleteConversation(id: string) {
+    const existed = conversations.value.some((item) => item.id === id);
     conversations.value = conversations.value.filter((item) => item.id !== id);
     if (selectedConversationId.value === id) setSelectedConversationId(null, false);
     await deleteImageConversation(id);
+    applyDeletedHistoryCount(existed ? 1 : 0);
   }
   async function deleteManyConversations(ids: string[]) {
     const targetIds = Array.from(new Set(ids.map((id) => String(id || "").trim()).filter(Boolean)));
     if (!targetIds.length) return;
     const targetSet = new Set(targetIds);
+    const deletedCount = conversations.value.filter((item) => targetSet.has(item.id)).length;
     conversations.value = conversations.value.filter((item) => !targetSet.has(item.id));
     if (selectedConversationId.value && targetSet.has(selectedConversationId.value)) {
       setSelectedConversationId(null, false);
       clearComposer();
     }
     await deleteImageConversations(targetIds);
+    applyDeletedHistoryCount(deletedCount);
   }
   async function deleteTurnPart(conversationId: string, turnId: string, part: "prompt" | "results") {
     const conversation = conversations.value.find((item) => item.id === conversationId);
@@ -2584,7 +2717,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     const target = deleteConfirm.value;
     deleteConfirm.value = null;
     if (!target) return;
-    if (target.type === "all") { await clearImageConversations(); conversations.value = []; setSelectedConversationId(null, false); clearComposer(); toast.success("已清空历史记录"); return; }
+    if (target.type === "all") { await clearImageConversations(); conversations.value = []; historyCursor.value = null; hasMoreHistory.value = false; historyTotal.value = 0; setSelectedConversationId(null, false); clearComposer(); toast.success("已清空历史记录"); return; }
     if (target.type === "many") { await deleteManyConversations(target.ids); toast.success(`已删除 ${target.ids.length} 条历史记录`); return; }
     if (target.type === "one") { await deleteConversation(target.id); return; }
     await deleteTurnPart(target.conversationId, target.turnId, target.type);
@@ -2625,14 +2758,36 @@ export function useImageWorkspace(isAdmin: boolean) {
     localStorage.setItem(memoryPreferenceKey, longTermMemoryEnabled.value ? "true" : "false");
   }
 
+  function consumePendingPromptTemplate() {
+    const pendingTemplate = sessionStorage.getItem(PROMPT_TEMPLATE_USE_STORAGE_KEY);
+    if (!pendingTemplate) return false;
+    try {
+      const template = JSON.parse(pendingTemplate) as { name?: string; content?: string };
+      if (!template.content?.trim()) return false;
+      imagePrompt.value = template.content.trim();
+      toast.success(`已载入模板：${template.name?.trim() || "未命名模板"}`);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      sessionStorage.removeItem(PROMPT_TEMPLATE_USE_STORAGE_KEY);
+    }
+  }
+
   onMounted(async () => {
     unmounted = false;
+    void connectRealtimeEvents();
+    consumePendingPromptTemplate();
     void loadInitialData();
     await loadHistory();
     if (!unmounted) scanQueues();
   });
   onBeforeUnmount(() => {
     unmounted = true;
+    if (realtimeReconnectTimer) clearTimeout(realtimeReconnectTimer);
+    realtimeReconnectTimer = null;
+    realtimeController?.abort();
+    realtimeController = null;
     if (videoAnalysisPollTimer) clearTimeout(videoAnalysisPollTimer);
     videoAnalysisPollTimer = null;
     activeImageTurnQueueIds.clear();
@@ -2648,7 +2803,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
-    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox,
+    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, isLoadingMoreHistory, hasMoreHistory, historyTotal, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, loadMoreHistory, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox, consumePendingPromptTemplate,
   };
 }
 

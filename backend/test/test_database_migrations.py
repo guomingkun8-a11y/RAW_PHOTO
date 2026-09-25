@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,23 @@ class DatabaseMigrationTests(unittest.TestCase):
                 "022_professional_agent_videos",
                 "023_professional_agent_video_analysis",
                 "024_video_generation_tasks",
+                "025_video_generation_conversations",
+                "026_video_agent_messages",
+                "027_video_agent_reasoning",
+                "028_video_agent_attachments",
+                "029_video_agent_async_processing",
+                "031_video_generation_reliability",
+                "032_video_generation_history_query",
+                "033_video_generation_reconciliation_state",
+                "034_image_task_projection_outbox",
+                "035_history_query_indexes",
+                "036_generation_event_query_path",
+                "037_image_asset_database_index",
+                "038_upstream_usage_ledger",
+                "039_upstream_usage_event_index",
+                "040_upstream_usage_model_attribution",
+                "041_upstream_usage_chat_attribution",
+                "042_audio_generation_tasks",
             ])
             self.assertEqual(second["applied_now"], [])
             self.assertEqual(status["pending"], [])
@@ -71,6 +89,16 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertIn("professional_agent_batch_plan_items", tables)
                 self.assertIn("professional_agent_video_assets", tables)
                 self.assertIn("video_generation_tasks", tables)
+                self.assertIn("video_generation_owner_locks", tables)
+                self.assertIn("video_generation_cleanup", tables)
+                self.assertIn("video_generation_records", tables)
+                self.assertIn("audio_generation_tasks", tables)
+                self.assertIn("audio_generation_owner_locks", tables)
+                self.assertIn("audio_generation_cleanup", tables)
+                self.assertIn("audio_generation_records", tables)
+                self.assertIn("upstream_usage_records", tables)
+                self.assertIn("upstream_usage_sync_state", tables)
+                self.assertIn("video_agent_messages", tables)
                 self.assertIn("professional_knowledge_documents", tables)
                 self.assertIn("professional_knowledge_chunks", tables)
                 self.assertNotIn("model_cost_events", tables)
@@ -93,6 +121,160 @@ class DatabaseMigrationTests(unittest.TestCase):
                 }
                 self.assertIn("upstream_task_id", video_generation_columns)
                 self.assertIn("task_json", video_generation_columns)
+                self.assertIn("conversation_id", video_generation_columns)
+                self.assertIn("prompt", video_generation_columns)
+                video_record_columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("video_generation_records")
+                }
+                self.assertIn("reconciliation_required", video_record_columns)
+                video_agent_columns = {
+                    column["name"]
+                    for column in inspect(engine).get_columns("video_agent_messages")
+                }
+                self.assertIn("reasoning_summary", video_agent_columns)
+                self.assertIn("reasoning_enabled", video_agent_columns)
+                self.assertIn("attachments_json", video_agent_columns)
+                self.assertIn("status", video_agent_columns)
+                self.assertIn("analysis_error", video_agent_columns)
+            finally:
+                engine.dispose()
+
+    def test_video_reconciliation_migration_backfills_existing_task_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite:///{Path(temp_dir) / 'video-reconciliation.db'}"
+            run_migrations(database_url)
+            engine = create_engine(database_url)
+            task = {
+                "id": "unsettled-video", "owner_id": "legacy-owner", "status": "error",
+                "mode": "text_to_video", "model": "legacy-model",
+                "reconciliation_required": True,
+                "created_at": "2026-09-01 10:00:00", "updated_at": "2026-09-01 10:05:00",
+            }
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "INSERT INTO video_generation_tasks "
+                            "(key, owner_id, task_id, conversation_id, status, mode, model, prompt, upstream_task_id, "
+                            "created_at, updated_at, task_json) VALUES "
+                            "(:key, :owner_id, :task_id, '', :status, :mode, :model, '', NULL, "
+                            ":created_at, :updated_at, :task_json)"
+                        ),
+                        {
+                            "key": "legacy-owner:unsettled-video",
+                            "owner_id": "legacy-owner",
+                            "task_id": "unsettled-video",
+                            "status": "error",
+                            "mode": "text_to_video",
+                            "model": "legacy-model",
+                            "created_at": "2026-09-01 10:00:00",
+                            "updated_at": "2026-09-01 10:05:00",
+                            "task_json": json.dumps(task),
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "INSERT INTO video_generation_records "
+                            "(task_key, task_id, owner_id, owner_username, owner_name, status, mode, model, "
+                            "upstream_task_id, credential_id, history_deleted, reconciliation_required, "
+                            "cost_amount, duration_ms, error, video_url, cover_url, created_at, updated_at, "
+                            "completed_at, event_at) VALUES "
+                            "(:key, :task_id, :owner_id, '', '', 'error', 'text_to_video', 'legacy-model', "
+                            "'', '', 0, 0, NULL, 0, '', '', '', :created_at, :updated_at, :updated_at, :updated_at)"
+                        ),
+                        {
+                            "key": "legacy-owner:unsettled-video",
+                            "task_id": "unsettled-video",
+                            "owner_id": "legacy-owner",
+                            "created_at": "2026-09-01 10:00:00",
+                            "updated_at": "2026-09-01 10:05:00",
+                        },
+                    )
+                    connection.execute(text(
+                        "DELETE FROM schema_migrations "
+                        "WHERE version = '033_video_generation_reconciliation_state'"
+                    ))
+
+                result = run_migrations(database_url)
+                self.assertEqual(result["applied_now"], ["033_video_generation_reconciliation_state"])
+                with engine.connect() as connection:
+                    required = connection.execute(text(
+                        "SELECT reconciliation_required FROM video_generation_records "
+                        "WHERE task_key = 'legacy-owner:unsettled-video'"
+                    )).scalar_one()
+                self.assertTrue(required)
+            finally:
+                engine.dispose()
+
+    def test_video_reliability_migration_backfills_existing_accounting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_url = f"sqlite:///{Path(temp_dir) / 'video-backfill.db'}"
+            run_migrations(database_url)
+            engine = create_engine(database_url)
+            task = {
+                "id": "legacy-video", "owner_id": "legacy-owner", "status": "success",
+                "mode": "text_to_video", "model": "legacy-model", "cost": 2.75,
+                "duration_ms": 1200, "upstream_task_id": "legacy-upstream",
+                "created_at": "2026-09-01 10:00:00", "updated_at": "2026-09-01 10:05:00",
+            }
+            try:
+                with engine.begin() as connection:
+                    connection.execute(text("DROP INDEX IF EXISTS idx_video_record_reconciliation_event"))
+                    connection.execute(text(
+                        "ALTER TABLE video_generation_records DROP COLUMN reconciliation_required"
+                    ))
+                    connection.execute(text("DELETE FROM video_generation_records"))
+                    connection.execute(
+                        text(
+                            "INSERT INTO video_generation_tasks "
+                            "(key, owner_id, task_id, conversation_id, status, mode, model, upstream_task_id, "
+                            "created_at, updated_at, task_json) VALUES "
+                            "(:key, :owner_id, :task_id, '', :status, :mode, :model, :upstream_task_id, "
+                            ":created_at, :updated_at, :task_json)"
+                        ),
+                        {
+                            "key": "legacy-owner:legacy-video",
+                            "owner_id": "legacy-owner",
+                            "task_id": "legacy-video",
+                            "status": "success",
+                            "mode": "text_to_video",
+                            "model": "legacy-model",
+                            "upstream_task_id": "legacy-upstream",
+                            "created_at": "2026-09-01 10:00:00",
+                            "updated_at": "2026-09-01 10:05:00",
+                            "task_json": json.dumps(task),
+                        },
+                    )
+                    connection.execute(
+                        text(
+                            "DELETE FROM schema_migrations WHERE version IN "
+                            "('031_video_generation_reliability', "
+                            "'032_video_generation_history_query', "
+                            "'033_video_generation_reconciliation_state')"
+                        )
+                    )
+
+                result = run_migrations(database_url)
+                self.assertEqual(result["applied_now"], [
+                    "031_video_generation_reliability",
+                    "032_video_generation_history_query",
+                    "033_video_generation_reconciliation_state",
+                ])
+                self.assertIn(
+                    "reconciliation_required",
+                    {column["name"] for column in inspect(engine).get_columns("video_generation_records")},
+                )
+                with engine.connect() as connection:
+                    record = connection.execute(text(
+                        "SELECT owner_id, status, model, cost_amount, upstream_task_id "
+                        "FROM video_generation_records WHERE task_key = 'legacy-owner:legacy-video'"
+                    )).mappings().one()
+                self.assertEqual(record["owner_id"], "legacy-owner")
+                self.assertEqual(record["status"], "success")
+                self.assertEqual(record["model"], "legacy-model")
+                self.assertEqual(float(record["cost_amount"]), 2.75)
+                self.assertEqual(record["upstream_task_id"], "legacy-upstream")
             finally:
                 engine.dispose()
 

@@ -14,7 +14,6 @@ from api.image_inputs import _download_image_url
 from api.support import require_identity, resolve_image_base_url
 from services.image.image_library_service import image_library_service
 from services.image.image_storage_service import image_storage_service
-from services.image.image_task_service import image_task_service
 
 ZIP_MAX_ITEM_BYTES = 50 * 1024 * 1024
 ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024
@@ -179,41 +178,6 @@ def _stream_zip_payload(payload):
         payload.close()
 
 
-def _list_image_library(
-    identity: dict[str, object],
-    base_url: str,
-    limit: int,
-    offset: int,
-    cursor_created_at: str,
-    cursor_id: int,
-    query_text: str,
-    product_id: int,
-    template_id: int,
-    favorite: bool,
-    include_deleted: bool,
-    all_owners: bool,
-    owner_id: str,
-    include_references: bool,
-):
-    image_task_service.sync_successful_library_results(identity, base_url)
-    return image_library_service.list_images(
-        identity=identity,
-        base_url=base_url,
-        limit=limit,
-        offset=offset,
-        cursor_created_at=cursor_created_at,
-        cursor_id=cursor_id,
-        query_text=query_text,
-        product_id=product_id,
-        template_id=template_id,
-        favorite_only=favorite,
-        include_deleted=include_deleted,
-        include_all_owners=all_owners,
-        owner_id_filter=owner_id,
-        include_references=include_references,
-    )
-
-
 def create_router() -> APIRouter:
     router = APIRouter()
 
@@ -231,28 +195,45 @@ def create_router() -> APIRouter:
         include_deleted: bool = Query(default=False),
         all_owners: bool = Query(default=False),
         owner_id: str = Query(default=""),
-        include_references: bool = Query(default=False, alias="includeReferences"),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
         base_url = resolve_image_base_url(request)
         return await run_in_threadpool(
-            _list_image_library,
-            identity,
-            base_url,
-            limit,
-            offset,
-            cursor_created_at,
-            cursor_id,
-            q,
-            product_id,
-            template_id,
-            favorite,
-            include_deleted,
-            all_owners,
-            owner_id,
-            include_references,
+            image_library_service.list_images,
+            identity=identity,
+            base_url=base_url,
+            limit=limit,
+            offset=offset,
+            cursor_created_at=cursor_created_at,
+            cursor_id=cursor_id,
+            query_text=q,
+            product_id=product_id,
+            template_id=template_id,
+            favorite_only=favorite,
+            include_deleted=include_deleted,
+            include_all_owners=all_owners,
+            owner_id_filter=owner_id,
         )
+
+    @router.get("/api/image-library/{image_id}")
+    async def get_image_library_item(
+        request: Request,
+        image_id: int,
+        include_references: bool = Query(default=False, alias="includeReferences"),
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        items = await run_in_threadpool(
+            image_library_service.list_images_by_ids,
+            identity=identity,
+            base_url=resolve_image_base_url(request),
+            image_ids=[image_id],
+            include_references=include_references,
+        )
+        if not items:
+            raise HTTPException(status_code=404, detail={"error": "image not found"})
+        return items[0]
 
     @router.patch("/api/image-library/{image_id}")
     async def update_image_library_item(

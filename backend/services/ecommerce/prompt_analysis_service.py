@@ -9,6 +9,7 @@ from typing import Any, Iterator
 from curl_cffi import requests
 from fastapi import HTTPException
 
+from services.billing.chat_usage_attribution import record_chat_attribution
 from services.platform.config import config
 from services.providers.openai_relay_pool import current_relay_account, run_with_relay_pool
 from services.platform.proxy_service import proxy_settings
@@ -102,7 +103,7 @@ def upstream_chat_model(model: object) -> str:
 
 def is_reasoning_chat_model(model: object) -> bool:
     value = str(model or "").strip().lower()
-    return value.startswith("gpt-5") or value.startswith(("o1", "o3", "o4"))
+    return value.startswith(("gpt-5", "tt-5", "o1", "o3", "o4"))
 
 
 def _normalize_response_cost(value: object) -> float | None:
@@ -146,6 +147,34 @@ def response_cost(data: object) -> float | None:
         cost = _normalize_response_cost(candidate)
         if cost is not None:
             return cost
+    return None
+
+
+def response_identifiers(data: object) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+    identifiers: list[str] = []
+
+    def collect(value: object, depth: int = 0) -> None:
+        if not isinstance(value, dict) or depth > 3:
+            return
+        for key in ("request_id", "requestId", "response_id", "responseId", "task_id", "taskId", "id"):
+            candidate = str(value.get(key) or "").strip()
+            if candidate and candidate not in identifiers:
+                identifiers.append(candidate[:191])
+        for key in ("_gmkraw_relay_metadata", "data", "result", "meta", "metadata"):
+            collect(value.get(key), depth + 1)
+
+    collect(data)
+    return identifiers
+
+
+def response_usage(data: object) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    for value in (data, data.get("data"), data.get("result")):
+        if isinstance(value, dict) and isinstance(value.get("usage"), dict):
+            return dict(value["usage"])
     return None
 
 
@@ -248,7 +277,21 @@ def _chat_completion_once(payload: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=502, detail={"error": "vision model response is not JSON"}) from exc
         if not isinstance(data, dict):
             raise HTTPException(status_code=502, detail={"error": "vision model response is not a JSON object"})
-        return data
+        response_headers = {
+            str(key).lower(): str(value)
+            for key, value in getattr(response, "headers", {}).items()
+            if str(key).lower() in {"x-task-id", "task-id", "x-request-id", "request-id", "x-trace-id", "trace-id"}
+        }
+        header_task_id = response_headers.get("x-task-id") or response_headers.get("task-id")
+        return {
+            **data,
+            "_gmkraw_relay_metadata": {
+                "upstream_task_id": data.get("task_id") or data.get("taskId") or header_task_id,
+                "response_id": data.get("id"),
+                "upstream_request_id": response_headers.get("x-request-id") or response_headers.get("request-id") or response_headers.get("x-trace-id") or response_headers.get("trace-id"),
+                "headers": response_headers,
+            },
+        }
 
     detail: Any
     try:
@@ -258,21 +301,25 @@ def _chat_completion_once(payload: dict[str, Any]) -> dict[str, Any]:
     raise HTTPException(status_code=response.status_code, detail=detail)
 
 
-def _chat_completion(payload: dict[str, Any]) -> dict[str, Any]:
+def _chat_completion(payload: dict[str, Any], operation: str = "prompt_analysis") -> dict[str, Any]:
     return run_with_relay_pool(
         _relay_settings(),
-        "prompt_analysis",
+        operation,
         lambda: _chat_completion_once(payload),
     )
 
 
-def request_json_completion(
+def request_json_completion_details(
     *,
     model: str,
     system_prompt: str,
     content: str | list[dict[str, Any]],
     max_tokens: int = 1800,
     temperature: float = 0.2,
+    operation: str = "prompt_analysis",
+    billing_owner_id: object = "",
+    billing_local_task_id: object = "",
+    billing_local_source: str = "chat",
 ) -> dict[str, Any]:
     payload = {
         "model": _chat_payload_model(model),
@@ -283,15 +330,97 @@ def request_json_completion(
         "max_tokens": max(256, min(8000, int(max_tokens))),
         "response_format": {"type": "json_object"},
     }
+    billing_user = str(billing_owner_id or "").strip()[:191]
+    if billing_user:
+        payload["user"] = billing_user
     _apply_sampling_params(payload, model=model, temperature=temperature)
     try:
-        data = _chat_completion(payload)
+        data = _chat_completion(payload, operation)
     except HTTPException as exc:
         if "response_format" not in str(exc.detail):
             raise
         payload.pop("response_format", None)
-        data = _chat_completion(payload)
-    return _parse_json_content(_extract_message_content(data))
+        data = _chat_completion(payload, operation)
+    record_chat_attribution(
+        owner_id=billing_owner_id,
+        requested_model=model,
+        local_task_id=billing_local_task_id,
+        local_source=billing_local_source,
+        response=data,
+    )
+    return {
+        "result": _parse_json_content(_extract_message_content(data)),
+        "cost": response_cost(data),
+        "upstream_ids": response_identifiers(data),
+        "usage": response_usage(data),
+    }
+
+
+def request_json_completion(
+    *,
+    model: str,
+    system_prompt: str,
+    content: str | list[dict[str, Any]],
+    max_tokens: int = 1800,
+    temperature: float = 0.2,
+    operation: str = "prompt_analysis",
+    billing_owner_id: object = "",
+    billing_local_task_id: object = "",
+    billing_local_source: str = "chat",
+) -> dict[str, Any]:
+    details = request_json_completion_details(
+        model=model,
+        system_prompt=system_prompt,
+        content=content,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        operation=operation,
+        billing_owner_id=billing_owner_id,
+        billing_local_task_id=billing_local_task_id,
+        billing_local_source=billing_local_source,
+    )
+    result = details.get("result")
+    return dict(result) if isinstance(result, dict) else {}
+
+
+def request_text_completion_details(
+    *,
+    model: str,
+    system_prompt: str,
+    content: str | list[dict[str, Any]],
+    max_tokens: int = 1800,
+    temperature: float = 0.3,
+    operation: str = "prompt_analysis",
+    billing_owner_id: object = "",
+    billing_local_task_id: object = "",
+    billing_local_source: str = "chat",
+) -> dict[str, Any]:
+    payload = {
+        "model": _chat_payload_model(model),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": max(256, min(8000, int(max_tokens))),
+    }
+    billing_user = str(billing_owner_id or "").strip()[:191]
+    if billing_user:
+        payload["user"] = billing_user
+    _apply_sampling_params(payload, model=model, temperature=temperature)
+    data = _chat_completion(payload, operation)
+    record_chat_attribution(
+        owner_id=billing_owner_id,
+        requested_model=model,
+        local_task_id=billing_local_task_id,
+        local_source=billing_local_source,
+        response=data,
+    )
+    return {
+        "text": _extract_message_content(data),
+        "cost": response_cost(data),
+        "upstream_ids": response_identifiers(data),
+        "usage": response_usage(data),
+    }
 
 
 def request_text_completion(
@@ -301,31 +430,40 @@ def request_text_completion(
     content: str | list[dict[str, Any]],
     max_tokens: int = 1800,
     temperature: float = 0.3,
+    operation: str = "prompt_analysis",
+    billing_owner_id: object = "",
+    billing_local_task_id: object = "",
+    billing_local_source: str = "chat",
 ) -> str:
-    payload = {
-        "model": _chat_payload_model(model),
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max(256, min(8000, int(max_tokens))),
-    }
-    _apply_sampling_params(payload, model=model, temperature=temperature)
-    data = _chat_completion(payload)
-    return _extract_message_content(data)
+    details = request_text_completion_details(
+        model=model,
+        system_prompt=system_prompt,
+        content=content,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        operation=operation,
+        billing_owner_id=billing_owner_id,
+        billing_local_task_id=billing_local_task_id,
+        billing_local_source=billing_local_source,
+    )
+    return str(details.get("text") or "")
 
 
 def _audio_transcription_once(payload: dict[str, Any]) -> dict[str, Any]:
     file_path = Path(str(payload["file_path"]))
+    form = {
+        "model": str(payload.get("model") or "whisper-1"),
+        "response_format": str(payload.get("response_format") or "json"),
+        **({"prompt": str(payload.get("prompt") or "")} if payload.get("prompt") else {}),
+        **({"language": str(payload.get("language") or "")} if payload.get("language") else {}),
+    }
+    if form["response_format"] == "verbose_json":
+        form["timestamp_granularities[]"] = "segment"
     with file_path.open("rb") as handle:
         response = requests.post(
             _relay_url("/v1/audio/transcriptions"),
             headers=_relay_auth_headers(),
-            data={
-                "model": str(payload.get("model") or "whisper-1"),
-                "response_format": "json",
-                **({"prompt": str(payload.get("prompt") or "")} if payload.get("prompt") else {}),
-            },
+            data=form,
             files={"file": (file_path.name, handle, str(payload.get("mime_type") or "audio/mpeg"))},
             timeout=int(payload.get("timeout") or REQUEST_TIMEOUT_SECONDS),
             **proxy_settings.build_session_kwargs(),
@@ -337,12 +475,87 @@ def _audio_transcription_once(payload: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=502, detail={"error": "audio transcription response is not JSON"}) from exc
         if not isinstance(data, dict):
             raise HTTPException(status_code=502, detail={"error": "audio transcription response is not a JSON object"})
-        return data
+        response_headers = {
+            str(key).lower(): str(value)
+            for key, value in getattr(response, "headers", {}).items()
+            if str(key).lower() in {"x-task-id", "task-id", "x-request-id", "request-id", "x-trace-id", "trace-id"}
+        }
+        return {
+            **data,
+            "_gmkraw_relay_metadata": {
+                "upstream_task_id": data.get("task_id") or data.get("taskId") or response_headers.get("x-task-id") or response_headers.get("task-id"),
+                "response_id": data.get("id"),
+                "upstream_request_id": response_headers.get("x-request-id") or response_headers.get("request-id") or response_headers.get("x-trace-id") or response_headers.get("trace-id"),
+                "headers": response_headers,
+            },
+        }
     try:
         detail = response.json()
     except Exception:
         detail = {"error": {"message": str(response.text or "")[:500] or f"HTTP {response.status_code}"}}
     raise HTTPException(status_code=response.status_code, detail=detail)
+
+
+def request_audio_transcription_details(
+    *,
+    model: str,
+    file_path: str | Path,
+    prompt: str = "",
+    mime_type: str = "audio/mpeg",
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    language: str = "",
+    timestamps: bool = False,
+    operation: str = "audio_transcription",
+) -> dict[str, Any]:
+    payload = {
+        "model": str(model or "whisper-1").strip() or "whisper-1",
+        "file_path": str(file_path),
+        "prompt": prompt,
+        "mime_type": mime_type,
+        "timeout": timeout,
+        "language": str(language or "").strip(),
+        "response_format": "verbose_json" if timestamps else "json",
+    }
+    try:
+        data = run_with_relay_pool(_relay_settings(), operation, lambda: _audio_transcription_once(payload))
+    except HTTPException as exc:
+        if not timestamps or not any(
+            marker in str(exc.detail).lower()
+            for marker in ("response_format", "timestamp", "verbose_json", "granular")
+        ):
+            raise
+        payload["response_format"] = "json"
+        data = run_with_relay_pool(_relay_settings(), operation, lambda: _audio_transcription_once(payload))
+    return data if isinstance(data, dict) else {}
+
+
+def request_audio_transcription_result(
+    *,
+    model: str,
+    file_path: str | Path,
+    prompt: str = "",
+    mime_type: str = "audio/mpeg",
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    language: str = "",
+    timestamps: bool = False,
+    operation: str = "audio_transcription",
+) -> dict[str, Any]:
+    data = request_audio_transcription_details(
+        model=model,
+        file_path=file_path,
+        prompt=prompt,
+        mime_type=mime_type,
+        timeout=timeout,
+        language=language,
+        timestamps=timestamps,
+        operation=operation,
+    )
+    return {
+        "data": data,
+        "cost": response_cost(data),
+        "upstream_ids": response_identifiers(data),
+        "usage": response_usage(data),
+    }
 
 
 def request_audio_transcription(
@@ -352,6 +565,8 @@ def request_audio_transcription(
     prompt: str = "",
     mime_type: str = "audio/mpeg",
     timeout: int = REQUEST_TIMEOUT_SECONDS,
+    billing_owner_id: object = "",
+    billing_local_task_id: object = "",
 ) -> str:
     payload = {
         "model": str(model or "whisper-1").strip() or "whisper-1",
@@ -360,10 +575,21 @@ def request_audio_transcription(
         "mime_type": mime_type,
         "timeout": timeout,
     }
-    data = run_with_relay_pool(
-        _relay_settings(),
-        "audio_transcription",
-        lambda: _audio_transcription_once(payload),
+    data = request_audio_transcription_details(
+        model=payload["model"],
+        file_path=payload["file_path"],
+        prompt=payload["prompt"],
+        mime_type=payload["mime_type"],
+        timeout=payload["timeout"],
+        operation="audio_transcription",
+    )
+    record_chat_attribution(
+        owner_id=billing_owner_id,
+        requested_model=payload["model"],
+        local_task_id=billing_local_task_id,
+        local_source="video_analysis_audio",
+        model_type="audio",
+        response=data,
     )
     text = data.get("text")
     if isinstance(text, str):
@@ -491,6 +717,9 @@ def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
         "max_tokens": 1800,
         "response_format": {"type": "json_object"},
     }
+    billing_user = str(body.get("billing_owner_id") or "").strip()[:191]
+    if billing_user:
+        payload["user"] = billing_user
     _apply_sampling_params(payload, model=model, temperature=0.2)
 
     try:
@@ -500,6 +729,14 @@ def analyze_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
             raise
         payload.pop("response_format", None)
         data = _chat_completion(payload)
+
+    record_chat_attribution(
+        owner_id=body.get("billing_owner_id"),
+        requested_model=model,
+        local_task_id=body.get("billing_local_task_id"),
+        local_source=body.get("billing_local_source") or "image_prompt",
+        response=data,
+    )
 
     content_text = _extract_message_content(data)
     parsed = _parse_json_content(content_text)

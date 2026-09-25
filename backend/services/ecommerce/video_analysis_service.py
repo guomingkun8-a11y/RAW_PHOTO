@@ -8,8 +8,10 @@ from pathlib import Path
 import subprocess
 import tempfile
 from typing import Any, Mapping
+from uuid import uuid4
 
 from fastapi import HTTPException
+from ffmpy import FFExecutableNotFoundError, FFmpeg, FFRuntimeError
 
 from services.ecommerce.professional_video_service import professional_video_asset_service
 from services.ecommerce.prompt_analysis_service import (
@@ -90,6 +92,20 @@ def _run_command(command: list[str], *, timeout: int, label: str) -> subprocess.
     return result
 
 
+def _run_ffmpeg(command: FFmpeg, *, label: str) -> None:
+    try:
+        command.run(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FFExecutableNotFoundError as exc:
+        raise VideoAnalysisError(f"{label} is not available: {command.executable}") from exc
+    except FFRuntimeError as exc:
+        raw_error = exc.stderr or exc.stdout or b""
+        if isinstance(raw_error, bytes):
+            error = raw_error.decode("utf-8", errors="replace")
+        else:
+            error = str(raw_error)
+        raise VideoAnalysisError(f"{label} failed: {error.strip()[:1200] or f'exit code {exc.exit_code}'}") from exc
+
+
 def _probe_video(path: Path, settings: Mapping[str, object]) -> dict[str, Any]:
     result = _run_command(
         [
@@ -159,26 +175,22 @@ def _extract_frames(source: Path, work_dir: Path, metadata: Mapping[str, Any], s
     for index, time_sec in enumerate(times, start=1):
         target = work_dir / f"frame-{index:03d}.jpg"
         try:
-            _run_command(
-                [
-                    _clean(settings.get("ffmpeg_path"), "ffmpeg"),
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-y",
-                    "-ss",
-                    f"{time_sec:.3f}",
-                    "-i",
-                    str(source),
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    f"scale={width}:-2:force_original_aspect_ratio=decrease",
-                    "-q:v",
-                    "3",
-                    str(target),
-                ],
-                timeout=90,
+            _run_ffmpeg(
+                FFmpeg(
+                    executable=_clean(settings.get("ffmpeg_path"), "ffmpeg"),
+                    global_options=["-hide_banner", "-loglevel", "error", "-y"],
+                    inputs={str(source): ["-ss", f"{time_sec:.3f}"]},
+                    outputs={
+                        str(target): [
+                            "-frames:v",
+                            "1",
+                            "-vf",
+                            f"scale={width}:-2:force_original_aspect_ratio=decrease",
+                            "-q:v",
+                            "3",
+                        ]
+                    },
+                ),
                 label="ffmpeg frame extraction",
             )
         except VideoAnalysisError:
@@ -196,33 +208,37 @@ def _extract_audio(source: Path, target: Path, metadata: Mapping[str, Any], sett
     max_duration = max(10, int(settings.get("max_duration_secs") or 300))
     duration = _number(metadata.get("durationSec"), float(max_duration))
     effective_duration = max(0.1, min(duration or float(max_duration), float(max_duration)))
-    _run_command(
-        [
-            _clean(settings.get("ffmpeg_path"), "ffmpeg"),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(source),
-            "-t",
-            f"{effective_duration:.3f}",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-b:a",
-            "64k",
-            str(target),
-        ],
-        timeout=180,
+    _run_ffmpeg(
+        FFmpeg(
+            executable=_clean(settings.get("ffmpeg_path"), "ffmpeg"),
+            global_options=["-hide_banner", "-loglevel", "error", "-y"],
+            inputs={str(source): None},
+            outputs={
+                str(target): [
+                    "-t",
+                    f"{effective_duration:.3f}",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-b:a",
+                    "64k",
+                ]
+            },
+        ),
         label="ffmpeg audio extraction",
     )
     return target.exists() and target.stat().st_size > 0
 
 
-def _transcribe_audio(audio_path: Path, settings: Mapping[str, object]) -> dict[str, str]:
+def _transcribe_audio(
+    audio_path: Path,
+    settings: Mapping[str, object],
+    *,
+    owner_id: str = "",
+    local_task_id: str = "",
+) -> dict[str, str]:
     if not bool(settings.get("asr_enabled")):
         return {"status": "disabled", "text": "", "error": ""}
     max_bytes = max(1, int(settings.get("audio_max_mb") or 25)) * 1024 * 1024
@@ -234,6 +250,8 @@ def _transcribe_audio(audio_path: Path, settings: Mapping[str, object]) -> dict[
             file_path=audio_path,
             mime_type="audio/mpeg",
             timeout=180,
+            billing_owner_id=owner_id,
+            billing_local_task_id=local_task_id,
         )
     except Exception as exc:
         return {"status": "failed", "text": "", "error": _clean(exc, limit=1000)}
@@ -273,6 +291,9 @@ def _analyze_frames(
     metadata: Mapping[str, Any],
     transcript: Mapping[str, str],
     settings: Mapping[str, object],
+    *,
+    owner_id: str = "",
+    local_task_id: str = "",
 ) -> dict[str, Any]:
     if not is_prompt_analysis_enabled():
         raise VideoAnalysisError("openai relay is not enabled for video analysis")
@@ -327,6 +348,9 @@ def _analyze_frames(
         content=content,
         max_tokens=3600,
         temperature=0.2,
+        billing_owner_id=owner_id,
+        billing_local_task_id=local_task_id,
+        billing_local_source="video_analysis",
     )
     return {
         "model": model,
@@ -373,11 +397,23 @@ class ProfessionalVideoAnalysisService:
             if bool(metadata.get("hasAudio")):
                 try:
                     if _extract_audio(source_path, audio_path, metadata, settings):
-                        transcript = _transcribe_audio(audio_path, settings)
+                        transcript = _transcribe_audio(
+                            audio_path,
+                            settings,
+                            owner_id=owner_id,
+                            local_task_id=f"video-analysis-audio:{video_id}:{uuid4().hex}",
+                        )
                 except VideoAnalysisError as exc:
                     transcript = {"status": "failed", "text": "", "error": _clean(exc, limit=1000)}
 
-            vision = _analyze_frames(frames, metadata, transcript, settings)
+            vision = _analyze_frames(
+                frames,
+                metadata,
+                transcript,
+                settings,
+                owner_id=owner_id,
+                local_task_id=f"video-analysis:{video_id}:{uuid4().hex}",
+            )
             if transcript.get("error"):
                 warnings.append(f"音频转写未完成：{transcript['error']}")
 

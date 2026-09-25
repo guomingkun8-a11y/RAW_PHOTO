@@ -35,6 +35,10 @@ class ImageGenerationTaskRequest(BaseModel):
     model: str = "gpt-image-2"
     size: str | None = None
     quality: str = "auto"
+    n: int = Field(default=1, ge=1, le=4)
+    aspect_ratio: str | None = None
+    image_size: str | None = None
+    thinking_level: str | None = None
     prompt_engine_mode: Literal["standard", "professional", "general"] = "standard"
     conversation_id: str | None = None
     turn_id: str | None = None
@@ -129,9 +133,13 @@ def _task_image_payload(task: dict[str, object], image_index: int) -> tuple[byte
 
     storage_rel = str(item.get("storage_rel") or "").strip() or _storage_rel_from_url(str(item.get("url") or ""))
     if storage_rel:
-        image_bytes = image_storage_service.get_bytes(storage_rel)
-        content_type = mimetypes.guess_type(storage_rel)[0] or ""
-        return image_bytes, content_type, storage_rel
+        try:
+            image_bytes = image_storage_service.get_bytes(storage_rel)
+        except Exception:
+            image_bytes = b""
+        if image_bytes:
+            content_type = mimetypes.guess_type(storage_rel)[0] or ""
+            return image_bytes, content_type, storage_rel
 
     encoded = str(item.get("b64_json") or "").strip()
     if encoded:
@@ -274,6 +282,10 @@ def create_router() -> APIRouter:
                 model=body.model,
                 size=body.size,
                 quality=body.quality,
+                n=body.n,
+                aspect_ratio=str(body.aspect_ratio or ""),
+                image_size=str(body.image_size or ""),
+                thinking_level=str(body.thinking_level or ""),
                 prompt_engine_mode=body.prompt_engine_mode,
                 base_url=resolve_image_base_url(request),
                 conversation_id=str(body.conversation_id or ""),
@@ -333,6 +345,10 @@ def create_router() -> APIRouter:
                 model=model,
                 size=payload["size"],
                 quality=payload["quality"],
+                n=int(payload.get("n") or 1),
+                aspect_ratio=str(payload.get("aspect_ratio") or ""),
+                image_size=str(payload.get("image_size") or ""),
+                thinking_level=str(payload.get("thinking_level") or ""),
                 prompt_engine_mode=str(payload.get("prompt_engine_mode") or "standard"),
                 base_url=resolve_image_base_url(request),
                 images=images,

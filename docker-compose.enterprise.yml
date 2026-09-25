@@ -106,6 +106,18 @@ services:
       VIDEO_PARSE_OWNER_PENDING_LIMIT: ${VIDEO_PARSE_OWNER_PENDING_LIMIT:-8}
       VIDEO_PARSE_SLOT_LEASE_SECS: ${VIDEO_PARSE_SLOT_LEASE_SECS:-1800}
       VIDEO_PARSE_MAX_RETRIES: ${VIDEO_PARSE_MAX_RETRIES:-2}
+      CANVAS_TASK_REDIS_URL: ${CANVAS_TASK_REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379/0}
+      CANVAS_TASK_LIMITER_NAMESPACE: ${CANVAS_TASK_LIMITER_NAMESPACE:-canvas_tasks_prod}
+      CANVAS_TASK_USER_LIMIT: ${CANVAS_TASK_USER_LIMIT:-6}
+      CANVAS_TASK_BATCH_LIMIT: ${CANVAS_TASK_BATCH_LIMIT:-8}
+      CANVAS_AI_REDIS_URL: ${CANVAS_AI_REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379/0}
+      CANVAS_AI_QUEUE_NAME: ${CANVAS_AI_QUEUE_NAME:-canvas_ai_tasks_prod}
+      CANVAS_AI_TOTAL_CONCURRENCY: ${CANVAS_AI_TOTAL_CONCURRENCY:-8}
+      CANVAS_AI_OWNER_CONCURRENCY: ${CANVAS_AI_OWNER_CONCURRENCY:-2}
+      CANVAS_AI_OWNER_PENDING_LIMIT: ${CANVAS_AI_OWNER_PENDING_LIMIT:-4}
+      CANVAS_AI_PENDING_LIMIT: ${CANVAS_AI_PENDING_LIMIT:-32}
+      CANVAS_AI_ACQUIRE_TIMEOUT_SECS: ${CANVAS_AI_ACQUIRE_TIMEOUT_SECS:-120}
+      CANVAS_AI_LEASE_SECS: ${CANVAS_AI_LEASE_SECS:-900}
       QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
       QDRANT_API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required}
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-raw_professional_memory}
@@ -195,6 +207,21 @@ services:
     image: raw-photo:enterprise
     restart: unless-stopped
     command: ["uv", "run", "python", "video_worker.py"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      schema-init:
+        condition: service_completed_successfully
+    environment: *app-environment
+    volumes:
+      - ./data:/app/data
+
+  video-composition-worker:
+    image: raw-photo:enterprise
+    restart: unless-stopped
+    command: ["uv", "run", "python", "video_composition_worker.py"]
     depends_on:
       mysql:
         condition: service_healthy

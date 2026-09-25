@@ -54,6 +54,11 @@ def collect_integrity_report(database_url: str | None = None) -> dict[str, int]:
                 "SELECT COUNT(*) FROM video_generation_tasks t LEFT JOIN business_users u ON u.id = t.owner_id WHERE u.id IS NULL",
                 {},
             ),
+            "audio_generation_tasks_without_user": (
+                {"audio_generation_tasks", "business_users"},
+                "SELECT COUNT(*) FROM audio_generation_tasks t LEFT JOIN business_users u ON u.id = t.owner_id WHERE u.id IS NULL",
+                {},
+            ),
             "generation_events_without_user": (
                 {"generation_task_events", "business_users"},
                 "SELECT COUNT(*) FROM generation_task_events e LEFT JOIN business_users u ON u.id = e.owner_id WHERE u.id IS NULL",
@@ -121,6 +126,12 @@ def repair_integrity_issues(
                         "DELETE FROM video_generation_tasks "
                         "WHERE status IN ('success', 'error', 'canceled') "
                         "AND NOT EXISTS (SELECT 1 FROM business_users u WHERE u.id = video_generation_tasks.owner_id)",
+                    ),
+                    "terminal_audio_generation_tasks_without_user_removed": (
+                        {"audio_generation_tasks", "business_users"},
+                        "DELETE FROM audio_generation_tasks "
+                        "WHERE status IN ('success', 'error', 'canceled') "
+                        "AND NOT EXISTS (SELECT 1 FROM business_users u WHERE u.id = audio_generation_tasks.owner_id)",
                     ),
                 }
             )

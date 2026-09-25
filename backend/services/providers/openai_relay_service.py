@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import time
@@ -10,8 +11,14 @@ from curl_cffi import CurlMime, requests
 from fastapi import HTTPException
 
 from services.platform.config import config
+from services.image.image_size import canvas_media_request_size, normalize_image_size
 from services.image.image_prompt_compliance import ensure_image_prompt_engineered
-from services.providers.openai_relay_pool import RelaySubmittedHTTPException, current_relay_account, run_with_relay_pool
+from services.providers.openai_relay_pool import (
+    RelaySubmissionUnknownHTTPException,
+    RelaySubmittedHTTPException,
+    current_relay_account,
+    run_with_relay_pool,
+)
 from services.platform.proxy_service import proxy_settings
 from services.image import reference_image_uploader
 from utils.log import logger
@@ -19,15 +26,22 @@ from utils.log import logger
 
 STREAM_TIMEOUT_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 300
+TT_IMAGE_2_5_VERSIONS = {
+    "gpt-image-2.5-flare": "flare",
+    "gpt-image-2.5-sunburst": "sunburst",
+}
 MEDIA_IMAGE_MODEL_ALIASES = {
     "gemini-3.1-flash-image-preview": "banana-2",
     "gpt-image-2": "tt-image-2",
+    "gpt-image-2.5": "tt-image-2.5",
+    **{model: "tt-image-2.5" for model in TT_IMAGE_2_5_VERSIONS},
 }
 MEDIA_IMAGE_MODELS = {
     "banana-2",
     "mj_imagine",
     "qwen-image",
     "tt-image-2",
+    "tt-image-2.5",
     "wan2.6-image",
     "wan2.7-image",
 }
@@ -39,6 +53,43 @@ MEDIA_IMAGE_MODEL_PREFIXES = (
 MEDIA_STATUS_PATHS = (
     "/v1/media/status",
     "/v1/skills/task-status",
+)
+MEDIA_PENDING_STATUS_MARKERS = (
+    "pending",
+    "queued",
+    "queue",
+    "waiting",
+    "running",
+    "processing",
+    "in_progress",
+    "in progress",
+    "submitted",
+    "created",
+    "starting",
+    "started",
+    "\u7b49\u5f85",
+    "\u6392\u961f",
+    "\u5904\u7406\u4e2d",
+    "\u751f\u6210\u4e2d",
+    "\u8fdb\u884c\u4e2d",
+)
+MEDIA_SUCCESS_STATUS_MARKERS = (
+    "success",
+    "succeeded",
+    "done",
+    "complete",
+    "completed",
+    "\u5b8c\u6210",
+    "\u6210\u529f",
+)
+MEDIA_FAILURE_STATUS_MARKERS = (
+    "failed",
+    "fail",
+    "error",
+    "failure",
+    "\u5931\u8d25",
+    "\u9519\u8bef",
+    "\u5f02\u5e38",
 )
 MEDIA_IMAGE_ASPECT_RATIOS = {
     "1:1": 1,
@@ -56,6 +107,10 @@ MEDIA_IMAGE_ASPECT_RATIOS = {
     "1:8": 1 / 8,
     "8:1": 8,
 }
+MEDIA_IMAGE_SIZE_OPTIONS = ("0.5K", "1K", "2K", "4K")
+MEDIA_IMAGE_QUALITY_OPTIONS = ("auto", "high", "medium", "low")
+MEDIA_IMAGE_THINKING_OPTIONS = ("minimal", "high")
+MAX_MEDIA_REFERENCE_IMAGES = 14
 
 
 def settings() -> dict[str, object]:
@@ -192,12 +247,39 @@ def list_models() -> dict[str, Any]:
     return run_with_relay_pool(settings(), "list_models", execute)
 
 
+def list_media_voices(model: str) -> dict[str, Any]:
+    selected_model = str(model or "").strip()
+    if not selected_model:
+        raise HTTPException(status_code=400, detail={"error": "model is required"})
+
+    def execute() -> dict[str, Any]:
+        response = requests.get(
+            _url("/v1/skills/voices"),
+            headers=_headers({"Accept": "application/json"}),
+            params={"model": selected_model},
+            timeout=60,
+            **proxy_settings.build_session_kwargs(),
+        )
+        _raise_for_status(response)
+        return _response_json_object(response)
+
+    return run_with_relay_pool(settings(), "list_media_voices", execute)
+
+
 def image_generations(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     def execute() -> dict[str, Any] | Iterator[dict[str, Any]]:
         payload = {
             key: value
             for key, value in body.items()
-            if key not in {"base_url", "progress_callback", "prompt_engine_mode", "subject_mutation_policy"} and value is not None
+            if key not in {
+                "base_url",
+                "progress_callback",
+                "prompt_engine_mode",
+                "subject_mutation_policy",
+                "aspect_ratio",
+                "image_size",
+                "thinking_level",
+            } and value is not None
         }
         payload["prompt"] = ensure_image_prompt_engineered(
             str(payload.get("prompt") or ""),
@@ -282,6 +364,138 @@ def _image_size_tier_from_size(size: object) -> str:
     return "1K"
 
 
+def _media_option(value: object, allowed: tuple[str, ...], default: str, field_name: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+    by_lower = {item.lower(): item for item in allowed}
+    selected = by_lower.get(normalized.lower())
+    if selected is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"{field_name} must be one of: {', '.join(allowed)}"},
+        )
+    return selected
+
+
+def _media_aspect_ratio(body: dict[str, Any], requested_size: str) -> str:
+    explicit = str(body.get("aspect_ratio") or "").strip()
+    if explicit:
+        by_lower = {item.lower(): item for item in MEDIA_IMAGE_ASPECT_RATIOS}
+        selected = by_lower.get(explicit.lower())
+        if selected is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": f"aspect_ratio must be one of: {', '.join(MEDIA_IMAGE_ASPECT_RATIOS)}"},
+            )
+        return selected
+    return _aspect_ratio_from_size(requested_size)
+
+
+def _media_image_size(body: dict[str, Any], requested_size: str) -> str:
+    explicit = str(body.get("image_size") or "").strip()
+    return _media_option(
+        explicit,
+        MEDIA_IMAGE_SIZE_OPTIONS,
+        _image_size_tier_from_size(requested_size),
+        "image_size",
+    )
+
+
+def _media_quality(body: dict[str, Any]) -> str:
+    requested = str(body.get("quality") or "").strip()
+    if requested.lower() == "standard":
+        requested = "auto"
+    return _media_option(requested, MEDIA_IMAGE_QUALITY_OPTIONS, "auto", "quality")
+
+
+def _media_thinking_level(body: dict[str, Any]) -> str:
+    return _media_option(
+        body.get("thinking_level"),
+        MEDIA_IMAGE_THINKING_OPTIONS,
+        "minimal",
+        "thinking_level",
+    )
+
+
+def _tt_image_size(body: dict[str, Any], requested_size: str) -> str:
+    aspect_ratio = str(body.get("aspect_ratio") or "").strip()
+    if aspect_ratio:
+        target = canvas_media_request_size(
+            aspect_ratio,
+            body.get("image_size") or _media_image_size(body, requested_size),
+        )
+        if target is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "tt-image-2 aspect ratio must be between 1:3 and 3:1"},
+            )
+        return target
+    expected_size = normalize_image_size(body.get("expected_size"))
+    return expected_size or normalize_image_size(requested_size) or requested_size
+
+
+def _media_batch_prompt(prompt: str, image_index: int, image_count: int) -> str:
+    if image_count <= 1:
+        return prompt
+    current = min(image_count, max(1, image_index + 1))
+    pattern = re.compile(
+        rf"((?:这是|当前是|批量差异：)\s*第)\s*\d+\s*/\s*{image_count}(\s*张)"
+    )
+    rewritten, replacements = pattern.subn(
+        lambda match: f"{match.group(1)} {current}/{image_count}{match.group(2)}",
+        prompt,
+    )
+    if replacements:
+        return rewritten
+    return (
+        f"{prompt}\n\n"
+        f"批量生成执行说明：这是第 {current}/{image_count} 张独立成品图；"
+        "只输出当前这一张，不要拼图、分屏或多面板。"
+    )
+
+
+def _media_image_params(
+    body: dict[str, Any],
+    *,
+    upstream_model: str,
+    requested_size: str,
+    reference_urls: list[str],
+) -> dict[str, Any]:
+    params: dict[str, Any]
+    if upstream_model.lower() == "tt-image-2.5":
+        params = {
+            "background": "auto",
+            "quality": _media_quality(body),
+            "resolution": _media_image_size(body, requested_size),
+        }
+        aspect_ratio = _media_aspect_ratio(body, requested_size)
+        if aspect_ratio != "auto":
+            params["aspect_ratio"] = aspect_ratio
+        version = TT_IMAGE_2_5_VERSIONS.get(str(body.get("model") or "").strip().lower())
+        # Unversioned legacy requests keep the provider's default version.
+        if version:
+            params["version"] = version
+    elif upstream_model.lower() == "tt-image-2":
+        params = {
+            "n": 1,
+            "quality": _media_quality(body),
+            "size": _tt_image_size(body, requested_size),
+        }
+    else:
+        params = {
+            "aspectRatio": _media_aspect_ratio(body, requested_size),
+            "imageSize": _media_image_size(body, requested_size),
+            "n": 1,
+            "quality": _media_quality(body),
+            "size": requested_size,
+            "thinkingLevel": _media_thinking_level(body),
+        }
+    if reference_urls:
+        params["images"] = reference_urls
+    return params
+
+
 def _extract_media_task_id(data: dict[str, Any]) -> str:
     candidates = [
         data.get("task_id"),
@@ -302,6 +516,69 @@ def _extract_media_task_id(data: dict[str, Any]) -> str:
         if value:
             return value
     raise HTTPException(status_code=502, detail={"error": "media generation response did not include task_id"})
+
+
+def _sanitize_reconciliation_value(value: object, *, depth: int = 0) -> object:
+    if depth >= 5:
+        return "[truncated]"
+    if isinstance(value, dict):
+        sanitized: dict[str, object] = {}
+        for key, item in list(value.items())[:50]:
+            normalized_key = str(key)
+            if any(marker in normalized_key.lower() for marker in ("authorization", "api_key", "apikey", "secret", "token")):
+                sanitized[normalized_key] = "[redacted]"
+            else:
+                sanitized[normalized_key] = _sanitize_reconciliation_value(item, depth=depth + 1)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_reconciliation_value(item, depth=depth + 1) for item in value[:20]]
+    if isinstance(value, str):
+        return value[:2000]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:500]
+
+
+def _submission_reconciliation_metadata(
+    response: requests.Response,
+    response_data: object,
+    request_payload: dict[str, Any],
+    *,
+    image_index: int,
+    requested_count: int,
+) -> dict[str, Any]:
+    digest_payload = {
+        "model": request_payload.get("model"),
+        "prompt": request_payload.get("prompt"),
+        "params": request_payload.get("params"),
+        "image_index": image_index,
+        "requested_count": requested_count,
+    }
+    request_digest = hashlib.sha256(
+        json.dumps(digest_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    request_id = ""
+    response_headers = {
+        str(key).lower(): value
+        for key, value in getattr(response, "headers", {}).items()
+    }
+    for header in ("x-request-id", "request-id", "x-trace-id", "trace-id"):
+        request_id = str(response_headers.get(header) or "").strip()
+        if request_id:
+            break
+    account = current_relay_account()
+    return {
+        "http_status": int(response.status_code),
+        "upstream_request_id": request_id,
+        "request_digest": request_digest,
+        "relay_account_id": str(getattr(account, "id", "") or ""),
+        "relay_account_name": str(getattr(account, "name", "") or ""),
+        "model": str(request_payload.get("model") or ""),
+        "submitted_at": int(time.time()),
+        "image_index": image_index,
+        "requested_count": requested_count,
+        "upstream_response": _sanitize_reconciliation_value(response_data),
+    }
 
 
 def _media_status_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -398,30 +675,59 @@ def _with_response_cost(data: dict[str, Any]) -> dict[str, Any]:
     return {**data, "cost": cost}
 
 
+def _media_result_urls(value: object) -> list[str]:
+    """Extract every generated media URL from the relay's status shapes."""
+
+    direct_keys = ("result_url", "resultUrl", "output_url", "outputUrl", "audio_url", "audioUrl", "url")
+    collection_keys = ("result_urls", "resultUrls", "urls", "images", "outputs", "artifacts", "data", "result")
+    found: list[str] = []
+
+    def add_url(candidate: object) -> None:
+        if not isinstance(candidate, str):
+            return
+        url = candidate.strip()
+        if url.startswith(("http://", "https://")) and url not in found:
+            found.append(url)
+
+    def visit(candidate: object) -> None:
+        if isinstance(candidate, str):
+            add_url(candidate)
+            return
+        if isinstance(candidate, list):
+            for item in candidate:
+                visit(item)
+            return
+        if not isinstance(candidate, dict):
+            return
+        for key in direct_keys:
+            if key in candidate:
+                value = candidate.get(key)
+                if isinstance(value, list):
+                    visit(value)
+                elif isinstance(value, dict):
+                    visit(value)
+                else:
+                    add_url(value)
+        for key in collection_keys:
+            if key in candidate:
+                visit(candidate.get(key))
+
+    visit(value)
+    return found
+
+
 def _media_result_url(data: dict[str, Any]) -> str:
-    payload = _media_status_payload(data)
-    for key in ("result_url", "resultUrl", "output_url", "url"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.startswith(("http://", "https://")):
-            return value
-    for key in ("result_urls", "resultUrls", "urls"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, str) and item.startswith(("http://", "https://")):
-                    return item
-    result = payload.get("result")
-    if isinstance(result, dict):
-        return _media_result_url(result)
-    if isinstance(result, list):
-        for item in result:
-            if isinstance(item, str) and item.startswith(("http://", "https://")):
-                return item
-            if isinstance(item, dict):
-                url = _media_result_url(item)
-                if url:
-                    return url
-    return ""
+    return (_media_result_urls(_media_status_payload(data)) or [""])[0]
+
+
+def _media_count(value: object) -> int:
+    try:
+        count = int(value or 1)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
+    if count < 1 or count > 4:
+        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    return count
 
 
 def _media_error_text(data: dict[str, Any]) -> str:
@@ -433,21 +739,39 @@ def _media_error_text(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False)[:500]
 
 
+def _media_status_text(data: dict[str, Any]) -> str:
+    payload = _media_status_payload(data)
+    parts = [
+        str(value)
+        for key in ("status", "state", "error", "message", "msg")
+        if (value := payload.get(key))
+    ]
+    return " ".join(parts).strip().casefold()
+
+
+def _media_status_has_marker(data: dict[str, Any], markers: tuple[str, ...]) -> bool:
+    status = _media_status_text(data)
+    return any(marker in status for marker in markers)
+
+
+def _media_task_failed(data: dict[str, Any]) -> bool:
+    return _media_status_has_marker(data, MEDIA_FAILURE_STATUS_MARKERS)
+
+
 def _media_task_finished(data: dict[str, Any]) -> bool:
     payload = _media_status_payload(data)
+    if _media_task_failed(data):
+        return True
+    if _media_status_has_marker(data, MEDIA_PENDING_STATUS_MARKERS):
+        return False
+    if _media_result_url(data):
+        return True
     if payload.get("is_final") is True:
         return True
     progress = str(payload.get("progress") or "").strip().rstrip("%")
     if progress == "100":
         return True
-    status = str(payload.get("status") or payload.get("state") or "").lower()
-    return any(marker in status for marker in ("success", "succeeded", "done", "complete", "failed", "error", "完成", "失败"))
-
-
-def _media_task_failed(data: dict[str, Any]) -> bool:
-    payload = _media_status_payload(data)
-    status = str(payload.get("status") or payload.get("state") or payload.get("error") or "").lower()
-    return any(marker in status for marker in ("failed", "fail", "error", "失败"))
+    return _media_status_has_marker(data, MEDIA_SUCCESS_STATUS_MARKERS)
 
 
 def _get_media_status(task_id: str) -> dict[str, Any]:
@@ -466,6 +790,110 @@ def _get_media_status(task_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=502, detail={"error": "media status endpoint is unavailable"})
 
 
+def generate_media_task(
+    body: dict[str, Any],
+    *,
+    operation: str = "media_generation",
+    timeout_seconds: int = REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request_payload = {
+        "model": str(body.get("model") or "").strip(),
+        "prompt": str(body.get("prompt") or "").strip(),
+        "params": dict(body.get("params") or {}),
+    }
+    if not request_payload["model"]:
+        raise HTTPException(status_code=400, detail={"error": "model is required"})
+    if not request_payload["prompt"]:
+        raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    poll_timeout = max(30, min(1800, int(timeout_seconds or REQUEST_TIMEOUT_SECONDS)))
+
+    def execute() -> dict[str, Any]:
+        response = requests.post(
+            _url("/v1/media/generate"),
+            headers=_headers({"Accept": "application/json", "Content-Type": "application/json"}),
+            json=request_payload,
+            timeout=min(60, poll_timeout),
+            **proxy_settings.build_session_kwargs(),
+        )
+        _raise_for_status(response)
+        response_data = _response_json_object(response)
+        try:
+            task_id = _extract_media_task_id(response_data)
+        except HTTPException as exc:
+            raise RelaySubmissionUnknownHTTPException(
+                detail={"error": "media generation was accepted but the response did not include task_id"},
+                reconciliation={
+                    "http_status": int(response.status_code),
+                    "model": request_payload["model"],
+                    "submitted_at": int(time.time()),
+                    "upstream_response": _sanitize_reconciliation_value(response_data),
+                },
+            ) from exc
+
+        deadline = time.monotonic() + poll_timeout
+        last_status: dict[str, Any] = {}
+        try:
+            while time.monotonic() <= deadline:
+                last_status = _get_media_status(task_id)
+                if not _media_task_finished(last_status):
+                    time.sleep(2)
+                    continue
+
+                payload = _media_status_payload(last_status)
+                result_urls = _media_result_urls(payload)
+                if _media_task_failed(last_status):
+                    error = HTTPException(
+                        status_code=422,
+                        detail={"error": f"media generation failed: {_media_error_text(last_status)}"},
+                    )
+                    error.upstream_finished = True
+                    raise error
+                if not result_urls:
+                    error = HTTPException(
+                        status_code=502,
+                        detail={"error": "media generation completed without a result URL"},
+                    )
+                    error.upstream_finished = True
+                    raise error
+
+                return {
+                    "task_id": task_id,
+                    "state": str(payload.get("state") or "success"),
+                    "status": str(payload.get("status") or payload.get("state") or "success"),
+                    "is_final": bool(payload.get("is_final", True)),
+                    "progress": payload.get("progress") or "100%",
+                    "result_url": result_urls[0],
+                    "result_type": str(payload.get("result_type") or ""),
+                    "error": "",
+                    "cost": _media_cost(last_status),
+                }
+
+            raise HTTPException(
+                status_code=504,
+                detail={"error": f"media generation timed out: {_media_error_text(last_status)}"},
+            )
+        except RelaySubmittedHTTPException:
+            raise
+        except HTTPException as exc:
+            upstream_finished = bool(getattr(exc, "upstream_finished", False))
+            raise RelaySubmittedHTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+                upstream_task_ids=[task_id],
+                submission_uncertain=not upstream_finished,
+                upstream_finished=upstream_finished,
+            ) from exc
+        except Exception as exc:
+            raise RelaySubmittedHTTPException(
+                status_code=502,
+                detail={"error": f"media status request failed: {exc}"},
+                upstream_task_ids=[task_id],
+                submission_uncertain=True,
+            ) from exc
+
+    return run_with_relay_pool(settings(), operation, execute)
+
+
 def _poll_media_image_task(task_id: str) -> dict[str, Any]:
     deadline = time.time() + REQUEST_TIMEOUT_SECONDS
     last_status: dict[str, Any] = {}
@@ -475,13 +903,18 @@ def _poll_media_image_task(task_id: str) -> dict[str, Any]:
         if not _media_task_finished(data):
             time.sleep(2)
             continue
-        result_url = _media_result_url(data)
-        if result_url and not _media_task_failed(data):
+        result_urls = _media_result_urls(_media_status_payload(data))
+        if result_urls and not _media_task_failed(data):
             cost = _media_cost(data)
             if cost is None:
                 _log_missing_media_cost(task_id, data)
-            return {"result_url": result_url, "cost": cost}
-        raise HTTPException(status_code=502, detail={"error": f"media generation failed: {_media_error_text(data)}"})
+            return {"result_url": result_urls[0], "result_urls": result_urls, "cost": cost}
+        error = HTTPException(
+            status_code=422,
+            detail={"error": f"media generation failed: {_media_error_text(data)}"},
+        )
+        error.upstream_finished = True
+        raise error
     raise HTTPException(status_code=504, detail={"error": f"media generation timed out: {_media_error_text(last_status)}"})
 
 
@@ -499,38 +932,99 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
     requested_size = str(body.get("size") or "auto").strip() or "auto"
-    params: dict[str, Any] = {
-        "aspectRatio": _aspect_ratio_from_size(requested_size),
-        "imageSize": _image_size_tier_from_size(requested_size),
-        "n": body.get("n") or 1,
-        "quality": str(body.get("quality") or "auto").strip() or "auto",
-        "size": requested_size,
-    }
-    if reference_urls:
-        params["images"] = reference_urls
-    response = requests.post(
-        _url("/v1/media/generate"),
-        headers=_headers({"Content-Type": "application/json"}),
-        json={"model": upstream_model, "prompt": prompt, "params": params},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        **proxy_settings.build_session_kwargs(),
+    reference_count = len(reference_urls)
+    if reference_count > MAX_MEDIA_REFERENCE_IMAGES:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"supports at most {MAX_MEDIA_REFERENCE_IMAGES} reference images"},
+        )
+    requested_count = _media_count(body.get("n"))
+    params = _media_image_params(
+        body,
+        upstream_model=upstream_model,
+        requested_size=requested_size,
+        reference_urls=reference_urls,
     )
-    _raise_for_status(response)
-    task_id = _extract_media_task_id(_response_json_object(response))
+    task_ids: list[str] = []
+    for image_index in range(requested_count):
+        try:
+            request_payload = {
+                "model": upstream_model,
+                "prompt": _media_batch_prompt(prompt, image_index, requested_count),
+                "params": dict(params),
+            }
+            response = requests.post(
+                _url("/v1/media/generate"),
+                headers=_headers({"Content-Type": "application/json"}),
+                json=request_payload,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                **proxy_settings.build_session_kwargs(),
+            )
+            _raise_for_status(response)
+            response_data = _try_response_json(response)
+            if not isinstance(response_data, dict):
+                response_data = {"raw_text": str(response.text or "")[:2000]}
+            try:
+                task_id = _extract_media_task_id(response_data)
+            except HTTPException as exc:
+                reconciliation = _submission_reconciliation_metadata(
+                    response,
+                    response_data,
+                    request_payload,
+                    image_index=image_index,
+                    requested_count=requested_count,
+                )
+                if task_ids:
+                    reconciliation["accepted_task_ids"] = list(task_ids)
+                raise RelaySubmissionUnknownHTTPException(
+                    detail={"error": "media generation was accepted but the response did not include task_id"},
+                    reconciliation=reconciliation,
+                ) from exc
+            task_ids.append(task_id)
+        except RelaySubmissionUnknownHTTPException:
+            raise
+        except HTTPException as exc:
+            if task_ids:
+                raise RelaySubmittedHTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    upstream_task_ids=task_ids,
+                    submission_uncertain=True,
+                ) from exc
+            raise
     progress_callback = body.get("progress_callback")
     if callable(progress_callback):
         progress_callback("image_stream_resolve_start")
-    try:
-        media_result = _poll_media_image_task(task_id)
-    except HTTPException as exc:
-        raise RelaySubmittedHTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    result_urls: list[str] = []
+    total_cost = 0.0
+    has_complete_cost = True
+    for task_id in task_ids:
+        try:
+            media_result = _poll_media_image_task(task_id)
+        except HTTPException as exc:
+            upstream_finished = bool(getattr(exc, "upstream_finished", False))
+            raise RelaySubmittedHTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+                upstream_task_ids=task_ids,
+                submission_uncertain=not upstream_finished,
+                upstream_finished=upstream_finished,
+            ) from exc
+        urls = media_result.get("result_urls") or [media_result.get("result_url")]
+        result_urls.extend(str(url).strip() for url in urls[:1] if str(url or "").strip())
+        cost = media_result.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            total_cost += float(cost)
+        else:
+            has_complete_cost = False
     result = {
         "created": int(time.time()),
-        "data": [{"url": media_result.get("result_url")}],
-        "_media_task_id": task_id,
+        "data": [{"url": url} for url in result_urls],
+        "_media_task_id": task_ids[0],
+        "_media_task_ids": task_ids,
     }
-    if media_result.get("cost") is not None:
-        result["cost"] = media_result.get("cost")
+    if has_complete_cost:
+        result["cost"] = total_cost
     return result
 
 
@@ -541,7 +1035,20 @@ def _image_generations_with_reference_images(
     payload: dict[str, Any] = {
         key: value
         for key, value in body.items()
-        if key not in {"images", "image_urls", "mask", "base_url", "progress_callback", "preserve_subject", "preserve_product", "prompt_engine_mode", "subject_mutation_policy"} and value is not None
+        if key not in {
+            "images",
+            "image_urls",
+            "mask",
+            "base_url",
+            "progress_callback",
+            "preserve_subject",
+            "preserve_product",
+            "prompt_engine_mode",
+            "subject_mutation_policy",
+            "aspect_ratio",
+            "image_size",
+            "thinking_level",
+        } and value is not None
     }
     payload["prompt"] = ensure_image_prompt_engineered(
         str(payload.get("prompt") or ""),
@@ -672,7 +1179,20 @@ def image_edits(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any
         fields = {
             key: str(value)
             for key, value in engineered_body.items()
-            if key not in {"images", "image_urls", "mask", "base_url", "progress_callback", "preserve_subject", "preserve_product", "prompt_engine_mode", "subject_mutation_policy"} and value is not None
+            if key not in {
+                "images",
+                "image_urls",
+                "mask",
+                "base_url",
+                "progress_callback",
+                "preserve_subject",
+                "preserve_product",
+                "prompt_engine_mode",
+                "subject_mutation_policy",
+                "aspect_ratio",
+                "image_size",
+                "thinking_level",
+            } and value is not None
         }
         if _relay_uses_generations_for_image_edits():
             return _image_generations_with_reference_images(engineered_body, fields)

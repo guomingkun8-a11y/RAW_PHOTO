@@ -91,6 +91,9 @@ def run_professional_prompt_agent(
     identity: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     prompt_builder = prompt_builder or build_adaptive_image_prompt
+    body = dict(body)
+    body.setdefault("billing_owner_id", _identity_id(identity))
+    body.setdefault("billing_local_source", "image_agent_prompt")
     registry = AgentToolRegistry([_prompt_tool(prompt_builder)])
     runner = AgentRunner(
         registry,

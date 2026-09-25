@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Column, DateTime, String, Text, create_engine, desc, text
+from sqlalchemy import Column, DateTime, String, Text, and_, create_engine, desc, or_, text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -14,6 +14,8 @@ Base = declarative_base()
 DEFAULT_DATABASE_URL = "mysql+pymysql://root:root@127.0.0.1:3306/raw_photo?charset=utf8mb4"
 LONG_TEXT = Text().with_variant(LONGTEXT, "mysql")
 INLINE_IMAGE_REMOTE_LIMIT = 2048
+CONVERSATION_LIST_DEFAULT_LIMIT = 50
+CONVERSATION_LIST_MAX_LIMIT = 200
 
 
 class ImageConversationModel(Base):
@@ -48,6 +50,23 @@ def _owner_id(identity: dict[str, object]) -> str:
 
 def _iso(value: datetime | None) -> str:
     return value.isoformat(timespec="seconds") if value else ""
+
+
+def _parse_cursor_datetime(value: str) -> datetime:
+    clean_value = _clean(value)
+    if not clean_value:
+        raise ValueError("conversation cursor timestamp is required")
+    try:
+        parsed = datetime.fromisoformat(clean_value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid conversation cursor timestamp") from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _cursor_datetime(value: datetime | None) -> str:
+    return value.isoformat(timespec="microseconds") if value else ""
 
 
 def _payload_timestamp(payload: dict[str, Any]) -> float:
@@ -144,6 +163,7 @@ class ImageConversationService:
             return
         statements = [
             "CREATE INDEX idx_image_conversations_owner_updated ON image_conversations (owner_id, deleted_at, updated_at)",
+            "CREATE INDEX idx_image_conversations_owner_updated_id ON image_conversations (owner_id, deleted_at, updated_at, id)",
             "CREATE INDEX idx_image_conversations_owner_title ON image_conversations (owner_id, title)",
         ]
         with engine.begin() as connection:
@@ -160,21 +180,72 @@ class ImageConversationService:
             raise RuntimeError(f"image conversation database unavailable: {self._init_error}")
         return self.Session()
 
-    def list_conversations(self, *, identity: dict[str, object], limit: int = 500) -> dict[str, Any]:
+    def count_conversations(self, *, identity: dict[str, object]) -> int:
         owner_id = _owner_id(identity)
-        page_limit = max(1, min(1000, limit))
+        session = self._session()
+        try:
+            return int(
+                session.query(ImageConversationModel.id)
+                .filter(
+                    ImageConversationModel.owner_id == owner_id,
+                    ImageConversationModel.deleted_at.is_(None),
+                )
+                .count()
+            )
+        finally:
+            session.close()
+
+    def list_conversations(
+        self,
+        *,
+        identity: dict[str, object],
+        limit: int = CONVERSATION_LIST_DEFAULT_LIMIT,
+        cursor_at: str = "",
+        cursor_id: str = "",
+    ) -> dict[str, Any]:
+        owner_id = _owner_id(identity)
+        if bool(cursor_at) != bool(cursor_id):
+            raise ValueError("cursorAt and cursorId must be provided together")
+        cursor_datetime = _parse_cursor_datetime(cursor_at) if cursor_at else None
+        clean_cursor_id = _clean(cursor_id)
+        if clean_cursor_id and len(clean_cursor_id) > 191:
+            raise ValueError("invalid conversation cursor id")
+        page_limit = max(1, min(CONVERSATION_LIST_MAX_LIMIT, limit))
         session = self._session()
         try:
             query = session.query(ImageConversationModel).filter(
                 ImageConversationModel.owner_id == owner_id,
                 ImageConversationModel.deleted_at.is_(None),
             )
+            if cursor_datetime is not None:
+                query = query.filter(
+                    or_(
+                        ImageConversationModel.updated_at < cursor_datetime,
+                        and_(
+                            ImageConversationModel.updated_at == cursor_datetime,
+                            ImageConversationModel.id < clean_cursor_id,
+                        ),
+                    )
+                )
             rows = (
-                query.order_by(desc(ImageConversationModel.updated_at), desc(ImageConversationModel.created_at))
-                .limit(page_limit)
+                query.order_by(desc(ImageConversationModel.updated_at), desc(ImageConversationModel.id))
+                .limit(page_limit + 1)
                 .all()
             )
-            return {"items": [_payload_from_row(row) for row in rows], "total": len(rows)}
+            has_more = len(rows) > page_limit
+            visible_rows = rows[:page_limit]
+            last = visible_rows[-1] if visible_rows else None
+            return {
+                "items": [_payload_from_row(row) for row in visible_rows],
+                "total": len(visible_rows),
+                "limit": page_limit,
+                "has_more": has_more,
+                "next_cursor": (
+                    {"updated_at": _cursor_datetime(last.updated_at), "id": last.id}
+                    if has_more and last is not None
+                    else None
+                ),
+            }
         finally:
             session.close()
 

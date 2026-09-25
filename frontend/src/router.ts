@@ -8,6 +8,11 @@ const routes: RouteRecordRaw[] = [
   { path: "/login", name: "login", component: () => import("@/pages/AuthPage.vue"), meta: { public: true, auth: true } },
   { path: "/register", name: "register", component: () => import("@/pages/AuthPage.vue"), meta: { public: true, auth: true } },
   { path: "/image", name: "image", component: () => import("@/pages/ImageWorkspacePage.vue"), meta: { keepAlive: true } },
+  { path: "/video-generation", name: "video-generation", component: () => import("@/pages/VideoGenerationPage.vue") },
+  { path: "/audio-generation", name: "audio-generation", component: () => import("@/pages/AudioGenerationPage.vue") },
+  { path: "/infinite-canvas", name: "infinite-canvas", component: () => import("@/pages/InfiniteCanvasPage.vue"), meta: { fullscreen: true } },
+  { path: "/video-generation/agent", name: "video-agent", component: () => import("@/pages/VideoAgentPage.vue") },
+  { path: "/video-library", redirect: { path: "/image-library", query: { type: "video" } } },
   { path: "/image-library", name: "image-library", component: () => import("@/pages/ImageLibraryPage.vue") },
   { path: "/products", redirect: "/image" },
   { path: "/prompt-templates", name: "prompt-templates", component: () => import("@/pages/PromptTemplatesPage.vue") },
@@ -34,6 +39,12 @@ router.beforeEach(async (to) => {
   }
   if (!session) {
     return { name: "login", query: { next: to.fullPath } };
+  }
+  if (to.path === "/video-generation" && to.query.history === "1") {
+    return {
+      path: "/image",
+      query: { ...to.query, history: "1", type: "video" },
+    };
   }
   if (to.meta.role && to.meta.role !== session.role) return "/image";
   return true;

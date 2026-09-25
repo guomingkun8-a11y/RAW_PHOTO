@@ -7,11 +7,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import ai, business, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system, video_generation
+from api import ai, audio_generation, billing, business, canvas, events, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system, video_agent, video_compositions, video_generation
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
 from services.platform.config import config
 from services.platform.database_maintenance import ensure_database_ready, start_database_maintenance_scheduler
+from services.billing.upstream_usage_service import start_upstream_usage_scheduler
 from services.image.image_storage_service import image_storage_service
 from services.image.image_service import start_image_cleanup_scheduler
 from utils.log import logger
@@ -30,6 +31,7 @@ def create_app() -> FastAPI:
             logger.info({"event": "database_ready_failed", "error": str(exc)})
         database_thread = start_database_maintenance_scheduler(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
+        upstream_usage_thread = start_upstream_usage_scheduler(stop_event)
         image_storage_service.cleanup_old_images()
         try:
             yield
@@ -37,6 +39,7 @@ def create_app() -> FastAPI:
             stop_event.set()
             database_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            upstream_usage_thread.join(timeout=1)
             try:
                 from services.ecommerce.cow_agent_extended_tools import reset_extended_tool_services
 
@@ -54,15 +57,21 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(ai.create_router())
+    app.include_router(audio_generation.create_router())
     app.include_router(business.create_router())
     app.include_router(image_tasks.create_router())
+    app.include_router(events.create_router())
     app.include_router(video_generation.create_router())
+    app.include_router(video_compositions.create_router())
+    app.include_router(video_agent.create_router())
+    app.include_router(canvas.create_router())
     app.include_router(image_uploads.create_router())
     app.include_router(image_conversations.create_router())
     app.include_router(image_library.create_router())
     app.include_router(prompt_analysis.create_router())
     app.include_router(image_agent.create_router())
     app.include_router(monitoring.create_router())
+    app.include_router(billing.create_router())
     app.include_router(system.create_router(app_version))
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)

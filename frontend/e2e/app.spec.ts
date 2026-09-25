@@ -1,3 +1,5 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { expect, type Page, test } from "@playwright/test";
@@ -18,6 +20,7 @@ type MockState = {
   generationTaskRequests: Array<Record<string, unknown>>;
   editTaskRequests: string[];
   generationResultUrl?: string;
+  generatedImageCost?: number;
   externalImageRequests: number;
   imageConversations: Array<Record<string, unknown>>;
   agentMemories: Array<Record<string, unknown>>;
@@ -167,15 +170,15 @@ async function mockAppApi(page: Page, overrides: Partial<MockState> = {}) {
       await route.fulfill({
         json: {
           object: "list",
-          data: [{
-            id: "gpt-image-2",
+          data: ["gpt-image-2", "banana-pro", "tt-image-2.5-flare-token", "kling-v3-video"].map((id) => ({
+            id,
             object: "model",
             created: 0,
             owned_by: "mock",
             permission: [],
-            root: "gpt-image-2",
+            root: id,
             parent: null,
-          }],
+          })),
         },
       });
       return;
@@ -352,7 +355,7 @@ async function mockAppApi(page: Page, overrides: Partial<MockState> = {}) {
                 phase: "completed",
                 promptPlan: { model: "gpt-5.6-sol", sceneType: "auto", sceneName: "CowAgent open workflow" },
                 proposal: {},
-                images: shouldGenerate ? [{ taskId: "mock-cowagent-image-1", url: fakePngDataUrl, width: 1, height: 1 }] : [],
+                images: shouldGenerate ? [{ taskId: "mock-cowagent-image-1", url: fakePngDataUrl, width: 1, height: 1, cost: state.generatedImageCost }] : [],
                 qualityChecks: [],
                 assistantMessage: "你好，我可以帮你规划商品主图、详情页、场景图和文字排版。",
                 suggestions: [],
@@ -386,7 +389,7 @@ async function mockAppApi(page: Page, overrides: Partial<MockState> = {}) {
     }
     if (path === "/api/image-conversations") {
       if (request.method() === "GET") {
-        await route.fulfill({ json: { items: [], total: 0 } });
+        await route.fulfill({ json: { items: state.imageConversations, total: state.imageConversations.length } });
         return;
       }
       if (request.method() === "DELETE") {
@@ -413,7 +416,7 @@ async function mockAppApi(page: Page, overrides: Partial<MockState> = {}) {
     if (path === "/api/image-tasks/generations") {
       const body = request.postDataJSON() as Record<string, unknown>;
       state.generationTaskRequests.push(body);
-      await route.fulfill({ json: imageTaskFromBody(body, state.generationResultUrl) });
+      await route.fulfill({ json: { ...imageTaskFromBody(body, state.generationResultUrl), cost: state.generatedImageCost } });
       return;
     }
     if (path === "/api/image-tasks/edits") {
@@ -495,6 +498,41 @@ async function loginThroughUi(page: Page) {
   await expect(page.getByTestId("image-prompt-input")).toBeVisible();
 }
 
+for (const version of ["flare", "sunburst"]) {
+  for (const mode of ["standard", "agent"]) {
+    test(`gpt-image-2.5 ${version} ${mode} keeps model and cost in history`, async ({ page }) => {
+      const state = await mockAppApi(page, { generatedImageCost: 0.35, generationResultUrl: fakePngDataUrl });
+      if (version === "sunburst") await page.setViewportSize({ width: 390, height: 844 });
+      await loginThroughUi(page);
+      if (mode === "agent") await page.getByRole("button", { name: "智能体", exact: true }).click();
+      await page.getByTestId(mode === "agent" ? "agent-generation-preferences-toggle" : "image-model-card-toggle").click();
+      const select = page.locator(mode === "agent" ? "#composer-preferences-card-panel select" : "#composer-model-card-panel select");
+      await expect(select.locator("option")).toHaveCount(4);
+      await expect(select.locator('option[value="gpt-image-2.5-flare"]')).toHaveCount(1);
+      await expect(select.locator('option[value="gpt-image-2.5-sunburst"]')).toHaveCount(1);
+      await expect(select.locator('option[value="gpt-image-2.5"]')).toHaveCount(0);
+      await expect(select.locator('option[value="banana-pro"]')).toHaveCount(0);
+      await expect(select.locator('option[value="tt-image-2.5-flare-token"]')).toHaveCount(0);
+      await expect(select.locator('option[value="kling-v3-video"]')).toHaveCount(0);
+      const model = `gpt-image-2.5-${version}`;
+      await select.selectOption(model);
+      await select.press("Escape");
+      await page.getByTestId("image-prompt-input").fill("generate a product image");
+      await page.getByTestId("generate-submit-button").click();
+      const requests = mode === "agent" ? state.imageAgentRequests : state.generationTaskRequests;
+      await expect.poll(() => requests.length).toBe(1);
+      expect(requests[0].model).toBe(model);
+      await expect(page.getByTestId("generated-image")).toHaveCount(1);
+      await expect(page.getByText("费用 ￥0.35", { exact: true })).toBeVisible();
+      await expect.poll(() => state.imageConversations[0]).toMatchObject({ turns: [{ model, images: [{ cost: 0.35 }] }] });
+      await page.reload();
+      await expect(page.getByTestId("generated-image")).toHaveCount(1);
+      await expect(page.getByText("费用 ￥0.35", { exact: true })).toBeVisible();
+      await page.screenshot({ path: `test-results/image-25-${version}-${mode}.png`, fullPage: true });
+    });
+  }
+}
+
 test("login redirects to the image workspace", async ({ page }) => {
   await mockAppApi(page);
 
@@ -561,6 +599,79 @@ test("image generation and folder batch generation render completed results", as
   await expect(page.getByText(/2 轮/)).toBeVisible();
   expect(state.imageConversations).toHaveLength(1);
   expect((state.imageConversations[0] as { turns?: unknown[] }).turns).toHaveLength(2);
+});
+
+async function expectWorkspaceWithinViewport(page: Page) {
+  await expect.poll(() => page.locator(
+    ".image-chat-page, .image-chat-content, .image-chat-composer, .composer-prompt-shell, .image-results-thread",
+  ).evaluateAll((elements) => elements.flatMap((element) => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.left < -1 || bounds.right > window.innerWidth + 1 || element.scrollWidth > element.clientWidth + 1
+      ? [{ className: element.className, left: bounds.left, right: bounds.right, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth }]
+      : [];
+  }))).toEqual([]);
+}
+
+for (const viewport of [{ width: 1911, height: 930 }, { width: 390, height: 844 }]) {
+  test(`many reference images and long prompts fit a ${viewport.width}px workspace`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    await mockAppApi(page);
+    await loginThroughUi(page);
+
+    await page.getByTestId("reference-file-input").setInputFiles(Array.from({ length: 48 }, (_, index) => ({
+      name: `reference-${index}.png`,
+      mimeType: "image/png",
+      buffer: Buffer.from(fakePngBase64, "base64"),
+    })));
+    await expect(page.locator("[data-reference-thumb]")).toHaveCount(48);
+    await expectWorkspaceWithinViewport(page);
+    const referenceStrip = page.locator(".composer-reference-strip");
+    await referenceStrip.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+    await expect(page.locator("[data-reference-thumb]").last()).toBeInViewport();
+    await expect(page.locator(".composer-reference-assist-button").first()).toBeInViewport();
+
+    await page.getByTestId("image-prompt-input").fill(`Product photo https://example.com/${"a".repeat(500)}`);
+    await page.getByTestId("generate-submit-button").click();
+    await expect(page.getByTestId("generated-image")).toHaveCount(1);
+    await expectWorkspaceWithinViewport(page);
+    const userMessage = page.locator(".chat-message-body--user");
+    await expect.poll(() => userMessage.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+    const savedReferences = userMessage.locator(".overflow-x-auto");
+    await expect(savedReferences.locator("button")).toHaveCount(48);
+    await savedReferences.scrollIntoViewIfNeeded();
+    await savedReferences.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+    await expect(savedReferences.locator("button").last()).toBeInViewport();
+  });
+}
+
+test("a 48-image folder batch stays within the workspace after generation and reload", async ({ page }) => {
+  await page.setViewportSize({ width: 1911, height: 930 });
+  const state = await mockAppApi(page);
+  await loginThroughUi(page);
+  const folder = await mkdtemp(path.join(os.tmpdir(), "raw-photo-layout-"));
+  try {
+    await Promise.all(Array.from({ length: 48 }, (_, index) => writeFile(
+      path.join(folder, `photo-${index}.png`), Buffer.from(fakePngBase64, "base64"),
+    )));
+    const chooserPromise = page.waitForEvent("filechooser");
+    await page.getByTestId("pick-batch-folder-button").click();
+    await (await chooserPromise).setFiles(folder);
+    await page.getByTestId("image-prompt-input").fill("Product photo");
+    await page.getByTestId("generate-submit-button").click();
+    await expect(page.getByTestId("generated-image")).toHaveCount(48);
+    await expect.poll(() => state.editTaskRequests.length).toBe(48);
+    await expectWorkspaceWithinViewport(page);
+    await page.reload();
+    await expect(page.getByTestId("generated-image")).toHaveCount(48);
+    await expectWorkspaceWithinViewport(page);
+    const savedReferences = page.locator(".chat-message-body--user .overflow-x-auto");
+    await expect(savedReferences.locator("button")).toHaveCount(48);
+    await savedReferences.scrollIntoViewIfNeeded();
+    await savedReferences.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+    await expect(savedReferences.locator("button").last()).toBeInViewport();
+  } finally {
+    await rm(folder, { recursive: true, force: true });
+  }
 });
 
 test("continued prompts reuse the current conversation until a new task is requested", async ({ page }) => {

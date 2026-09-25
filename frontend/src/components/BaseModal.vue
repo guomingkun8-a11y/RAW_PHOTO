@@ -20,7 +20,7 @@ const emit = defineEmits<{ close: [] }>();
 <template>
   <Teleport to="body">
     <div v-if="open" class="fixed inset-0 z-[100] grid place-items-center bg-slate-950/55 p-4 backdrop-blur-sm" @mousedown.self="emit('close')">
-      <section class="max-h-[92dvh] w-full overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-[0_30px_90px_rgba(15,23,42,0.32)] dark:border-white/10 dark:bg-[#171a21]" :class="widthClass" role="dialog" aria-modal="true">
+      <section class="max-h-[92dvh] w-full overflow-hidden rounded-2xl border border-black/[0.08] bg-white shadow-[0_30px_90px_rgba(15,23,42,0.32)] dark:border-white/10 dark:bg-[#171a21]" :class="widthClass" role="dialog" aria-modal="true" :aria-label="title || undefined">
         <header v-if="title || showClose" class="flex items-start justify-between gap-4 border-b border-black/[0.06] px-5 py-4 dark:border-white/10">
           <div>
             <h2 v-if="title" class="text-lg font-semibold text-slate-950 dark:text-stone-50">{{ title }}</h2>

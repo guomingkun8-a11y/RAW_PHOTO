@@ -246,6 +246,9 @@ def build_general_image_prompt(body: dict[str, Any]) -> dict[str, Any]:
             content=content,
             max_tokens=GENERAL_PROMPT_MAX_TOKENS,
             temperature=0.2,
+            billing_owner_id=body.get("billing_owner_id"),
+            billing_local_task_id=body.get("billing_local_task_id"),
+            billing_local_source=body.get("billing_local_source") or "image_agent_prompt",
         )
     except HTTPException as exc:
         is_format_error, planner_question = _planner_format_detail(exc)

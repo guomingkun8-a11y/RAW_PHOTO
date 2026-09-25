@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ChevronLeft, ChevronRight, ListChecks, MessageSquarePlus, Pencil, Search, Sparkles, Trash2, X } from "@lucide/vue";
+import { ArrowDown, ChevronLeft, ChevronRight, ListChecks, LoaderCircle, MessageSquarePlus, Pencil, Search, Sparkles, Trash2, X } from "@lucide/vue";
 import { computed, nextTick, ref, watch } from "vue";
 
 import { extractUserDisplayPrompt } from "@/lib/prompt-display";
@@ -11,6 +11,9 @@ const props = defineProps<{
   selectedId: string | null;
   formatTime: (value: string) => string;
   compact?: boolean;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  total?: number;
 }>();
 const emit = defineEmits<{
   create: [];
@@ -19,6 +22,7 @@ const emit = defineEmits<{
   remove: [id: string];
   deleteMany: [ids: string[]];
   rename: [id: string, title: string];
+  loadMore: [];
 }>();
 
 const editingId = ref<string | null>(null);
@@ -229,7 +233,7 @@ watch(() => props.conversations.map((conversation) => conversation.id).join("|")
       </div>
       <div v-if="!loading && filteredConversations.length" class="flex shrink-0 flex-col gap-3 border-t border-black/[0.06] pt-3 text-xs text-slate-500 dark:border-white/10 dark:text-stone-400 sm:flex-row sm:items-center sm:justify-between">
         <span>
-          显示 {{ pageStart }}-{{ pageEnd }} / {{ filteredConversations.length }} 条，每页 20 条
+          显示 {{ pageStart }}-{{ pageEnd }} / {{ total || filteredConversations.length }} 条，每页 20 条
         </span>
         <div class="flex items-center gap-2">
           <button
@@ -253,6 +257,18 @@ watch(() => props.conversations.map((conversation) => conversation.id).join("|")
           </button>
         </div>
       </div>
+      <button
+        v-if="!loading && hasMore && !searchQuery.trim()"
+        type="button"
+        class="studio-button flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl border border-black/[0.06] text-sm font-medium text-slate-600 hover:bg-slate-100 disabled:cursor-wait disabled:opacity-50 dark:border-white/10 dark:text-stone-300 dark:hover:bg-white/[0.08]"
+        :disabled="loadingMore"
+        data-testid="history-load-more"
+        @click="emit('loadMore')"
+      >
+        <LoaderCircle v-if="loadingMore" class="size-4 animate-spin" />
+        <ArrowDown v-else class="size-4" />
+        {{ loadingMore ? '正在加载' : '加载更早的历史记录' }}
+      </button>
     </div>
   </aside>
 </template>

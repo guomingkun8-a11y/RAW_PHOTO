@@ -721,6 +721,7 @@ function copyPrompt(prompt: string) {
 
 .chat-message-body {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .chat-message-row--assistant {

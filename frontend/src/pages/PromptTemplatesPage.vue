@@ -1,34 +1,25 @@
 <script setup lang="ts">
-import { Archive, LoaderCircle, Pencil, Plus, RefreshCw, Search, Sparkles } from "@lucide/vue";
+import { ArrowRight, LoaderCircle, Pencil, Plus, RefreshCw, Search, Sparkles, Trash2 } from "@lucide/vue";
 import { computed, onMounted, ref } from "vue";
 import { toast } from "vue-sonner";
+import { useRouter } from "vue-router";
 
 import BaseModal from "@/components/BaseModal.vue";
-import { createPromptTemplate, disablePromptTemplate, fetchPromptTemplates, updatePromptTemplate, type PromptTemplate } from "@/lib/api";
-import { IMAGE_MODEL_CATALOG, formatImageModel } from "@/lib/image-models";
+import { createPromptTemplate, deletePromptTemplate, fetchPromptTemplates, updatePromptTemplate, type PromptTemplate } from "@/lib/api";
+import { PROMPT_TEMPLATE_USE_STORAGE_KEY } from "@/lib/storage-namespace";
+import { sessionState } from "@/stores/session";
 
 type Draft = {
   id?: number;
   name: string;
   category: string;
   content: string;
-  model: string;
-  size: string;
-  quality: string;
-  preserve_subject: boolean;
-  enabled: boolean;
 };
 
-const defaultModel = IMAGE_MODEL_CATALOG[0]?.id || "gpt-image-2";
 const emptyDraft = (): Draft => ({
   name: "",
   category: "电商",
   content: "",
-  model: defaultModel,
-  size: "1024x1024",
-  quality: "auto",
-  preserve_subject: false,
-  enabled: true,
 });
 
 const items = ref<PromptTemplate[]>([]);
@@ -37,19 +28,21 @@ const category = ref("all");
 const loading = ref(true);
 const saving = ref(false);
 const editing = ref<Draft | null>(null);
+const router = useRouter();
+const isAdmin = computed(() => sessionState.session?.role === "admin");
 
 const categories = computed(() => Array.from(new Set(items.value.map((item) => item.category).filter(Boolean))));
 const filtered = computed(() => {
   const keyword = query.value.trim().toLowerCase();
   return items.value.filter((item) => (
     category.value === "all" || item.category === category.value
-  ) && (!keyword || [item.name, item.category, item.content, item.model].some((value) => String(value || "").toLowerCase().includes(keyword))));
+  ) && (!keyword || [item.name, item.category, item.content].some((value) => String(value || "").toLowerCase().includes(keyword))));
 });
 
 async function load() {
   loading.value = true;
   try {
-    items.value = (await fetchPromptTemplates({ includeDisabled: true })).items;
+    items.value = (await fetchPromptTemplates()).items;
   } catch (error) {
     toast.error(error instanceof Error ? error.message : "读取模板失败");
   } finally {
@@ -64,11 +57,6 @@ function edit(item?: PromptTemplate) {
         name: item.name,
         category: item.category,
         content: item.content,
-        model: item.model || defaultModel,
-        size: item.size || "1024x1024",
-        quality: item.quality || "auto",
-        preserve_subject: item.preserve_subject,
-        enabled: item.enabled,
       }
     : emptyDraft();
 }
@@ -98,14 +86,20 @@ async function save() {
   }
 }
 
-async function disable(item: PromptTemplate) {
+async function remove(item: PromptTemplate) {
+  if (!window.confirm(`确定删除模板“${item.name}”吗？删除后无法恢复。`)) return;
   try {
-    await disablePromptTemplate(item.id);
+    await deletePromptTemplate(item.id);
     await load();
-    toast.success("模板已停用");
+    toast.success("模板已删除");
   } catch (error) {
-    toast.error(error instanceof Error ? error.message : "停用模板失败");
+    toast.error(error instanceof Error ? error.message : "删除模板失败");
   }
+}
+
+async function useTemplate(item: PromptTemplate) {
+  sessionStorage.setItem(PROMPT_TEMPLATE_USE_STORAGE_KEY, JSON.stringify({ name: item.name, content: item.content }));
+  await router.push({ path: "/image", query: { prompt_template: String(item.id) } });
 }
 
 onMounted(load);
@@ -119,7 +113,7 @@ onMounted(load);
           <div>
             <div class="inline-flex rounded-full bg-[#4F7CFF]/10 px-3 py-1 text-[13px] font-semibold text-[#4F7CFF]">Prompt Assets</div>
             <h1 class="mt-3 text-[30px] font-semibold text-slate-950 dark:text-stone-50">模板中心</h1>
-            <p class="mt-2 text-[15px] leading-7 text-slate-600 dark:text-stone-300">把常用 Prompt、模型、尺寸和主体保真配置沉淀为团队资产。</p>
+            <p class="mt-2 text-[15px] leading-7 text-slate-600 dark:text-stone-300">保存和复用团队常用的提示词模板。</p>
           </div>
           <div class="flex gap-2">
             <button type="button" class="studio-button inline-flex h-11 items-center gap-2 rounded-2xl border border-black/[0.06] bg-white px-4 text-sm dark:border-white/10 dark:bg-white/[0.06]" @click="load">
@@ -136,7 +130,7 @@ onMounted(load);
         <div class="mt-5 grid gap-2 md:grid-cols-[minmax(260px,1fr)_220px]">
           <div class="relative">
             <Search class="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" placeholder="搜索模板名称、分类、Prompt 或模型" />
+            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" placeholder="搜索模板名称、分类或提示词" />
           </div>
           <select v-model="category" class="studio-input h-12 px-3">
             <option value="all">全部分类</option>
@@ -163,32 +157,32 @@ onMounted(load);
             <div>
               <span class="rounded-full bg-[#4F7CFF]/10 px-2.5 py-1 text-[11px] font-semibold text-[#315be8]">{{ item.category }}</span>
               <h2 class="mt-3 text-lg font-semibold text-slate-950 dark:text-stone-50">{{ item.name }}</h2>
+              <p v-if="isAdmin" class="mt-1 text-xs text-slate-500 dark:text-stone-400">创建者：{{ item.owner_name || item.owner_id || "未知用户" }}</p>
             </div>
-            <span class="rounded-full px-2.5 py-1 text-[11px] font-semibold" :class="item.enabled ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300' : 'bg-slate-100 text-slate-500 dark:bg-white/[0.08]'">{{ item.enabled ? '启用' : '停用' }}</span>
           </div>
           <p class="mt-4 line-clamp-2 text-sm leading-6 text-slate-600 dark:text-stone-300">{{ item.content }}</p>
-          <div class="mt-4 flex flex-wrap gap-2 text-[11px] text-slate-500">
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ item.model ? formatImageModel(item.model) : '默认模型' }}</span>
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ item.size || '自动尺寸' }}</span>
-            <span class="rounded-full bg-slate-100 px-2 py-1 dark:bg-white/[0.08]">{{ item.quality || 'auto' }}</span>
-            <span v-if="item.preserve_subject" class="rounded-full bg-[#4F7CFF]/10 px-2 py-1 text-[#315be8]">主体保真</span>
-          </div>
-          <div v-if="item.can_manage" class="mt-auto flex gap-2 pt-5">
-            <button type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 text-xs font-semibold dark:border-white/10" @click="edit(item)">
-              <Pencil class="size-3.5" />
-              编辑
+          <div class="mt-auto flex flex-wrap gap-2 pt-5">
+            <button type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl bg-slate-950 px-3 text-xs font-semibold text-white dark:bg-white dark:text-slate-950" :data-testid="`use-template-${item.id}`" @click="useTemplate(item)">
+              <ArrowRight class="size-3.5" />
+              使用模板
             </button>
-            <button v-if="item.enabled" type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl border border-rose-100 px-3 text-xs font-semibold text-rose-600 dark:border-rose-400/20" @click="disable(item)">
-              <Archive class="size-3.5" />
-              停用
-            </button>
+            <template v-if="item.can_manage">
+              <button type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 text-xs font-semibold dark:border-white/10" @click="edit(item)">
+                <Pencil class="size-3.5" />
+                编辑
+              </button>
+              <button type="button" class="studio-button inline-flex h-9 items-center gap-1.5 rounded-xl border border-rose-100 px-3 text-xs font-semibold text-rose-600 dark:border-rose-400/20" @click="remove(item)">
+                <Trash2 class="size-3.5" />
+                删除
+              </button>
+            </template>
           </div>
         </article>
       </div>
     </div>
   </section>
 
-  <BaseModal :open="Boolean(editing)" :title="editing?.id ? '编辑模板' : '新建模板'" description="模板会同步到图片工作台的模型与画布设置。" width-class="max-w-[760px]" @close="editing = null">
+  <BaseModal :open="Boolean(editing)" :title="editing?.id ? '编辑模板' : '新建模板'" description="模板会同步到图片工作台和画布。" width-class="max-w-[760px]" @close="editing = null">
     <div v-if="editing" class="grid gap-4 p-5">
       <div class="grid gap-4 sm:grid-cols-2">
         <label class="grid gap-1.5 text-sm font-medium">
@@ -199,35 +193,6 @@ onMounted(load);
           分类
           <input v-model="editing.category" class="studio-input h-11 px-3" />
         </label>
-        <label class="grid gap-1.5 text-sm font-medium">
-          模型
-          <select v-model="editing.model" class="studio-input h-11 px-3">
-            <option v-for="model in IMAGE_MODEL_CATALOG" :key="model.id" :value="model.id">{{ model.label }} - {{ model.id }}</option>
-          </select>
-        </label>
-        <label class="grid gap-1.5 text-sm font-medium">
-          尺寸
-          <input v-model="editing.size" class="studio-input h-11 px-3" placeholder="1024x1024" />
-        </label>
-        <label class="grid gap-1.5 text-sm font-medium">
-          质量
-          <select v-model="editing.quality" class="studio-input h-11 px-3">
-            <option value="auto">自动</option>
-            <option value="low">低</option>
-            <option value="medium">中</option>
-            <option value="high">高</option>
-          </select>
-        </label>
-        <div class="flex items-end gap-4 pb-2">
-          <label class="inline-flex items-center gap-2 text-sm">
-            <input v-model="editing.preserve_subject" type="checkbox" class="size-4 accent-[#4F7CFF]" />
-            主体保真
-          </label>
-          <label class="inline-flex items-center gap-2 text-sm">
-            <input v-model="editing.enabled" type="checkbox" class="size-4 accent-[#4F7CFF]" />
-            启用模板
-          </label>
-        </div>
       </div>
       <label class="grid gap-1.5 text-sm font-medium">
         Prompt 内容

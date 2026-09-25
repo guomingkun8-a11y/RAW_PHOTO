@@ -165,6 +165,12 @@
     box-shadow: var(--studio-shadow-strong);
   }
 
+  .studio-card.audio-generation-panel:hover {
+    transform: none;
+    border-color: var(--studio-border);
+    box-shadow: var(--studio-shadow);
+  }
+
   .image-single-page .studio-card:hover {
     transform: none;
     border-color: var(--studio-border);

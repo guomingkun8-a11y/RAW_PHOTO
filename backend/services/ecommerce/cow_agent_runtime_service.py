@@ -42,6 +42,7 @@ from services.ecommerce.prompt_analysis_service import (
     prompt_analysis_model,
     upstream_chat_model,
 )
+from services.billing.chat_usage_attribution import record_chat_attribution
 from services.image.image_task_service import image_task_service
 from services.image.image_storage_service import image_storage_service
 from services.ecommerce.professional_folder_service import FOLDER_MAX_ITEMS, professional_folder_asset_service
@@ -1132,6 +1133,19 @@ def _open_sse_chunks(payload: dict[str, Any], base_url: str, api_key: str):
         raise _response_error(response)
 
     content_type = _clean(response.headers.get("content-type")).lower()
+    response_headers = {
+        str(key).lower(): str(value)
+        for key, value in getattr(response, "headers", {}).items()
+        if str(key).lower() in {"x-task-id", "task-id", "x-request-id", "request-id", "x-trace-id", "trace-id"}
+    }
+    header_task_id = _clean(response_headers.get("x-task-id") or response_headers.get("task-id"), 255)
+    header_request_id = _clean(
+        response_headers.get("x-request-id")
+        or response_headers.get("request-id")
+        or response_headers.get("x-trace-id")
+        or response_headers.get("trace-id"),
+        255,
+    )
     if "text/event-stream" not in content_type:
         try:
             body = response.json()
@@ -1147,12 +1161,25 @@ def _open_sse_chunks(payload: dict[str, Any], base_url: str, api_key: str):
                     "finish_reason": choices[0].get("finish_reason") if choices else "stop",
                 }],
                 "usage": body.get("usage") if isinstance(body, Mapping) else None,
+                "_gmkraw_relay_metadata": {
+                    "upstream_task_id": (
+                        body.get("task_id") or body.get("taskId")
+                        if isinstance(body, Mapping)
+                        else ""
+                    ) or header_task_id,
+                    "upstream_request_id": (
+                        body.get("request_id") or body.get("requestId") or body.get("id")
+                        if isinstance(body, Mapping)
+                        else ""
+                    ) or header_request_id,
+                },
             }
         finally:
             response.close()
         return iter([chunk])
 
     def iterate():
+        metadata_added = False
         try:
             for raw_line in response.iter_lines():
                 line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line or "")
@@ -1166,6 +1193,21 @@ def _open_sse_chunks(payload: dict[str, Any], base_url: str, api_key: str):
                 except json.JSONDecodeError:
                     continue
                 if isinstance(item, dict):
+                    if not metadata_added:
+                        metadata_added = True
+                        item = {
+                            **item,
+                            "_gmkraw_relay_metadata": {
+                                "upstream_task_id": _clean(
+                                    item.get("task_id") or item.get("taskId"),
+                                    255,
+                                ) or header_task_id,
+                                "upstream_request_id": _clean(
+                                    item.get("request_id") or item.get("requestId") or item.get("id"),
+                                    255,
+                                ) or header_request_id,
+                            },
+                        }
                     yield item
         finally:
             response.close()
@@ -1192,10 +1234,11 @@ def _message_text(messages: Iterable[Mapping[str, Any]], fallback: str) -> str:
 
 
 class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
-    def __init__(self, model: str, fresh_context_loader) -> None:
+    def __init__(self, model: str, fresh_context_loader, *, owner_id: str = "") -> None:
         LLMModel.__init__(self, model=model)
         self.channel_type = "web"
         self._fresh_context_loader = fresh_context_loader
+        self._billing_owner_id = _clean(owner_id, "anonymous", 191)
         self.dialogue_calls = 0
         self.vision_calls = 0
         self.estimated_input_chars = 0
@@ -1291,6 +1334,9 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
             "messages": ([{"role": "system", "content": system}] if system else []) + messages,
             "stream": True,
         }
+        billing_user = _clean(self._billing_owner_id, limit=191)
+        if billing_user:
+            payload["user"] = billing_user
         if tools:
             payload["tools"] = tools
             forced_tool_name = self._forced_tool_name or self._next_required_tool(list(request.messages or []))
@@ -1324,14 +1370,35 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
             return _open_sse_chunks(payload, base_url, api_key)
 
         chunks = run_with_relay_pool(_relay_settings(), "cowagent_dialogue", request_once)
-        for chunk in chunks:
-            if isinstance(chunk, Mapping):
-                choices = chunk.get("choices")
-                if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
-                    delta = choices[0].get("delta")
-                    if isinstance(delta, Mapping):
-                        self.estimated_output_chars += len(_clean(delta.get("content")))
-            yield chunk
+        attribution: dict[str, object] = {}
+        try:
+            for chunk in chunks:
+                if isinstance(chunk, Mapping):
+                    metadata = chunk.get("_gmkraw_relay_metadata")
+                    if isinstance(metadata, Mapping):
+                        attribution.update(dict(metadata))
+                    if not attribution.get("upstream_task_id"):
+                        attribution["upstream_task_id"] = _clean(
+                            chunk.get("task_id") or chunk.get("taskId"),
+                            255,
+                        )
+                    if not attribution.get("upstream_request_id"):
+                        attribution["upstream_request_id"] = _clean(chunk.get("request_id") or chunk.get("requestId") or chunk.get("id"), 255)
+                    choices = chunk.get("choices")
+                    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+                        delta = choices[0].get("delta")
+                        if isinstance(delta, Mapping):
+                            self.estimated_output_chars += len(_clean(delta.get("content")))
+                yield chunk
+        finally:
+            record_chat_attribution(
+                owner_id=self._billing_owner_id,
+                requested_model=self.model,
+                local_source="cowagent_dialogue",
+                upstream_task_id=attribution.get("upstream_task_id"),
+                upstream_request_id=attribution.get("upstream_request_id"),
+                response=attribution,
+            )
 
     def analyze_image(self, data_url: str, question: str) -> str:
         payload = {
@@ -1371,6 +1438,22 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
                 raise RuntimeError("vision model returned an empty response")
             clean_content = _clean(content, limit=12000)
             self.estimated_output_chars += len(clean_content)
+            response_headers = {
+                str(key).lower(): str(value)
+                for key, value in getattr(response, "headers", {}).items()
+                if str(key).lower() in {"x-task-id", "task-id", "x-request-id", "request-id", "x-trace-id", "trace-id"}
+            }
+            relay_metadata = {
+                "upstream_task_id": body.get("task_id") or body.get("taskId") or response_headers.get("x-task-id") or response_headers.get("task-id"),
+                "upstream_request_id": body.get("request_id") or body.get("requestId") or body.get("id") or response_headers.get("x-request-id") or response_headers.get("request-id") or response_headers.get("x-trace-id") or response_headers.get("trace-id"),
+                "headers": response_headers,
+            }
+            record_chat_attribution(
+                owner_id=self._billing_owner_id,
+                requested_model=self.model,
+                local_source="cowagent_vision",
+                response={**body, "_gmkraw_relay_metadata": relay_metadata},
+            )
             return clean_content
 
         return run_with_relay_pool(_relay_settings(), "cowagent_vision", request_once)
@@ -1828,6 +1911,7 @@ class CowAgentRunRuntime:
         self.model = RawCowLLMModel(
             prompt_analysis_model(_clean(run.request.get("planner_model"), limit=160)),
             self.fresh_context,
+            owner_id=self.owner_id,
         )
 
     def _build_memory_manager(self):
@@ -4175,6 +4259,7 @@ class CowAgentRunRuntime:
                     "height": data.get("height") if isinstance(data.get("height"), int) else None,
                     "requestedSize": data.get("requested_size") or self.run.request.get("size"),
                     "aspectRatioCorrected": bool(data.get("aspect_ratio_corrected")),
+                    "cost": task.get("cost"),
                 })
             if task_image_count == 0:
                 empty_successes += 1
@@ -4716,6 +4801,7 @@ class CowAgentRunRuntime:
                     "height": item.get("height") if isinstance(item.get("height"), int) else None,
                     "requestedSize": item.get("requested_size") or self.run.request.get("size"),
                     "aspectRatioCorrected": bool(item.get("aspect_ratio_corrected")),
+                    "cost": task.get("cost"),
                 })
         self.generated_images.extend(images)
         return {"status": "completed", "images": images, "count": len(images)}
@@ -4810,6 +4896,7 @@ class CowAgentRunRuntime:
                     "height": item.get("height") if isinstance(item.get("height"), int) else None,
                     "requestedSize": item.get("requested_size") or self.run.request.get("size"),
                     "aspectRatioCorrected": bool(item.get("aspect_ratio_corrected")),
+                    "cost": task.get("cost"),
                 })
         self.generated_images.extend(images)
         self.image_generation_calls += len(task_ids)

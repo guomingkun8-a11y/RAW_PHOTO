@@ -120,7 +120,13 @@ class ImageTaskEventModel(EnterpriseBase):
 class ImageAssetModel(EnterpriseBase):
     __tablename__ = "image_assets"
     __table_args__ = (
-        UniqueConstraint("task_id", "image_index", name="uq_image_asset_task_index"),
+        UniqueConstraint(
+            "owner_id",
+            "task_id",
+            "asset_type",
+            "image_index",
+            name="uq_image_asset_owner_task_type_index",
+        ),
         Index("ix_image_asset_owner_created", "owner_id", "created_at"),
         Index("ix_image_asset_batch", "batch_id", "image_index"),
     )
@@ -129,7 +135,7 @@ class ImageAssetModel(EnterpriseBase):
     task_id = Column(String(191), nullable=False)
     batch_id = Column(String(191), nullable=False)
     owner_id = Column(String(191), nullable=False)
-    image_index = Column(Integer, nullable=False, default=0)
+    image_index = Column(String(191), nullable=False, default="0")
     asset_type = Column(String(32), nullable=False, default="generated")
     storage_provider = Column(String(64), nullable=False)
     object_key = Column(String(1024), nullable=False)

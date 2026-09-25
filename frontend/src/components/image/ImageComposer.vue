@@ -1298,6 +1298,7 @@ watch(promptEngineMode, () => {
   z-index: 2;
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   margin-bottom: 0.75rem;
@@ -1306,6 +1307,7 @@ watch(promptEngineMode, () => {
 .composer-reference-strip {
   display: flex;
   min-width: 0;
+  max-width: 100%;
   flex: none;
   gap: 0.5rem;
   overflow-x: auto;

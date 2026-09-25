@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   Activity,
+  AudioLines,
   Bell,
   Camera,
   Clock3,
@@ -12,6 +13,7 @@ import {
   LogOut,
   Menu,
   Moon,
+  PanelsTopLeft,
   PanelLeftClose,
   PanelLeftOpen,
   ReceiptText,
@@ -19,17 +21,18 @@ import {
   Sun,
   UserRound,
   Users,
+  Video,
   WandSparkles,
   X,
 } from "@lucide/vue";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
-import { changePassword, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, updateCurrentUserProfile, uploadAvatar, type SystemAnnouncement } from "@/lib/api";
+import { changePassword, fetchImageConversationCount, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, streamRealtimeEvents, updateCurrentUserProfile, uploadAvatar, type RealtimeEvent, type SystemAnnouncement } from "@/lib/api";
+import { storageKey } from "@/lib/storage-namespace";
 import { clearStoredAuthSession, setStoredAuthSession } from "@/stores/auth";
-import { listImageConversations } from "@/stores/image-conversations";
 import { sessionState, setSession } from "@/stores/session";
 
 const route = useRoute();
@@ -40,6 +43,7 @@ const showNotifications = ref(false);
 const announcements = ref<SystemAnnouncement[]>([]);
 const announcementsLoading = ref(false);
 const announcementsLoadedAt = ref(0);
+const announcementUnread = ref(false);
 const showUserMenu = ref(false);
 const isDark = ref(document.documentElement.classList.contains("dark"));
 const passwordOpen = ref(false);
@@ -58,26 +62,43 @@ const profileSaving = ref(false);
 const avatarInput = ref<HTMLInputElement | null>(null);
 const avatarUploading = ref(false);
 let taskTimer = 0;
+let announcementSyncTimer = 0;
 let taskCountLoadedAt = 0;
 let taskCountPromise: Promise<void> | null = null;
 let passwordClearTimers: number[] = [];
+let realtimeController: AbortController | null = null;
+let realtimeReconnectTimer = 0;
+let realtimeReconnectAttempt = 0;
+let realtimeStopped = false;
 const TASK_COUNT_CACHE_MS = 30_000;
 const ANNOUNCEMENT_CACHE_MS = 60_000;
-const SIDEBAR_COLLAPSED_STORAGE_KEY = "gmkraw:studio_sidebar_collapsed";
+const ANNOUNCEMENT_SYNC_INTERVAL_MS = 10_000;
+const SIDEBAR_COLLAPSED_STORAGE_KEY = storageKey("gmkraw:studio_sidebar_collapsed");
+const THEME_STORAGE_KEY = storageKey("gmkraw-theme");
 const sidebarCollapsed = ref(localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true");
+const contentRoot = ref<HTMLElement | null>(null);
+const contentInsetTransitioning = ref(false);
+let routeAnimation: Animation | null = null;
+let contentInsetTransitionTimer = 0;
 
 const navItems = [
   { href: "/image", label: "图片生成", detail: "AI 创作台", icon: WandSparkles },
+  { href: "/video-generation", label: "视频生成", detail: "文生视频 / 图生视频", icon: Video },
+  { href: "/audio-generation", label: "音频生成", detail: "音频创作", icon: AudioLines },
+  { href: "/infinite-canvas", label: "无限画布", detail: "图片与视频生成", icon: PanelsTopLeft },
   { href: "/prompt-templates", label: "模板中心", detail: "提示词资产", icon: Sparkles },
-  { href: "/image-library", label: "历史图库", detail: "瀑布流资产", icon: Library },
+  { href: "/image-library", label: "历史", detail: "图片、视频与音频资产", icon: Library },
   { href: "/monitoring", label: "监控看板", detail: "运行状态", icon: Activity, adminOnly: true },
   { href: "/costs", label: "费用记录", detail: "模型与用户费用", icon: ReceiptText, adminOnly: true },
   { href: "/users", label: "成员权限", detail: "团队管理", icon: Users, adminOnly: true },
-  { href: "/image?history=1", activePath: "/image", activeQuery: { history: "1" }, label: "生成历史记录", detail: "全部生成任务", icon: History },
+  { href: "/image?history=1", activePath: "/image", activeQuery: { history: "1" }, label: "生成记录", detail: "图片、视频与音频任务", icon: History },
 ];
 
 const visibleNavItems = computed(() => navItems.filter((item) => !item.adminOnly || sessionState.session?.role === "admin"));
-const contentInsetClass = computed(() => sidebarCollapsed.value ? "lg:pl-0" : "lg:pl-[var(--studio-content-left)]");
+const isFullscreenRoute = computed(() => route.meta.fullscreen === true);
+const contentInsetClass = computed(() => (
+  isFullscreenRoute.value || sidebarCollapsed.value ? "lg:pl-0" : "lg:pl-[var(--studio-content-left)]"
+));
 const userInitial = computed(() => {
   const source = sessionState.session?.name || sessionState.session?.username || "U";
   return source.trim().slice(0, 1).toUpperCase();
@@ -101,7 +122,7 @@ async function loadTaskCount(force = false) {
   if (taskCountPromise) return taskCountPromise;
   taskCountPromise = (async () => {
     try {
-      taskCount.value = (await listImageConversations()).length;
+      taskCount.value = (await fetchImageConversationCount()).count;
       taskCountLoadedAt = Date.now();
     } catch {
       taskCount.value = 0;
@@ -137,9 +158,50 @@ async function loadAnnouncements(force = false) {
   }
 }
 
+function applyRealtimeAnnouncement(item: SystemAnnouncement) {
+  if (!item || typeof item.id !== "number") return;
+  if (!item.enabled) {
+    announcements.value = announcements.value.filter((current) => current.id !== item.id);
+  } else {
+    announcements.value = [item, ...announcements.value.filter((current) => current.id !== item.id)]
+      .sort((left, right) => String(right.updated_at || right.created_at).localeCompare(String(left.updated_at || left.created_at)))
+      .slice(0, 5);
+  }
+  announcementsLoadedAt.value = Date.now();
+  announcementUnread.value = true;
+}
+
+function scheduleRealtimeReconnect() {
+  if (realtimeStopped || realtimeReconnectTimer) return;
+  const delay = Math.min(30000, 3000 * (2 ** Math.min(realtimeReconnectAttempt, 3)));
+  realtimeReconnectAttempt += 1;
+  realtimeReconnectTimer = window.setTimeout(() => {
+    realtimeReconnectTimer = 0;
+    void connectRealtimeEvents();
+  }, delay);
+}
+
+async function connectRealtimeEvents() {
+  if (realtimeStopped || realtimeController) return;
+  const controller = new AbortController();
+  realtimeController = controller;
+  try {
+    await streamRealtimeEvents((event: RealtimeEvent) => {
+      if (event.type === "announcement") applyRealtimeAnnouncement(event.data);
+    }, { signal: controller.signal });
+    realtimeReconnectAttempt = 0;
+  } catch {
+    if (!controller.signal.aborted) scheduleRealtimeReconnect();
+  } finally {
+    if (realtimeController === controller) realtimeController = null;
+    if (!controller.signal.aborted) scheduleRealtimeReconnect();
+  }
+}
+
 function toggleNotifications() {
   showNotifications.value = !showNotifications.value;
   showUserMenu.value = false;
+  if (showNotifications.value) announcementUnread.value = false;
   if (showNotifications.value) void loadAnnouncements();
 }
 
@@ -154,12 +216,18 @@ function announcementDotClass(type: string) {
 function toggleTheme() {
   isDark.value = !isDark.value;
   document.documentElement.classList.toggle("dark", isDark.value);
-  localStorage.setItem("gmkraw-theme", isDark.value ? "dark" : "light");
+  localStorage.setItem(THEME_STORAGE_KEY, isDark.value ? "dark" : "light");
 }
 
 function toggleSidebarCollapsed() {
+  window.clearTimeout(contentInsetTransitionTimer);
+  contentInsetTransitioning.value = true;
   sidebarCollapsed.value = !sidebarCollapsed.value;
   localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed.value ? "true" : "false");
+  contentInsetTransitionTimer = window.setTimeout(() => {
+    contentInsetTransitioning.value = false;
+    contentInsetTransitionTimer = 0;
+  }, 320);
 }
 
 async function handleLogout() {
@@ -350,35 +418,72 @@ async function submitPasswordChange() {
   }
 }
 
-watch(() => route.fullPath, () => {
+function playRouteTransition() {
+  const element = contentRoot.value;
+  if (!element || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  routeAnimation?.cancel();
+
+  const animation = element.animate(
+    [{ opacity: 0.95 }, { opacity: 1 }],
+    {
+      duration: 140,
+      easing: "cubic-bezier(0.25, 1, 0.5, 1)",
+    },
+  );
+  routeAnimation = animation;
+  animation.addEventListener("finish", () => {
+    if (routeAnimation === animation) routeAnimation = null;
+  }, { once: true });
+}
+
+watch(() => route.fullPath, async () => {
+  window.clearTimeout(contentInsetTransitionTimer);
+  contentInsetTransitionTimer = 0;
+  contentInsetTransitioning.value = false;
   mobileOpen.value = false;
   showNotifications.value = false;
   showUserMenu.value = false;
   void refreshTaskCountSoon();
+  await nextTick();
+  playRouteTransition();
 });
 
 onMounted(() => {
+  realtimeStopped = false;
   void loadTaskCount(true);
   void loadAnnouncements(true);
+  void connectRealtimeEvents();
   taskTimer = window.setInterval(() => void loadTaskCount(true), 30000);
+  announcementSyncTimer = window.setInterval(() => void loadAnnouncements(true), ANNOUNCEMENT_SYNC_INTERVAL_MS);
 });
 
-onBeforeUnmount(() => window.clearInterval(taskTimer));
 onBeforeUnmount(() => {
+  window.clearInterval(taskTimer);
+  window.clearInterval(announcementSyncTimer);
+  announcementSyncTimer = 0;
+});
+onBeforeUnmount(() => {
+  realtimeStopped = true;
+  if (realtimeReconnectTimer) window.clearTimeout(realtimeReconnectTimer);
+  realtimeReconnectTimer = 0;
+  realtimeController?.abort();
+  realtimeController = null;
+  routeAnimation?.cancel();
+  window.clearTimeout(contentInsetTransitionTimer);
   passwordClearTimers.forEach((timer) => window.clearTimeout(timer));
 });
 </script>
 
 <template>
-  <div class="min-h-[100dvh] bg-[#F8FAFC] dark:bg-[#0f1115]" :class="{ 'studio-shell-sidebar-collapsed': sidebarCollapsed }">
+  <div class="min-h-[100dvh] bg-[#F8FAFC] dark:bg-[#0f1115]" :class="{ 'studio-shell-sidebar-collapsed': sidebarCollapsed || isFullscreenRoute }">
     <header class="sticky top-0 z-40 flex h-[var(--studio-nav-height)] items-center border-b border-black/[0.06] bg-[#F8FAFC]/88 px-4 backdrop-blur-2xl dark:border-white/10 dark:bg-[#0f1115]/84 sm:px-5">
       <div class="mx-auto grid h-14 w-full max-w-[1680px] grid-cols-[auto_1fr_auto] items-center gap-3">
         <div class="flex min-w-0 items-center gap-3">
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:hidden" aria-label="打开导航" @click="mobileOpen = !mobileOpen">
+          <button v-if="!isFullscreenRoute" type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:hidden" aria-label="打开导航" @click="mobileOpen = !mobileOpen">
             <X v-if="mobileOpen" class="size-5" />
             <Menu v-else class="size-5" />
           </button>
-          <button type="button" class="studio-button hidden size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:inline-flex" :aria-label="sidebarCollapsed ? '展开导航' : '收起导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" data-testid="studio-sidebar-toggle" @click="toggleSidebarCollapsed">
+          <button v-if="!isFullscreenRoute" type="button" class="studio-button hidden size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-700 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 lg:inline-flex" :aria-label="sidebarCollapsed ? '展开导航' : '收起导航'" :title="sidebarCollapsed ? '展开导航' : '收起导航'" data-testid="studio-sidebar-toggle" @click="toggleSidebarCollapsed">
             <PanelLeftOpen v-if="sidebarCollapsed" class="size-5" />
             <PanelLeftClose v-else class="size-5" />
           </button>
@@ -396,6 +501,7 @@ onBeforeUnmount(() => {
         <div class="relative flex min-w-0 items-center justify-end gap-2">
           <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" @click="toggleNotifications">
             <Bell class="size-4" />
+            <span v-if="announcementUnread" class="pointer-events-none absolute left-6 top-1.5 size-2 rounded-full bg-rose-500 ring-2 ring-white dark:ring-[#0f1115]" />
           </button>
           <div v-if="showNotifications" class="absolute right-24 top-12 z-50 w-[320px] rounded-2xl border border-black/[0.06] bg-white p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] dark:border-white/10 dark:bg-[#171a21]">
             <div class="px-2 pb-2 pt-1 text-xs font-semibold text-slate-500 dark:text-stone-400">更新公告</div>
@@ -466,7 +572,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <aside class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl transition-[transform,opacity] duration-300 ease-[var(--studio-ease)] dark:border-white/10 dark:bg-white/[0.055] lg:flex" :class="sidebarCollapsed ? 'pointer-events-none -translate-x-[260px] opacity-0' : 'translate-x-0 opacity-100'">
+    <aside v-if="!isFullscreenRoute" data-testid="studio-sidebar" class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl transition-[transform,opacity] duration-300 ease-[var(--studio-ease)] dark:border-white/10 dark:bg-white/[0.055] lg:flex" :class="sidebarCollapsed ? 'pointer-events-none -translate-x-[260px] opacity-0' : 'translate-x-0 opacity-100'">
       <nav class="flex flex-col gap-2">
         <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="group relative flex min-h-[58px] items-center gap-3 rounded-2xl border px-3.5 py-3 text-left transition" :class="isActive(item) ? 'border-[#4F7CFF]/20 bg-[#4F7CFF]/10 text-slate-950 shadow-[0_8px_18px_rgba(79,124,255,0.12)] dark:text-white' : 'border-transparent text-slate-600 hover:border-black/[0.04] hover:bg-[#4F7CFF]/[0.08] hover:text-slate-950 dark:text-stone-300 dark:hover:border-white/10 dark:hover:text-white'">
           <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="isActive(item) ? 'bg-[#4F7CFF] text-white' : 'bg-slate-100 text-slate-600 dark:bg-white/[0.07] dark:text-stone-300'"><component :is="item.icon" class="size-4" /></span>
@@ -475,13 +581,26 @@ onBeforeUnmount(() => {
       </nav>
     </aside>
 
-    <div v-if="mobileOpen" class="fixed inset-x-3 top-[86px] z-50 rounded-[20px] border border-black/[0.06] bg-white p-3 shadow-[0_24px_70px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21] lg:hidden">
+    <div v-if="mobileOpen && !isFullscreenRoute" class="fixed inset-x-3 top-[86px] z-50 rounded-[20px] border border-black/[0.06] bg-white p-3 shadow-[0_24px_70px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21] lg:hidden">
       <nav class="flex flex-col gap-2">
         <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="flex items-center gap-3 rounded-2xl px-3.5 py-3 text-slate-700 hover:bg-[#4F7CFF]/10 dark:text-stone-200" :class="isActive(item) ? 'bg-[#4F7CFF]/10 text-slate-950 dark:text-white' : ''"><component :is="item.icon" class="size-4" />{{ item.label }}</RouterLink>
       </nav>
     </div>
 
-    <div class="relative z-10 min-h-[calc(100dvh_-_var(--studio-nav-height))] transition-[padding] duration-300 ease-[var(--studio-ease)]" :class="contentInsetClass" data-testid="studio-content"><slot /></div>
+    <div
+      ref="contentRoot"
+      class="relative z-10 min-h-[calc(100dvh_-_var(--studio-nav-height))]"
+      :class="[
+        contentInsetClass,
+        contentInsetTransitioning && !isFullscreenRoute
+          ? 'transition-[padding] duration-300 ease-[var(--studio-ease)]'
+          : 'transition-none',
+      ]"
+      data-route-transition="fade"
+      data-testid="studio-content"
+    >
+      <slot />
+    </div>
 
     <BaseModal :open="passwordOpen" title="修改密码" description="修改后当前登录会失效，需要使用新密码重新登录。" width-class="max-w-[440px]" :show-close="!passwordSaving" @close="closePasswordModal">
       <form class="space-y-4 p-5" @submit.prevent="submitPasswordChange">

@@ -1,18 +1,25 @@
 <script setup lang="ts">
 import {
+  AudioLines,
   CalendarDays,
   ChevronLeft,
   ChevronRight,
   Download,
+  Images,
+  Layers3,
+  MessageSquareText,
   RefreshCw,
   ReceiptText,
   Search,
+  Video,
 } from "@lucide/vue";
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import AnimatedNumber from "@/components/AnimatedNumber.vue";
+import { useVisibilityAwareInterval } from "@/composables/useVisibilityAwareInterval";
+import UpstreamBillingPanel from "@/features/billing/UpstreamBillingPanel.vue";
 import {
   fetchMonitoringSummary,
   fetchMonitoringTasks,
@@ -20,10 +27,14 @@ import {
   type MonitoringSummary,
   type MonitoringTaskDetail,
   type MonitoringTaskDetails,
+  type MonitoringSource,
   type MonitoringUserStat,
+  type UpstreamBillingSource,
 } from "@/lib/api";
+import { storageKey } from "@/lib/storage-namespace";
 
 type RangePreset = "today" | "7d" | "30d" | "all" | "custom";
+type UpstreamBillingPanelApi = { refresh: (silent?: boolean) => Promise<void> };
 
 const route = useRoute();
 const router = useRouter();
@@ -36,11 +47,17 @@ const lastUpdated = ref("");
 const autoRefresh = ref(true);
 const taskQuery = ref("");
 const costRecordPage = ref(1);
-let refreshTimer = 0;
+const costRecordCursors = ref<Array<MonitoringTaskDetails["next_cursor"]>>([null]);
+const upstreamBillingPanel = ref<UpstreamBillingPanelApi | null>(null);
+const upstreamLoading = ref(false);
 let requestSequence = 0;
+let taskQueryTimer = 0;
 const COST_RECORD_PAGE_SIZE = 20;
+const COSTS_AUTO_REFRESH_STORAGE_KEY = storageKey("raw-costs-auto-refresh");
+const { restart: restartAutoRefresh } = useVisibilityAwareInterval(() => load(true), 15_000);
 
 const rangePreset = ref<RangePreset>("today");
+const costSource = ref<UpstreamBillingSource>("all");
 const customStartDate = ref("");
 const customEndDate = ref("");
 const appliedRange = ref<{ startAt?: string; endAt?: string }>({});
@@ -53,6 +70,33 @@ const rangePresets: Array<{ value: RangePreset; label: string }> = [
   { value: "all", label: "全部" },
   { value: "custom", label: "自定义" },
 ];
+
+const sourceOptions = [
+  { value: "all" as const, label: "全部账单", icon: Layers3 },
+  { value: "image" as const, label: "生图费用", icon: Images },
+  { value: "video" as const, label: "生视频费用", icon: Video },
+  { value: "chat" as const, label: "对话费用", icon: MessageSquareText },
+  { value: "audio" as const, label: "音频费用", icon: AudioLines },
+];
+
+const isUpstreamCostSource = computed(() => ["all", "chat", "audio"].includes(costSource.value));
+const pageBusy = computed(() => isUpstreamCostSource.value
+  ? upstreamLoading.value
+  : loading.value || refreshing.value);
+const upstreamSyncDays = computed(() => {
+  if (rangePreset.value === "today") return 1;
+  if (rangePreset.value === "7d") return 7;
+  if (rangePreset.value === "30d" || rangePreset.value === "all") return 30;
+  const start = new Date(`${customStartDate.value}T00:00:00`);
+  const end = new Date(`${customEndDate.value}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 2;
+  return Math.min(30, Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86_400_000) + 1));
+});
+const upstreamPanelKey = computed(() => [
+  costSource.value,
+  appliedRange.value.startAt || "",
+  appliedRange.value.endAt || "",
+].join(":"));
 
 const numberFormat = new Intl.NumberFormat("zh-CN");
 const costFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 });
@@ -74,10 +118,6 @@ function hasCost(value: unknown) {
 
 function formatCost(value: unknown, fallback = "0") {
   return hasCost(value) ? `￥${costFormat.format(numericCost(value))}` : fallback === "0" ? "￥0" : fallback;
-}
-
-function itemCostLabel(item: MonitoringTaskDetail) {
-  return hasCost(item.cost) ? formatCost(item.cost) : "待返回";
 }
 
 function formatPercent(value: number) {
@@ -116,7 +156,12 @@ function isValidRangePreset(value: unknown): value is RangePreset {
   return ["today", "7d", "30d", "all", "custom"].includes(String(value));
 }
 
+function isValidCostSource(value: unknown): value is UpstreamBillingSource {
+  return ["all", "image", "video", "chat", "audio"].includes(String(value));
+}
+
 function restoreRangeFromUrl() {
+  costSource.value = isValidCostSource(route.query.source) ? route.query.source : "all";
   const preset = String(route.query.range || "today");
   rangePreset.value = isValidRangePreset(preset) ? preset : "today";
   if (rangePreset.value !== "custom") return;
@@ -125,7 +170,7 @@ function restoreRangeFromUrl() {
 }
 
 function syncRangeUrl() {
-  const nextQuery = { ...route.query, range: rangePreset.value } as Record<string, string | undefined>;
+  const nextQuery = { ...route.query, range: rangePreset.value, source: costSource.value } as Record<string, string | undefined>;
   if (rangePreset.value === "custom") {
     nextQuery.start = customStartDate.value;
     nextQuery.end = customEndDate.value;
@@ -134,6 +179,25 @@ function syncRangeUrl() {
     delete nextQuery.end;
   }
   void router.replace({ query: nextQuery });
+}
+
+function sourceTitle() {
+  return {
+    all: "全部模型",
+    image: "生图",
+    video: "生视频",
+    chat: "对话",
+    audio: "音频",
+  }[costSource.value];
+}
+
+function selectCostSource(value: UpstreamBillingSource) {
+  if (costSource.value === value) return;
+  costSource.value = value;
+  taskQuery.value = "";
+  resetCostRecordPagination();
+  syncRangeUrl();
+  void load(false);
 }
 
 function rangeForSelection() {
@@ -166,18 +230,44 @@ function selectedRange() {
   return appliedRange.value;
 }
 
+function resetCostRecordPagination() {
+  costRecordPage.value = 1;
+  costRecordCursors.value = [null];
+}
+
 async function load(silent = false) {
+  if (isUpstreamCostSource.value) {
+    await nextTick();
+    await upstreamBillingPanel.value?.refresh(silent);
+    return;
+  }
   const sequence = ++requestSequence;
+  const requestedPage = costRecordPage.value;
+  const cursor = requestedPage === 1 ? null : costRecordCursors.value[requestedPage - 1];
+  if (cursor === undefined) {
+    resetCostRecordPagination();
+    return load(silent);
+  }
   silent ? (refreshing.value = true) : (loading.value = true);
   try {
     const range = selectedRange();
     const [nextSummary, nextDetails] = await Promise.all([
-      fetchMonitoringSummary(range),
-      fetchMonitoringTasks({ ...range, status: "success", limit: 500 }),
+      fetchMonitoringSummary({ ...range, source: costSource.value as MonitoringSource }),
+      fetchMonitoringTasks({
+        ...range,
+        source: costSource.value as MonitoringSource,
+        status: costSource.value === "video" ? "all" : "success",
+        limit: COST_RECORD_PAGE_SIZE,
+        cursor,
+        q: taskQuery.value,
+        costOnly: true,
+      }),
     ]);
     if (sequence !== requestSequence) return;
     summary.value = nextSummary;
     details.value = nextDetails;
+    costRecordCursors.value = costRecordCursors.value.slice(0, requestedPage);
+    if (nextDetails.next_cursor) costRecordCursors.value[requestedPage] = nextDetails.next_cursor;
     loadError.value = "";
     lastUpdated.value = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   } catch (error) {
@@ -193,6 +283,7 @@ async function load(silent = false) {
 
 function selectRangePreset(value: RangePreset) {
   rangePreset.value = value;
+  resetCostRecordPagination();
   if (value === "custom") {
     if (!customStartDate.value) customStartDate.value = toLocalDateValue(startOfToday());
     if (!customEndDate.value) customEndDate.value = toLocalDateValue(startOfToday());
@@ -212,24 +303,28 @@ function applyCustomRange() {
     toast.error("结束日期不能早于开始日期");
     return;
   }
+  resetCostRecordPagination();
   commitRangeSelection();
   syncRangeUrl();
   void load(true);
 }
 
-function restartRefreshTimer() {
-  window.clearInterval(refreshTimer);
-  refreshTimer = autoRefresh.value ? window.setInterval(() => void load(true), 15_000) : 0;
+function scheduleTaskQueryLoad() {
+  window.clearTimeout(taskQueryTimer);
+  taskQueryTimer = window.setTimeout(() => {
+    resetCostRecordPagination();
+    void load(true);
+  }, 300);
 }
 
 function toggleAutoRefresh() {
   autoRefresh.value = !autoRefresh.value;
   try {
-    window.localStorage.setItem("raw-costs-auto-refresh", String(autoRefresh.value));
+    window.localStorage.setItem(COSTS_AUTO_REFRESH_STORAGE_KEY, String(autoRefresh.value));
   } catch {
     // Local storage can be unavailable in private or embedded browser contexts.
   }
-  restartRefreshTimer();
+  restartAutoRefresh(autoRefresh.value);
 }
 
 function modelCostShare(item: MonitoringModelStat) {
@@ -240,18 +335,6 @@ function modelCostShare(item: MonitoringModelStat) {
 function ownerName(ownerId: string) {
   const owner = summary.value?.users.find((item) => item.user_id === ownerId);
   return owner?.name || owner?.username || ownerId;
-}
-
-function taskMatchesQuery(item: MonitoringTaskDetail, keyword: string) {
-  return [
-    item.task_id,
-    item.owner_id,
-    item.model,
-    item.mode,
-    item.upstream_task_id,
-    item.source_type,
-    ownerName(item.owner_id),
-  ].some((value) => String(value || "").toLowerCase().includes(keyword));
 }
 
 function csvCell(value: unknown) {
@@ -313,29 +396,23 @@ const userCosts = computed<MonitoringUserStat[]>(() =>
     .filter((item) => Number(item.cost_count || 0) > 0)
     .sort((a, b) => numericCost(b.cost_total) - numericCost(a.cost_total)),
 );
-const costItems = computed<MonitoringTaskDetail[]>(() =>
-  (details.value?.items || []).filter((item) => hasCost(item.cost)),
-);
-const filteredCostItems = computed(() => {
-  const keyword = taskQuery.value.trim().toLowerCase();
-  return keyword ? costItems.value.filter((item) => taskMatchesQuery(item, keyword)) : costItems.value;
-});
-const costRecordTotalPages = computed(() => Math.max(1, Math.ceil(filteredCostItems.value.length / COST_RECORD_PAGE_SIZE)));
+const costItems = computed<MonitoringTaskDetail[]>(() => details.value?.items || []);
+const filteredCostItems = computed(() => costItems.value.filter((item) => hasCost(item.cost)));
+const costRecordTotalPages = computed(() => Math.max(1, Math.ceil((details.value?.record_count || 0) / COST_RECORD_PAGE_SIZE)));
 const costRecordPageStart = computed(() => filteredCostItems.value.length ? (costRecordPage.value - 1) * COST_RECORD_PAGE_SIZE + 1 : 0);
-const costRecordPageEnd = computed(() => Math.min(costRecordPage.value * COST_RECORD_PAGE_SIZE, filteredCostItems.value.length));
-const paginatedCostItems = computed(() =>
-  filteredCostItems.value.slice(
-    (costRecordPage.value - 1) * COST_RECORD_PAGE_SIZE,
-    costRecordPage.value * COST_RECORD_PAGE_SIZE,
-  ),
-);
+const costRecordPageEnd = computed(() => (costRecordPage.value - 1) * COST_RECORD_PAGE_SIZE + filteredCostItems.value.length);
+const paginatedCostItems = computed(() => filteredCostItems.value);
 
 function goToCostRecordPage(page: number) {
-  costRecordPage.value = Math.min(costRecordTotalPages.value, Math.max(1, page));
+  const nextPage = Math.min(costRecordTotalPages.value, Math.max(1, page));
+  if (nextPage === costRecordPage.value || loading.value || refreshing.value) return;
+  costRecordPage.value = nextPage;
+  void load(true);
 }
 
 function sourceLabel(item: MonitoringTaskDetail) {
-  return item.source_type === "event" ? "事件" : "生图";
+  if (item.source_type === "video") return "生视频";
+  return item.source_type === "event" ? "生图记录" : "生图";
 }
 
 function upstreamLabel(item: MonitoringTaskDetail) {
@@ -350,23 +427,27 @@ onMounted(() => {
   }
   commitRangeSelection();
   try {
-    autoRefresh.value = window.localStorage.getItem("raw-costs-auto-refresh") !== "false";
+    autoRefresh.value = window.localStorage.getItem(COSTS_AUTO_REFRESH_STORAGE_KEY) !== "false";
   } catch {
     autoRefresh.value = true;
   }
   void load();
-  restartRefreshTimer();
+  restartAutoRefresh(autoRefresh.value);
 });
 
 watch(taskQuery, () => {
-  costRecordPage.value = 1;
+  scheduleTaskQueryLoad();
 });
 
 watch(costRecordTotalPages, (totalPages) => {
-  if (costRecordPage.value > totalPages) costRecordPage.value = totalPages;
+  if (costRecordPage.value > totalPages) {
+    resetCostRecordPagination();
+    void load(true);
+  }
 });
 
-onBeforeUnmount(() => window.clearInterval(refreshTimer));
+onBeforeUnmount(() => window.clearTimeout(taskQueryTimer));
+
 </script>
 
 <template>
@@ -381,8 +462,27 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
             </div>
             <h1 class="mt-2 text-[30px] font-semibold text-slate-950 dark:text-stone-50">费用记录</h1>
             <p class="mt-1 max-w-3xl text-[15px] leading-7 text-slate-600 dark:text-stone-300">
-              查看 {{ appliedRangeLabel }} 内所有已完成生图任务的实际费用。
+              <template v-if="isUpstreamCostSource">
+                查看 {{ appliedRangeLabel }} 内 {{ sourceTitle() }} 的上游实际扣费、失败与退款记录。
+              </template>
+              <template v-else>
+                查看 {{ appliedRangeLabel }} 内所有已完成{{ sourceTitle() }}任务的本地费用记录。
+              </template>
             </p>
+            <div class="mt-3 inline-flex max-w-full overflow-x-auto rounded-xl bg-[#F1F5F9] p-1 dark:bg-white/[0.06]" aria-label="费用来源">
+              <button
+                v-for="option in sourceOptions"
+                :key="option.value"
+                type="button"
+                class="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg px-3 text-[13px] font-medium text-slate-500 transition-colors"
+                :class="costSource === option.value ? 'bg-white text-[#315be8] shadow-sm dark:bg-white/10 dark:text-white' : 'hover:text-slate-900 dark:hover:text-white'"
+                :aria-pressed="costSource === option.value"
+                @click="selectCostSource(option.value)"
+              >
+                <component :is="option.icon" class="size-4" />
+                {{ option.label }}
+              </button>
+            </div>
           </div>
           <div class="flex flex-wrap items-center gap-3">
             <span class="text-xs text-slate-500">更新于 {{ lastUpdated || "--" }}</span>
@@ -396,10 +496,10 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
             <button
               type="button"
               class="studio-button inline-flex h-11 items-center gap-2 rounded-2xl border border-black/[0.06] bg-white px-4 text-sm dark:border-white/10 dark:bg-white/[0.06]"
-              :disabled="loading || refreshing"
+              :disabled="pageBusy"
               @click="load(true)"
             >
-              <RefreshCw class="size-4" :class="loading || refreshing ? 'animate-spin' : ''" />
+              <RefreshCw class="size-4" :class="pageBusy ? 'animate-spin' : ''" />
               刷新
             </button>
           </div>
@@ -442,7 +542,20 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
         </div>
       </header>
 
-      <div v-if="loadError" class="flex flex-col gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 sm:flex-row sm:items-center sm:justify-between dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300">
+      <UpstreamBillingPanel
+        v-if="isUpstreamCostSource"
+        :key="upstreamPanelKey"
+        ref="upstreamBillingPanel"
+        :source="costSource"
+        :start-at="appliedRange.startAt"
+        :end-at="appliedRange.endAt"
+        :range-label="appliedRangeLabel"
+        :sync-days="upstreamSyncDays"
+        @updated="lastUpdated = $event"
+        @loading="upstreamLoading = $event"
+      />
+
+      <div v-if="!isUpstreamCostSource && loadError" class="flex flex-col gap-3 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 sm:flex-row sm:items-center sm:justify-between dark:border-rose-400/20 dark:bg-rose-400/10 dark:text-rose-300">
         <span>加载费用记录失败：{{ loadError }}</span>
         <button type="button" class="studio-button inline-flex h-9 items-center justify-center gap-1.5 rounded-lg bg-rose-600 px-3 text-xs font-semibold text-white hover:bg-rose-700" @click="load(true)">
           <RefreshCw class="size-3.5" />
@@ -450,11 +563,11 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
         </button>
       </div>
 
-      <div v-if="loading && !summary" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div v-if="!isUpstreamCostSource && loading && !summary" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <div v-for="index in 4" :key="index" class="studio-skeleton h-28 rounded-2xl" />
       </div>
 
-      <template v-else>
+      <template v-else-if="!isUpstreamCostSource">
         <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <div class="studio-card bg-white px-4 py-4 dark:bg-[#171a21]">
             <div class="text-xs font-medium text-slate-500">总费用</div>
@@ -599,7 +712,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
           <div class="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
             <div>
               <h2 class="text-[20px] font-semibold">费用明细</h2>
-              <p class="mt-1 text-[13px] text-slate-500">每一笔已完成任务返回的实际费用。</p>
+              <p class="mt-1 text-[13px] text-slate-500">每一笔已完成{{ sourceTitle() }}任务返回的实际费用。</p>
             </div>
             <div class="flex w-full flex-col gap-2 sm:flex-row xl:w-auto">
               <div class="relative w-full sm:w-[320px]">
@@ -611,10 +724,6 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
                 导出 CSV
               </button>
             </div>
-          </div>
-
-          <div v-if="details?.truncated" class="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:bg-amber-400/10 dark:text-amber-300">
-            当前共有 {{ formatNumber(details.record_count) }} 条记录，仅加载了前 {{ formatNumber(details.limit) }} 条，请缩小日期范围查看完整数据。
           </div>
 
           <div v-if="filteredCostItems.length" class="mt-4 overflow-x-auto">
@@ -659,7 +768,7 @@ onBeforeUnmount(() => window.clearInterval(refreshTimer));
           </div>
           <div v-if="filteredCostItems.length" class="mt-4 flex flex-col gap-3 border-t border-black/[0.06] pt-4 text-sm text-slate-500 dark:border-white/10 sm:flex-row sm:items-center sm:justify-between">
             <span>
-              显示 {{ formatNumber(costRecordPageStart) }}-{{ formatNumber(costRecordPageEnd) }} / {{ formatNumber(filteredCostItems.length) }} 条记录，每页 20 条
+              显示 {{ formatNumber(costRecordPageStart) }}-{{ formatNumber(costRecordPageEnd) }} / {{ formatNumber(details?.record_count || 0) }} 条记录，每页 20 条
             </span>
             <div class="flex items-center gap-2">
               <button

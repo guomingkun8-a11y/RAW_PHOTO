@@ -5,6 +5,7 @@ from datetime import datetime
 import hashlib
 from io import BytesIO
 import json
+import logging
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
@@ -29,6 +30,7 @@ VIDEO_MAX_ITEMS = 4
 VIDEO_MAX_FILE_BYTES = 300 * 1024 * 1024
 VIDEO_MAX_TOTAL_BYTES = 600 * 1024 * 1024
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+logger = logging.getLogger(__name__)
 
 
 class ProfessionalVideoAssetModel(Base):
@@ -236,16 +238,27 @@ def _oss_client(item: dict[str, object]) -> Minio:
 
 
 class ProfessionalVideoAssetService:
-    def __init__(self) -> None:
+    def __init__(self, database_url: str | None = None) -> None:
+        self.database_url = database_url
         self.engine = None
         self.Session = None
 
     def _session(self):
         if self.Session is None:
-            self.engine = create_engine(resolve_enterprise_database_url(), pool_pre_ping=True, pool_recycle=3600)
+            self.engine = create_engine(
+                resolve_enterprise_database_url(self.database_url),
+                pool_pre_ping=True,
+                pool_recycle=3600,
+            )
             Base.metadata.create_all(self.engine)
             self.Session = sessionmaker(bind=self.engine)
         return self.Session()
+
+    def close(self) -> None:
+        if self.engine is not None:
+            self.engine.dispose()
+        self.engine = None
+        self.Session = None
 
     @staticmethod
     def _row_to_result(row: ProfessionalVideoAssetModel, *, cached: bool) -> ProfessionalVideoUploadResult:
@@ -443,6 +456,70 @@ class ProfessionalVideoAssetService:
         finally:
             session.close()
 
+    def delete_video(
+        self,
+        video_id: str,
+        *,
+        owner_id: str,
+        conversation_id: str = "",
+    ) -> bool:
+        owner = _owner_id(owner_id)
+        clean_video_id = _clean(video_id, limit=191)
+        expected_conversation_id = _clean(conversation_id, limit=191)
+        if not clean_video_id:
+            return False
+
+        session = self._session()
+        storage_provider = ""
+        bucket = ""
+        object_key = ""
+        try:
+            row = (
+                session.query(ProfessionalVideoAssetModel)
+                .filter(
+                    ProfessionalVideoAssetModel.video_id == clean_video_id,
+                    ProfessionalVideoAssetModel.owner_id == owner,
+                    ProfessionalVideoAssetModel.status != "deleted",
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if row is None:
+                return False
+            if expected_conversation_id and row.conversation_id != expected_conversation_id:
+                return False
+            storage_provider = _clean(row.storage_provider, "oss", 32)
+            bucket = _clean(row.bucket, limit=191)
+            object_key = _clean(row.object_key, limit=1000)
+            session.delete(row)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+        if storage_provider == "oss" and bucket and object_key:
+            reference_session = self._session()
+            try:
+                remaining_references = reference_session.query(ProfessionalVideoAssetModel).filter(
+                    ProfessionalVideoAssetModel.storage_provider == storage_provider,
+                    ProfessionalVideoAssetModel.bucket == bucket,
+                    ProfessionalVideoAssetModel.object_key == object_key,
+                    ProfessionalVideoAssetModel.status != "deleted",
+                ).count()
+            finally:
+                reference_session.close()
+            if not remaining_references:
+                try:
+                    _oss_client(_settings()).remove_object(bucket, object_key)
+                except S3Error as exc:
+                    if exc.code not in {"NoSuchBucket", "NoSuchKey", "NoSuchObject", "NotFound"}:
+                        logger.warning("Could not delete video object %s/%s: %s", bucket, object_key, exc)
+                except Exception as exc:
+                    logger.warning("Could not delete video object %s/%s: %s", bucket, object_key, exc)
+        return True
+
     def mark_analysis_queued(self, video_id: str, *, owner_id: str, error: str = "") -> dict[str, object] | None:
         return self._update_analysis_state(
             video_id,
@@ -551,8 +628,12 @@ class ProfessionalVideoAssetService:
         if current is None:
             return None
         if not bool(settings.get("enabled") and settings.get("queue_enabled")):
-            return current
-        status = _clean(current.get("analysisStatus"), "pending", 32)
+            from services.ecommerce.video_analysis_queue_service import VideoAnalysisQueueUnavailable
+
+            error = "video analysis queue is disabled"
+            self.mark_analysis_failed(video_id, owner_id=owner_id, error=error)
+            raise VideoAnalysisQueueUnavailable(error)
+        status = _clean(current.get("analysisStatus"), "pending", 32).lower()
         if status in {"ready", "processing", "queued"} and not force:
             return current
         queued = self.mark_analysis_queued(video_id, owner_id=owner_id)
@@ -565,7 +646,7 @@ class ProfessionalVideoAssetService:
                 conversation_id=_clean(current.get("conversationId"), limit=191),
             )
         except Exception as exc:
-            self.mark_analysis_pending(video_id, owner_id=owner_id, error=str(exc)[:2000])
+            self.mark_analysis_failed(video_id, owner_id=owner_id, error=str(exc)[:2000])
             raise
         return queued or self.get_video(video_id, owner_id=owner_id)
 

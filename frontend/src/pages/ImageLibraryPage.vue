@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import {
+  AudioLines,
   ChevronLeft,
   ChevronRight,
   Check,
   Download,
+  ExternalLink,
+  Film,
   Heart,
   ImageIcon,
   LoaderCircle,
@@ -14,37 +17,61 @@ import {
   WandSparkles,
 } from "@lucide/vue";
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { useRoute } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
 import ReferenceImagePreview from "@/components/image/ReferenceImagePreview.vue";
+import AudioAssetGrid from "@/features/audio-generation/components/AudioAssetGrid.vue";
+import { useVideoAssetRefresh } from "@/composables/useVideoTaskPolling";
 import {
   bulkDeleteImageLibraryItems,
   downloadImageLibraryItem,
   downloadImageLibraryZip,
   fetchImageLibrary,
+  fetchImageLibraryItem,
   fetchPromptTemplates,
   fetchUsers,
+  fetchVideoGenerationTasks,
   resolveApiAssetUrl,
   updateImageLibraryItem,
+  type ImageLibraryCursor,
   type ImageLibraryItem,
   type PromptTemplate,
   type UserAccount,
+  type VideoGenerationTask,
 } from "@/lib/api";
 import { imageLibraryDisplayPrompt } from "@/lib/prompt-display";
 import { sessionState } from "@/stores/session";
 
-const PAGE_SIZE = 20;
+const IMAGE_PAGE_SIZE = 20;
+const VIDEO_PAGE_SIZE = 9;
 
 const route = useRoute();
+const router = useRouter();
 const items = ref<ImageLibraryItem[]>([]);
+const videoTasks = ref<VideoGenerationTask[]>([]);
 const templates = ref<PromptTemplate[]>([]);
 const users = ref<UserAccount[]>([]);
 const total = ref(0);
 const currentPage = ref(1);
 const loading = ref(true);
-const query = ref("");
+const imageHasMore = ref(false);
+const imageCursors = ref<Array<ImageLibraryCursor | null>>([null]);
+const videoLoading = ref(false);
+const videoRefreshing = ref(false);
+const videoTotal = ref<number | undefined>();
+const videoHasMore = ref(false);
+const videoCursors = ref<string[]>([""]);
+const videoError = ref("");
+let videoRequestId = 0;
+let videoDisposed = false;
+let videoRetryPage = 1;
+const mediaType = ref<"image" | "video" | "audio">(
+  route.query.type === "video" ? "video" : route.query.type === "audio" ? "audio" : "image",
+);
+const audioRefreshKey = ref(0);
+const query = ref(typeof route.query.search === "string" ? route.query.search : "");
 const selectedTemplateId = ref<number | null>(null);
 const favoriteOnly = ref(false);
 const viewScope = ref<"mine" | "all" | "owner">(sessionState.session?.role === "admin" ? "all" : "mine");
@@ -58,33 +85,64 @@ const bulkDeleting = ref(false);
 const bulkDownloading = ref(false);
 let filterTimer = 0;
 let requestId = 0;
+let detailRequestId = 0;
+const detailLoadingId = ref<number | null>(null);
 const referencePreview = ref<{ previewUrl: string; label: string; subtitle: string } | null>(null);
 
 const templateMap = computed(() => new Map(templates.value.map((item) => [item.id, item])));
 const ownerMap = computed(() => new Map(users.value.map((item) => [item.id, item])));
 const isAdmin = computed(() => sessionState.session?.role === "admin");
 const selectedItem = computed(() => items.value.find((item) => item.id === selectedItemId.value) || null);
-const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)));
-const pageStart = computed(() => (total.value ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0));
-const pageEnd = computed(() => Math.min(total.value, currentPage.value * PAGE_SIZE));
 const selectedItems = computed(() => items.value.filter((item) => selectedIds.value.has(item.id)));
 const selectedCount = computed(() => selectedIds.value.size);
 const visibleItemIds = computed(() => items.value.map((item) => item.id));
 const allVisibleSelected = computed(() => Boolean(items.value.length) && visibleItemIds.value.every((id) => selectedIds.value.has(id)));
 const someVisibleSelected = computed(() => visibleItemIds.value.some((id) => selectedIds.value.has(id)));
+const completedVideos = computed(() => videoTasks.value.filter((task) => task.status === "success" && videoUrl(task)));
+const imageTotalPages = computed(() => Math.max(1, Math.ceil(total.value / IMAGE_PAGE_SIZE)));
+const videoTotalPages = computed(() => videoTotal.value === undefined
+  ? currentPage.value + (videoHasMore.value ? 1 : 0)
+  : Math.max(1, Math.ceil(videoTotal.value / VIDEO_PAGE_SIZE)));
+const activeTotal = computed(() => mediaType.value === "video"
+  ? videoTotal.value ?? (currentPage.value - 1) * VIDEO_PAGE_SIZE + completedVideos.value.length
+  : total.value);
+const activePageSize = computed(() => mediaType.value === "video" ? VIDEO_PAGE_SIZE : IMAGE_PAGE_SIZE);
+const totalPages = computed(() => mediaType.value === "video" ? videoTotalPages.value : imageTotalPages.value);
+const pageStart = computed(() => activeTotal.value ? (currentPage.value - 1) * activePageSize.value + 1 : 0);
+const pageEnd = computed(() => mediaType.value === "video"
+  ? (currentPage.value - 1) * VIDEO_PAGE_SIZE + completedVideos.value.length
+  : Math.min(activeTotal.value, currentPage.value * activePageSize.value));
+const paginatedVideos = completedVideos;
 const visiblePages = computed(() => {
-  const totalCount = totalPages.value;
+  const availablePages = mediaType.value === "video" ? videoCursors.value.length : imageCursors.value.length;
+  const totalCount = Math.min(totalPages.value, availablePages);
   const current = currentPage.value;
   const start = Math.max(1, Math.min(current - 2, totalCount - 4));
   const end = Math.min(totalCount, start + 4);
   return Array.from({ length: end - start + 1 }, (_, index) => start + index);
 });
+const currentLoading = computed(() => mediaType.value === "image"
+  ? loading.value
+  : mediaType.value === "video" ? videoLoading.value || videoRefreshing.value : false);
+const videoAssets = useVideoAssetRefresh(() => videoTasks.value, (updates) => {
+  const byId = new Map(updates.map((task) => [task.id, task]));
+  videoTasks.value = videoTasks.value.map((task) => byId.get(task.id) || task);
+});
+
+async function refreshVideoAsset(task: VideoGenerationTask) {
+  try { await videoAssets.refresh(task.id); }
+  catch (error) { toast.error(error instanceof Error ? error.message : "刷新视频链接失败"); }
+}
 
 function formatFileSize(bytes?: number) {
   if (!bytes) return "";
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
+}
+function formatCost(value?: number) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return "";
+  return `花费 $${Number(value).toFixed(4)}`;
 }
 function formatCreatedAt(value: string) {
   const date = new Date(value);
@@ -107,6 +165,38 @@ function imageAlt(item: ImageLibraryItem | null | undefined) {
 }
 function ownerLabel(ownerId: string) {
   return ownerMap.value.get(ownerId)?.name || ownerMap.value.get(ownerId)?.username || ownerId || "未知用户";
+}
+function videoUrl(task: VideoGenerationTask) {
+  return task.video_url || task.data?.find((item) => item.url)?.url || "";
+}
+function videoOwnerLabel(task: VideoGenerationTask) {
+  return task.owner_name || task.owner_username || ownerLabel(task.owner_id || "");
+}
+function videoMeta(task: VideoGenerationTask) {
+  return [
+    task.model,
+    task.aspect_ratio,
+    task.duration_secs ? `${task.duration_secs}s` : "",
+    task.resolution,
+    task.storage === "oss" ? "OSS" : task.storage === "local" ? "本地存储" : "",
+    task.file_size ? formatFileSize(task.file_size) : "",
+  ].filter(Boolean);
+}
+function formatVideoDate(value?: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+function openVideo(task: VideoGenerationTask) {
+  const url = videoUrl(task);
+  if (url) window.open(resolveApiAssetUrl(url), "_blank", "noopener,noreferrer");
 }
 function referenceItems(item: ImageLibraryItem | null | undefined) {
   return (item?.reference_images || [])
@@ -135,22 +225,24 @@ function analysis(item: ImageLibraryItem) {
 
 async function load(page = currentPage.value) {
   const nextPage = Math.max(1, Math.floor(page));
+  const cursor = nextPage === 1 ? null : imageCursors.value[nextPage - 1];
+  if (cursor === undefined) return;
   const currentId = ++requestId;
+  if (nextPage === 1) imageCursors.value = [null];
   loading.value = true;
   try {
     const data = await fetchImageLibrary({
-      limit: PAGE_SIZE,
-      offset: (nextPage - 1) * PAGE_SIZE,
+      limit: IMAGE_PAGE_SIZE,
+      cursor,
       q: query.value.trim(),
       productId: 0,
       templateId: selectedTemplateId.value || 0,
       favorite: favoriteOnly.value,
       allOwners: isAdmin.value && (viewScope.value === "all" || viewScope.value === "owner"),
       ownerId: isAdmin.value && viewScope.value === "owner" ? selectedOwnerId.value : "",
-      includeReferences: true,
     });
     if (currentId !== requestId) return;
-    const maxPage = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
+    const maxPage = Math.max(1, Math.ceil(data.total / IMAGE_PAGE_SIZE));
     if (data.total > 0 && nextPage > maxPage) {
       currentPage.value = maxPage;
       await load(maxPage);
@@ -158,6 +250,9 @@ async function load(page = currentPage.value) {
     }
     items.value = data.items;
     total.value = data.total;
+    imageHasMore.value = Boolean(data.has_more && data.next_cursor);
+    imageCursors.value = imageCursors.value.slice(0, nextPage);
+    if (imageHasMore.value && data.next_cursor) imageCursors.value[nextPage] = data.next_cursor;
     currentPage.value = nextPage;
     const visibleIds = new Set(data.items.map((item) => item.id));
     selectedIds.value = new Set(Array.from(selectedIds.value).filter((id) => visibleIds.has(id)));
@@ -166,6 +261,83 @@ async function load(page = currentPage.value) {
   } finally {
     if (currentId === requestId) loading.value = false;
   }
+}
+
+async function openImageDetails(item: ImageLibraryItem) {
+  selectedItemId.value = item.id;
+  if (item.reference_images !== undefined) return;
+  const currentId = ++detailRequestId;
+  detailLoadingId.value = item.id;
+  try {
+    const detail = await fetchImageLibraryItem(item.id, { includeReferences: true });
+    if (currentId !== detailRequestId) return;
+    items.value = items.value.map((current) => current.id === detail.id ? detail : current);
+  } catch (error) {
+    if (currentId === detailRequestId) {
+      toast.error(error instanceof Error ? error.message : "读取图片详情失败");
+    }
+  } finally {
+    if (currentId === detailRequestId) detailLoadingId.value = null;
+  }
+}
+
+async function loadVideos(showSpinner = true, page = 1) {
+  const cursor = page === 1 ? "" : videoCursors.value[page - 1];
+  if (cursor === undefined) return;
+  const currentId = ++videoRequestId;
+  const scope = JSON.stringify([query.value, viewScope.value, selectedOwnerId.value]);
+  videoRetryPage = page;
+  if (showSpinner) videoLoading.value = true;
+  else videoRefreshing.value = true;
+  videoError.value = "";
+  try {
+    const data = await fetchVideoGenerationTasks([], {
+      limit: VIDEO_PAGE_SIZE,
+      cursor,
+      status: "success",
+      q: query.value,
+      allOwners: isAdmin.value && (viewScope.value === "all" || viewScope.value === "owner"),
+      ownerId: isAdmin.value && viewScope.value === "owner" ? selectedOwnerId.value : "",
+    });
+    if (videoDisposed || currentId !== videoRequestId || mediaType.value !== "video"
+      || scope !== JSON.stringify([query.value, viewScope.value, selectedOwnerId.value])) return;
+    videoTasks.value = data.items;
+    videoTotal.value = data.total;
+    videoHasMore.value = Boolean(data.has_more && data.next_cursor && data.next_cursor !== cursor);
+    videoCursors.value = videoCursors.value.slice(0, page);
+    if (videoHasMore.value) videoCursors.value[page] = data.next_cursor!;
+    currentPage.value = page;
+  } catch (error) {
+    if (currentId !== videoRequestId || videoDisposed) return;
+    videoError.value = error instanceof Error ? error.message : "读取历史视频失败";
+  } finally {
+    if (currentId === videoRequestId) {
+      videoLoading.value = false;
+      videoRefreshing.value = false;
+    }
+  }
+}
+
+function switchMediaType(value: "image" | "video" | "audio") {
+  if (mediaType.value === value) return;
+  mediaType.value = value;
+  currentPage.value = 1;
+  clearSelection();
+  selectedItemId.value = null;
+  void router.replace({
+    query: {
+      ...route.query,
+      type: value === "image" ? undefined : value,
+    },
+  });
+  if (value === "video") void loadVideos();
+  else if (value === "image") void load(1);
+}
+
+function refreshCurrent() {
+  if (mediaType.value === "video") void loadVideos(false);
+  else if (mediaType.value === "image") void load(currentPage.value);
+  else audioRefreshKey.value += 1;
 }
 
 async function loadUsers() {
@@ -180,7 +352,11 @@ async function loadUsers() {
 }
 
 function goToPage(page: number) {
-  if (loading.value || page < 1 || page > totalPages.value || page === currentPage.value) return;
+  if (currentLoading.value || page < 1 || page > totalPages.value || page === currentPage.value) return;
+  if (mediaType.value === "video") {
+    void loadVideos(false, page);
+    return;
+  }
   void load(page);
 }
 
@@ -304,44 +480,53 @@ async function remove(item: ImageLibraryItem) {
 }
 function globalSearch(event: Event) {
   query.value = event instanceof CustomEvent ? String(event.detail?.query || "") : "";
-  void load(1);
+  currentPage.value = 1;
 }
 
 watch([query, selectedTemplateId, favoriteOnly], () => {
   clearSelection();
+  currentPage.value = 1;
   window.clearTimeout(filterTimer);
-  filterTimer = window.setTimeout(() => void load(1), 350);
+  filterTimer = window.setTimeout(() => {
+    if (mediaType.value === "video") void loadVideos();
+    else if (mediaType.value === "image") void load(1);
+  }, 350);
 });
 watch([viewScope, selectedOwnerId], () => {
   if (!isAdmin.value) return;
-  clearSelection();
-  void load(1);
-});
-watch(isAdmin, (value) => {
-  if (value) {
-    viewScope.value = "all";
-    void loadUsers();
-    void load(1);
-  } else {
-    viewScope.value = "mine";
+  if (viewScope.value === "owner" && !selectedOwnerId.value && users.value.length) {
+    selectedOwnerId.value = users.value[0].id;
+    return;
   }
+  clearSelection();
+  currentPage.value = 1;
+  if (mediaType.value === "video") void loadVideos();
+  else if (mediaType.value === "image") void load(1);
+});
+watch(() => route.query.type, (value) => {
+  const next = value === "video" ? "video" : value === "audio" ? "audio" : "image";
+  if (next === mediaType.value) return;
+  mediaType.value = next;
+  currentPage.value = 1;
+  clearSelection();
+  selectedItemId.value = null;
+  if (next === "video") void loadVideos();
+  else if (next === "image") void load(1);
 });
 
 onMounted(async () => {
-  query.value = typeof route.query.search === "string" ? route.query.search : "";
-  try {
-    templates.value = (await fetchPromptTemplates()).items;
-  } catch {
-    templates.value = [];
-  }
-  if (isAdmin.value) {
-    viewScope.value = "all";
-    await loadUsers();
-  }
-  await load(1);
   window.addEventListener("image-library-search", globalSearch);
+  const templateRequest = fetchPromptTemplates()
+    .then((response) => { templates.value = response.items; })
+    .catch(() => { templates.value = []; });
+  const userRequest = isAdmin.value ? loadUsers() : Promise.resolve();
+  const recordRequest = mediaType.value === "video" ? loadVideos() : mediaType.value === "image" ? load(1) : Promise.resolve();
+  await Promise.all([templateRequest, userRequest, recordRequest]);
 });
 onBeforeUnmount(() => {
+  videoDisposed = true;
+  videoRequestId += 1;
+  detailRequestId += 1;
   window.clearTimeout(filterTimer);
   window.removeEventListener("image-library-search", globalSearch);
 });
@@ -354,28 +539,44 @@ onBeforeUnmount(() => {
         <div class="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
             <div class="inline-flex rounded-full bg-[#4F7CFF]/10 px-3 py-1 text-[13px] font-semibold text-[#4F7CFF]">Asset Gallery</div>
-            <h1 class="mt-3 text-[30px] font-semibold text-slate-950 dark:text-stone-50">历史图库</h1>
+            <h1 class="mt-3 text-[30px] font-semibold text-slate-950 dark:text-stone-50">历史</h1>
             <p class="mt-2 text-[15px] leading-7 text-slate-600 dark:text-stone-300">
-              共保存 {{ total }} 张生成结果，当前显示 {{ pageStart }}-{{ pageEnd }} 张。收藏、下载和资产检查都在图片上完成。
+              集中查看你的图片、视频和音频生成结果，通过上方选项分开浏览。
             </p>
           </div>
-          <button type="button" class="studio-button inline-flex h-11 items-center gap-2 rounded-2xl border border-black/[0.06] bg-white px-4 text-sm dark:border-white/10 dark:bg-white/[0.06]" :disabled="loading" @click="load(currentPage)">
-            <LoaderCircle v-if="loading" class="size-4 animate-spin" />
-            <RefreshCw v-else class="size-4" />
-            刷新
-          </button>
+          <div class="flex flex-wrap items-center gap-2">
+            <div class="inline-flex rounded-xl border border-black/[0.06] bg-slate-100 p-1 dark:border-white/10 dark:bg-white/[0.05]" role="tablist" aria-label="历史类型">
+              <button type="button" role="tab" :aria-selected="mediaType === 'image'" class="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-sm font-semibold transition" :class="mediaType === 'image' ? 'bg-white text-slate-950 shadow-sm dark:bg-white/[0.12] dark:text-white' : 'text-slate-500 hover:text-slate-900 dark:text-stone-400 dark:hover:text-white'" @click="switchMediaType('image')">
+                <ImageIcon class="size-4" />
+                图片
+              </button>
+              <button type="button" role="tab" :aria-selected="mediaType === 'video'" class="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-sm font-semibold transition" :class="mediaType === 'video' ? 'bg-white text-slate-950 shadow-sm dark:bg-white/[0.12] dark:text-white' : 'text-slate-500 hover:text-slate-900 dark:text-stone-400 dark:hover:text-white'" @click="switchMediaType('video')">
+                <Film class="size-4" />
+                视频
+              </button>
+              <button type="button" role="tab" :aria-selected="mediaType === 'audio'" class="inline-flex h-9 items-center gap-1.5 rounded-lg px-3 text-sm font-semibold transition" :class="mediaType === 'audio' ? 'bg-white text-slate-950 shadow-sm dark:bg-white/[0.12] dark:text-white' : 'text-slate-500 hover:text-slate-900 dark:text-stone-400 dark:hover:text-white'" @click="switchMediaType('audio')">
+                <AudioLines class="size-4" />
+                音频
+              </button>
+            </div>
+            <button type="button" class="studio-button inline-flex h-11 items-center gap-2 rounded-2xl border border-black/[0.06] bg-white px-4 text-sm dark:border-white/10 dark:bg-white/[0.06]" :disabled="currentLoading" @click="refreshCurrent">
+              <LoaderCircle v-if="currentLoading" class="size-4 animate-spin" />
+              <RefreshCw v-else class="size-4" />
+              刷新
+            </button>
+          </div>
         </div>
         <div class="mt-5 grid gap-2 xl:grid-cols-[minmax(240px,520px)_190px_auto_auto]">
           <div class="relative">
             <Search class="pointer-events-none absolute left-4 top-1/2 size-4 -translate-y-1/2 text-slate-400" />
-            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" placeholder="搜索用户提示词、模型或优化后的提示词" data-testid="library-search-input" />
+            <input v-model="query" class="studio-input h-12 bg-[#F8FAFC] pl-11 pr-4 dark:bg-white/[0.04]" :placeholder="mediaType === 'image' ? '搜索用户提示词、模型或优化后的提示词' : '搜索提示词、模型、用户或任务 ID'" data-testid="library-search-input" />
           </div>
-          <select v-model="selectedTemplateId" class="studio-input h-12 px-3">
+          <select v-if="mediaType === 'image'" v-model="selectedTemplateId" class="studio-input h-12 px-3">
             <option :value="null">全部模板</option>
             <option v-for="template in templates" :key="template.id" :value="template.id">{{ template.name }}</option>
           </select>
           <select v-if="isAdmin" v-model="viewScope" class="studio-input h-12 px-3">
-            <option value="mine">我的图片</option>
+            <option value="mine">我的{{ mediaType === 'video' ? '视频' : mediaType === 'audio' ? '音频' : '图片' }}</option>
             <option value="all">全部用户</option>
             <option value="owner">指定用户</option>
           </select>
@@ -383,18 +584,18 @@ onBeforeUnmount(() => {
             <option value="">选择用户</option>
             <option v-for="user in users" :key="user.id" :value="user.id">{{ user.name || user.username || user.id }}</option>
           </select>
-          <label class="studio-button inline-flex h-12 w-fit cursor-pointer items-center gap-2 rounded-2xl border border-black/[0.06] bg-[#F8FAFC] px-4 text-sm dark:border-white/10 dark:bg-white/[0.04]">
+          <label v-if="mediaType === 'image'" class="studio-button inline-flex h-12 w-fit cursor-pointer items-center gap-2 rounded-2xl border border-black/[0.06] bg-[#F8FAFC] px-4 text-sm dark:border-white/10 dark:bg-white/[0.04]">
             <input v-model="favoriteOnly" type="checkbox" class="size-4 accent-[#4F7CFF]" />
             只看收藏
           </label>
         </div>
       </div>
 
-      <div v-if="loading && !items.length" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-5">
+      <div v-if="mediaType === 'image' && loading && !items.length" class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-5">
         <div v-for="index in 12" :key="index" class="studio-skeleton h-[330px] rounded-[20px]" />
       </div>
 
-      <div v-else-if="!items.length" class="studio-card grid min-h-[360px] place-items-center bg-white px-6 text-center dark:bg-[#171a21]">
+      <div v-else-if="mediaType === 'image' && !items.length" class="studio-card grid min-h-[360px] place-items-center bg-white px-6 text-center dark:bg-[#171a21]">
         <div>
           <div class="mx-auto flex size-12 items-center justify-center rounded-2xl bg-slate-950 text-white dark:bg-white dark:text-slate-950">
             <ImageIcon class="size-5" />
@@ -404,7 +605,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <template v-else>
+      <template v-else-if="mediaType === 'image'">
         <div class="studio-card flex flex-col gap-3 bg-white px-4 py-3 dark:bg-[#171a21] md:flex-row md:items-center md:justify-between">
           <label class="inline-flex h-10 cursor-pointer items-center gap-2 rounded-xl border border-black/[0.06] bg-[#F8FAFC] px-3 text-sm font-medium text-slate-700 dark:border-white/10 dark:bg-white/[0.05] dark:text-stone-200">
             <input type="checkbox" class="size-4 accent-[#4F7CFF]" :checked="allVisibleSelected" :aria-checked="someVisibleSelected && !allVisibleSelected ? 'mixed' : allVisibleSelected" data-testid="library-select-visible" @change="toggleVisibleSelected" />
@@ -432,7 +633,7 @@ onBeforeUnmount(() => {
         <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-5">
           <article v-for="item in items" :key="item.id" class="group studio-card flex min-h-[330px] flex-col overflow-hidden bg-white dark:bg-[#171a21]" :class="selectedIds.has(item.id) ? 'border-[#4F7CFF]/45 ring-2 ring-[#4F7CFF]/30' : ''" data-testid="library-image-card">
             <div class="relative">
-              <button type="button" class="block aspect-[4/3] w-full overflow-hidden bg-slate-100 text-left dark:bg-white/[0.04]" @click="selectedItemId = item.id">
+              <button type="button" class="block aspect-[4/3] w-full overflow-hidden bg-slate-100 text-left dark:bg-white/[0.04]" @click="openImageDetails(item)">
                 <img :src="thumbnail(item)" :alt="imageAlt(item)" class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.01]" loading="lazy" decoding="async" />
               </button>
               <button type="button" class="studio-button absolute left-3 top-3 inline-flex size-9 items-center justify-center rounded-xl border text-white shadow-sm" :class="selectedIds.has(item.id) ? 'border-[#4F7CFF] bg-[#4F7CFF]' : 'border-white/70 bg-slate-950/45 hover:bg-slate-950/70'" :aria-label="selectedIds.has(item.id) ? '取消选择图片' : '选择图片'" @click.stop="toggleSelected(item)">
@@ -470,18 +671,84 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <div v-if="items.length || totalPages > 1" class="studio-card flex flex-col gap-3 bg-white px-4 py-3 dark:bg-[#171a21] sm:flex-row sm:items-center sm:justify-between">
+      <template v-else-if="mediaType === 'video'">
+        <div v-if="videoError" role="alert" class="flex items-center justify-between gap-3 rounded-lg bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-400/10 dark:text-rose-300">
+          <span>{{ videoError }}</span>
+          <button type="button" class="studio-button shrink-0 p-2" title="重试加载视频" aria-label="重试加载视频" :disabled="currentLoading" @click="loadVideos(false, videoRetryPage)"><RefreshCw class="size-4" /></button>
+        </div>
+        <div v-if="videoLoading && !completedVideos.length" class="grid items-stretch gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <div v-for="index in VIDEO_PAGE_SIZE" :key="index" class="studio-skeleton aspect-video rounded-2xl" />
+        </div>
+
+        <div v-else-if="!completedVideos.length && !videoError" class="studio-card grid min-h-[360px] place-items-center bg-white px-6 text-center dark:bg-[#171a21]">
+          <div>
+            <div class="mx-auto flex size-12 items-center justify-center rounded-2xl bg-slate-950 text-white dark:bg-white dark:text-slate-950">
+              <Film class="size-5" />
+            </div>
+            <h2 class="mt-4 text-lg font-semibold">{{ query ? "没有匹配的视频" : "暂无视频资产" }}</h2>
+            <p class="mt-1 text-sm text-slate-500">{{ query ? "换一个关键词试试。" : "完成视频生成后，结果会自动出现在这里。" }}</p>
+          </div>
+        </div>
+
+        <div v-else class="grid items-stretch gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          <article v-for="task in paginatedVideos" :key="task.id" class="studio-card flex h-full min-h-[390px] flex-col overflow-hidden bg-white dark:bg-[#171a21]" data-testid="library-video-card">
+            <div class="aspect-video w-full shrink-0 overflow-hidden bg-slate-950">
+              <video class="h-full w-full object-cover object-center" :src="resolveApiAssetUrl(videoUrl(task))" :poster="resolveApiAssetUrl(task.cover_url || '')" controls playsinline preload="metadata" @error="videoAssets.onMediaError(task.id)" />
+            </div>
+            <div class="flex min-h-0 flex-1 flex-col p-3">
+              <div class="flex h-[52px] min-w-0 flex-wrap content-start gap-1.5 overflow-hidden">
+                <span class="inline-flex items-center gap-1 rounded-full bg-[#4F7CFF]/10 px-2 py-1 text-[11px] font-semibold text-[#315be8]">
+                  <Film class="size-3" />
+                  视频
+                </span>
+                <span v-for="item in videoMeta(task)" :key="`${task.id}-${item}`" class="max-w-full truncate rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-500 dark:bg-white/[0.08] dark:text-stone-300">{{ item }}</span>
+              </div>
+              <p class="mt-3 line-clamp-3 min-h-[72px] text-sm leading-6 text-slate-700 dark:text-stone-200">{{ task.prompt || "未记录提示词" }}</p>
+              <div class="mt-3 flex items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-stone-400">
+                <span>{{ formatVideoDate(task.created_at) }}</span>
+                <span v-if="formatCost(task.cost)" class="font-semibold text-[#315be8]">{{ formatCost(task.cost) }}</span>
+              </div>
+              <div class="mt-1 truncate text-[11px] text-slate-400" :title="videoOwnerLabel(task)">用户：{{ videoOwnerLabel(task) }}</div>
+              <div class="mt-auto flex items-center justify-between gap-2 border-t border-black/[0.06] pt-3 dark:border-white/10">
+                <span v-if="task.storage_error" class="truncate text-[11px] text-amber-600" :title="task.storage_error">存储回退</span>
+                <span v-else class="text-[11px] text-slate-400">已完成</span>
+                <div class="flex items-center gap-1.5">
+                  <button type="button" class="studio-button inline-flex size-9 items-center justify-center rounded-lg" title="刷新视频链接" aria-label="刷新视频链接" @click="refreshVideoAsset(task)"><RefreshCw class="size-4" /></button>
+                  <button type="button" class="studio-button inline-flex size-9 items-center justify-center rounded-xl" title="打开视频" aria-label="打开视频" @click="openVideo(task)">
+                    <ExternalLink class="size-4" />
+                  </button>
+                  <a class="studio-button inline-flex size-9 items-center justify-center rounded-xl" :href="resolveApiAssetUrl(videoUrl(task))" :download="`video-${task.id}.mp4`" title="下载视频" aria-label="下载视频">
+                    <Download class="size-4" />
+                  </a>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
+      </template>
+
+      <AudioAssetGrid
+        v-else
+        :key="audioRefreshKey"
+        :active="mediaType === 'audio'"
+        :query="query"
+        :all-owners="isAdmin && (viewScope === 'all' || viewScope === 'owner')"
+        :owner-id="isAdmin && viewScope === 'owner' ? selectedOwnerId : ''"
+      />
+
+      <div v-if="(mediaType === 'image' && items.length) || (mediaType === 'video' && completedVideos.length)" class="studio-card flex flex-col gap-3 bg-white px-4 py-3 dark:bg-[#171a21] sm:flex-row sm:items-center sm:justify-between">
         <div class="text-sm text-slate-500 dark:text-stone-400">
-          第 {{ currentPage }} / {{ totalPages }} 页，显示 {{ pageStart }}-{{ pageEnd }} / {{ total }} 张
+          <template v-if="mediaType === 'video' && videoTotal === undefined">第 {{ currentPage }} 页，显示 {{ pageStart }}-{{ pageEnd }} 条视频，每页 {{ VIDEO_PAGE_SIZE }} 条</template>
+          <template v-else>第 {{ currentPage }} / {{ totalPages }} 页，显示 {{ pageStart }}-{{ pageEnd }} / {{ activeTotal }} {{ mediaType === "video" ? "条视频" : "张图片" }}，每页 {{ activePageSize }} 条</template>
         </div>
         <div class="flex flex-wrap items-center gap-2">
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300" :disabled="loading || currentPage <= 1" aria-label="上一页" @click="goToPage(currentPage - 1)">
+          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300" :disabled="currentLoading || currentPage <= 1" aria-label="上一页" @click="goToPage(currentPage - 1)">
             <ChevronLeft class="size-4" />
           </button>
-          <button v-for="page in visiblePages" :key="page" type="button" class="studio-button inline-flex h-10 min-w-10 items-center justify-center rounded-xl border px-3 text-sm font-semibold" :class="page === currentPage ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" :disabled="loading" @click="goToPage(page)">
+          <button v-for="page in visiblePages" :key="page" type="button" class="studio-button inline-flex h-10 min-w-10 items-center justify-center rounded-xl border px-3 text-sm font-semibold" :class="page === currentPage ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] text-slate-600 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:text-stone-300'" :disabled="currentLoading" :aria-current="page === currentPage ? 'page' : undefined" @click="goToPage(page)">
             {{ page }}
           </button>
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300" :disabled="loading || currentPage >= totalPages" aria-label="下一页" @click="goToPage(currentPage + 1)">
+          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-xl border border-black/[0.06] text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/10 dark:text-stone-300" :disabled="currentLoading || (mediaType === 'video' ? !videoHasMore : !imageHasMore)" aria-label="下一页" @click="goToPage(currentPage + 1)">
             <ChevronRight class="size-4" />
           </button>
         </div>
@@ -499,7 +766,11 @@ onBeforeUnmount(() => {
           <h3 class="text-sm font-semibold">用户提示词</h3>
           <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-600 dark:text-stone-300">{{ displayPrompt(selectedItem) }}</p>
         </div>
-        <div v-if="referenceItems(selectedItem).length">
+        <div v-if="detailLoadingId === selectedItem.id" class="flex items-center gap-2 text-sm text-slate-500">
+          <LoaderCircle class="size-4 animate-spin" />
+          正在读取参考图
+        </div>
+        <div v-else-if="referenceItems(selectedItem).length">
           <h3 class="text-sm font-semibold">上传参考图</h3>
           <div class="mt-2 flex gap-2 overflow-x-auto pb-1">
             <button

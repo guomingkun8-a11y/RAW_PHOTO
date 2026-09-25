@@ -32,22 +32,12 @@ class PromptTemplatePayload(BaseModel):
     name: str = Field(default="", max_length=191)
     category: str = Field(default="main", max_length=64)
     content: str = ""
-    model: str = ""
-    size: str = ""
-    quality: str = "high"
-    preserve_subject: bool = True
-    enabled: bool = True
 
 
 class PromptTemplateUpdatePayload(BaseModel):
     name: str | None = Field(default=None, max_length=191)
     category: str | None = Field(default=None, max_length=64)
     content: str | None = None
-    model: str | None = None
-    size: str | None = None
-    quality: str | None = None
-    preserve_subject: bool | None = None
-    enabled: bool | None = None
 
 
 def create_router() -> APIRouter:
@@ -202,31 +192,30 @@ def create_router() -> APIRouter:
         del legacy_scope_id
         return await _update_prompt_template(template_id, body, authorization)
 
-    async def _disable_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
+    async def _delete_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         item = await run_in_threadpool(
-            business_service.update_template,
+            business_service.delete_template,
             identity=identity,
             template_id=template_id,
-            data={"enabled": False},
         )
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "template not found"})
         return item
 
     @router.delete("/api/prompt-templates/{template_id}")
-    async def disable_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
-        return await _disable_prompt_template(template_id, authorization)
+    async def delete_prompt_template(template_id: int, authorization: str | None = Header(default=None)):
+        return await _delete_prompt_template(template_id, authorization)
 
     # Keep compatibility with clients that sent a legacy parent/template ID pair.
     @router.delete("/api/prompt-templates/{legacy_scope_id}/{template_id}")
-    async def disable_prompt_template_legacy(
+    async def delete_prompt_template_legacy(
         legacy_scope_id: int,
         template_id: int,
         authorization: str | None = Header(default=None),
     ):
         del legacy_scope_id
-        return await _disable_prompt_template(template_id, authorization)
+        return await _delete_prompt_template(template_id, authorization)
 
     @router.get("/api/audit-logs")
     async def list_audit_logs(limit: int = Query(default=100, ge=1, le=500), authorization: str | None = Header(default=None)):

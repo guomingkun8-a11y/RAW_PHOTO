@@ -5,6 +5,15 @@ import { getStoredAuthKey } from "@/stores/auth";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 
+export type ImageTaskImageOptions = {
+  aspectRatio?: string;
+  imageSize?: string;
+  thinkingLevel?: string;
+  imageCount?: number;
+  source?: "standard" | "canvas";
+  canvasUnits?: number;
+};
+
 export type Model = {
   id: string;
   object: string;
@@ -27,6 +36,23 @@ export type OpenAIRelaySettings = {
   api_keys?: string[];
   has_api_key?: boolean;
   api_key_count?: number;
+};
+
+export type VideoGenerationDuration = number | "auto";
+
+export type VideoGenerationModelSpec = {
+  id: string;
+  label: string;
+  modes: Array<"text_to_video" | "image_to_video" | string>;
+  min_images: number;
+  max_images: number;
+  image_input_kind?: "none" | "reference" | "first_last_frame" | string;
+  aspect_ratios: string[];
+  durations: VideoGenerationDuration[];
+  default_duration: VideoGenerationDuration;
+  option_key: "resolution" | "mode" | string;
+  options: string[];
+  default_option: string;
 };
 
 export type SettingsConfig = {
@@ -84,9 +110,14 @@ export type SettingsConfig = {
   };
   video_generation?: {
     enabled?: boolean;
+    base_url?: string;
     queue_enabled?: boolean;
     has_api_key?: boolean;
     api_key_count?: number;
+    credential_source?: string;
+    submit_path?: string;
+    status_path?: string;
+    models?: VideoGenerationModelSpec[];
     worker_concurrency?: number | string;
     total_concurrency?: number | string;
     owner_concurrency?: number | string;
@@ -117,6 +148,7 @@ export type ImageTask = {
     height?: number;
     requested_size?: string;
     aspect_ratio_corrected?: boolean;
+    resolution_corrected?: boolean;
   }>;
   error?: string;
   progress?: string;
@@ -146,12 +178,15 @@ export type ImageTask = {
 
 export type VideoGenerationTask = {
   id: string;
+  owner_id?: string;
+  owner_name?: string;
+  owner_username?: string;
   status: "queued" | "running" | "success" | "error" | "canceled";
   mode: "text_to_video" | "image_to_video" | string;
   model?: string;
   prompt?: string;
   aspect_ratio?: string;
-  duration_secs?: number;
+  duration_secs?: VideoGenerationDuration;
   quality?: string;
   resolution?: string;
   image_urls?: string[];
@@ -164,12 +199,19 @@ export type VideoGenerationTask = {
   }>;
   video_url?: string;
   cover_url?: string;
+  source_video_url?: string;
+  storage?: string;
+  storage_rel?: string;
+  file_size?: number;
+  storage_error?: string;
   error?: string;
   progress?: string;
   elapsed_secs?: number;
   duration_ms?: number;
   cost?: number;
   upstream_task_id?: string;
+  cancellation_pending?: boolean;
+  reconciliation_required?: boolean;
   conversation_id?: string;
   turn_id?: string;
 };
@@ -179,7 +221,59 @@ export type VideoGenerationTaskListResponse = {
   missing_ids: string[];
   has_more?: boolean;
   limit?: number;
+  total?: number;
+  next_cursor?: string | null;
 };
+
+export type VideoAgentAttachment = {
+  kind: "image" | "video" | "generation";
+  name?: string;
+  mime_type?: string;
+  url?: string;
+  size?: number;
+  sha256?: string;
+  video_id?: string;
+  analysis_status?: string;
+  analysis_error?: string;
+  task_id?: string;
+  model?: string;
+  prompt?: string;
+  duration_secs?: VideoGenerationDuration;
+  resolution?: string;
+};
+
+export type VideoAgentPlan = {
+  id: string;
+  status: "completed" | string;
+  message: string;
+  prompt: string;
+  analysis_error?: string;
+  reasoning_summary?: string;
+  reasoning_enabled?: boolean;
+  chat_model?: string;
+  duration_ms?: number;
+  conversation_id?: string;
+  turn_id?: string;
+  owner_id?: string;
+  owner_username?: string;
+  owner_name?: string;
+  attachments?: VideoAgentAttachment[];
+  created_at: string;
+};
+
+export type VideoAgentPlanListResponse = {
+  items: VideoAgentPlan[];
+  total: number;
+  limit: number;
+  has_more: boolean;
+};
+
+export type VideoAgentPlanStreamEvent =
+  | { type: "reasoning.delta"; delta: string }
+  | { type: "answer.delta"; delta: string }
+  | { type: "pending"; message: VideoAgentPlan }
+  | { type: "completed"; message: VideoAgentPlan }
+  | { type: "error"; message: string };
 
 export type AgentRunStatus = "pending" | "running" | "waiting_for_images" | "waiting_for_input" | "completed" | "failed" | "canceled";
 
@@ -347,6 +441,7 @@ export type ImageAgentResult = {
     height?: number | null;
     requestedSize?: string | null;
     aspectRatioCorrected?: boolean;
+    cost?: number | null;
   }>;
   qualityChecks: ImageAgentQualityCheck[];
   revisionCount: number;
@@ -533,11 +628,8 @@ export type PromptTemplate = {
   name: string;
   category: string;
   content: string;
-  model?: ImageModel;
-  size?: string;
-  quality?: string;
-  preserve_subject: boolean;
-  enabled: boolean;
+  owner_id?: string;
+  owner_name?: string;
   can_manage?: boolean;
   created_at: string;
   updated_at: string;
@@ -606,6 +698,29 @@ export type SystemAnnouncement = {
   updated_at: string;
 };
 
+export type RealtimeAnnouncementEvent = SystemAnnouncement;
+
+export type RealtimeImageTaskProgressEvent = {
+  task_id: string;
+  state: "queued" | "running" | "success" | "error" | "canceled" | string;
+  status?: string;
+  status_group?: string;
+  is_final?: boolean;
+  progress?: string;
+  result_url?: string;
+  result_type?: string;
+  error?: string;
+  cost?: number;
+  model?: string;
+  conversation_id?: string;
+  turn_id?: string;
+  updated_at?: string;
+};
+
+export type RealtimeEvent =
+  | { type: "announcement"; data: RealtimeAnnouncementEvent }
+  | { type: "image_task_progress"; data: RealtimeImageTaskProgressEvent };
+
 type ImageTaskListResponse = {
   items: ImageTask[];
   missing_ids: string[];
@@ -619,9 +734,17 @@ export type ImageConversationApiPayload = Record<string, unknown> & {
   turns?: unknown[];
 };
 
-type ImageConversationListResponse = {
+export type ImageConversationCursor = {
+  updated_at: string;
+  id: string;
+};
+
+export type ImageConversationListResponse = {
   items: ImageConversationApiPayload[];
   total: number;
+  limit?: number;
+  has_more?: boolean;
+  next_cursor?: ImageConversationCursor | null;
 };
 
 export type LoginResponse = {
@@ -683,6 +806,26 @@ export type MonitoringUserStat = {
   active_tasks: number;
   last_login_at?: string;
   last_seen_at?: string;
+};
+
+export type MonitoringSource = "image" | "video" | "audio";
+
+export type MonitoringQueueItem = {
+  queue: string;
+  label: string;
+  waiting: number;
+  running: number;
+  failed: number;
+  p95_ms: number;
+  available: boolean;
+  concurrency?: number;
+  updated_at?: string;
+  error?: string;
+};
+
+export type MonitoringQueuesResponse = {
+  items: MonitoringQueueItem[];
+  updated_at?: string;
 };
 
 export type MonitoringQueueOwnerActivity = {
@@ -781,6 +924,7 @@ export type MonitoringStageLatencySummary = {
 };
 
 export type MonitoringSummary = {
+  source?: MonitoringSource;
   online_users: number;
   active_sessions: number;
   total_success: number;
@@ -798,6 +942,7 @@ export type MonitoringSummary = {
   task_queue: MonitoringQueueSummary;
   agent_queue?: MonitoringAgentQueueSummary;
   video_generation_queue?: MonitoringVideoGenerationQueueSummary;
+  audio_generation_queue?: MonitoringVideoGenerationQueueSummary;
   task_latency: MonitoringLatencySummary;
   stage_latency: MonitoringStageLatencySummary;
   users: MonitoringUserStat[];
@@ -805,11 +950,12 @@ export type MonitoringSummary = {
 
 export type MonitoringTaskDetail = {
   row_key: string;
-  source_type?: "image" | "event" | string;
+  source_type?: "image" | "event" | "video" | "audio" | string;
   task_id: string;
   owner_id: string;
-  status: "success" | "error";
+  status: "queued" | "running" | "success" | "error" | "canceled";
   image_count: number;
+  media_count?: number;
   mode: string;
   model: string;
   duration_ms: number;
@@ -818,6 +964,11 @@ export type MonitoringTaskDetail = {
   error: string;
   completed_at: string;
   image_url: string;
+  video_url?: string;
+  audio_url?: string;
+  cover_url?: string;
+  voice_id?: string;
+  output_format?: string;
   reference_images?: MonitoringTaskReferenceImage[];
 };
 
@@ -831,16 +982,121 @@ export type MonitoringTaskReferenceImage = {
 };
 
 export type MonitoringTaskDetails = {
+  source?: MonitoringSource;
   items: MonitoringTaskDetail[];
   record_count: number;
   image_count: number;
+  media_count?: number;
   cost_total?: number;
   cost_count?: number;
   limit: number;
+  offset?: number;
   truncated: boolean;
+  has_more?: boolean;
+  next_cursor?: { event_at: string; task_key: string } | null;
   range: MonitoringSummary["range"];
   owner_id: string;
-  status: "all" | "success" | "error";
+  status: "all" | "queued" | "running" | "success" | "error" | "canceled";
+};
+
+export type UpstreamBillingSource = "all" | "image" | "video" | "chat" | "audio";
+
+export type UpstreamBillingSyncStatus = {
+  provider: string;
+  enabled: boolean;
+  configured: boolean;
+  scope: "key" | "user";
+  status: "idle" | "running" | "success" | "error" | "unavailable" | string;
+  last_started_at: string;
+  last_success_at: string;
+  last_error_at: string;
+  last_error: string;
+  last_window_from: string;
+  last_window_to: string;
+  last_full_sync_at: string;
+  records_seen: number;
+  records_upserted: number;
+  interval_secs: number;
+  lookback_days: number;
+  full_lookback_days: number;
+};
+
+export type UpstreamBillingModelStat = {
+  model: string;
+  model_version?: string;
+  model_type: string;
+  count: number;
+  success_count: number;
+  failed_count: number;
+  cost: number;
+  refunded_count: number;
+  refunded_amount: number;
+};
+
+export type UpstreamBillingUserStat = {
+  owner_id: string;
+  username: string;
+  name: string;
+  count: number;
+  cost: number;
+  refunded_count: number;
+  refunded_amount: number;
+};
+
+export type UpstreamBillingSummary = {
+  source: UpstreamBillingSource;
+  unit: string;
+  record_count: number;
+  success_count: number;
+  failed_count: number;
+  total_cost: number;
+  refunded_count: number;
+  refunded_amount: number;
+  assigned_count: number;
+  unassigned_count: number;
+  models: UpstreamBillingModelStat[];
+  users: UpstreamBillingUserStat[];
+  range: MonitoringSummary["range"];
+  sync: UpstreamBillingSyncStatus;
+};
+
+export type UpstreamBillingRecord = {
+  row_key: string;
+  upstream_task_id: string;
+  model: string;
+  upstream_model: string;
+  requested_model: string;
+  model_version: string;
+  model_type: string;
+  channel_group: string;
+  state: string;
+  unit: string;
+  cost: number;
+  refunded: boolean;
+  refunded_amount: number;
+  created_at: string;
+  completed_at: string;
+  event_at: string;
+  local_source: string;
+  local_task_id: string;
+  owner_id: string;
+  owner_username: string;
+  owner_name: string;
+  attribution_status: "matched" | "unassigned";
+};
+
+export type UpstreamBillingRecords = {
+  source: UpstreamBillingSource;
+  items: UpstreamBillingRecord[];
+  record_count: number;
+  cost_total: number;
+  refunded_amount: number;
+  unit: string;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  query: string;
+  range: MonitoringSummary["range"];
 };
 
 export type AgentVideoAsset = {
@@ -977,29 +1233,96 @@ export async function fetchUsers() {
   return httpRequest<{ items: UserAccount[]; total: number }>(`/api/users?_t=${Date.now()}`);
 }
 
-export async function fetchMonitoringSummary(options: { startAt?: string; endAt?: string } = {}) {
+export async function fetchMonitoringSummary(options: { startAt?: string; endAt?: string; source?: MonitoringSource } = {}) {
   const params = new URLSearchParams({ _t: String(Date.now()) });
   if (options.startAt) params.set("startAt", options.startAt);
   if (options.endAt) params.set("endAt", options.endAt);
+  if (options.source) params.set("source", options.source);
   return httpRequest<MonitoringSummary>(`/api/monitoring/summary?${params.toString()}`);
+}
+
+export async function fetchMonitoringQueues() {
+  return httpRequest<MonitoringQueuesResponse>(`/api/monitoring/queues?_t=${Date.now()}`);
 }
 
 export async function fetchMonitoringTasks(options: {
   startAt?: string;
   endAt?: string;
   ownerId?: string;
-  status?: "all" | "success" | "error";
+  status?: "all" | "queued" | "running" | "success" | "error" | "canceled";
+  source?: MonitoringSource;
   limit?: number;
+  offset?: number;
+  q?: string;
+  costOnly?: boolean;
   includeReferences?: boolean;
+  cursor?: { event_at: string; task_key: string } | null;
 } = {}) {
   const params = new URLSearchParams({ _t: String(Date.now()) });
   if (options.startAt) params.set("startAt", options.startAt);
   if (options.endAt) params.set("endAt", options.endAt);
   if (options.ownerId) params.set("ownerId", options.ownerId);
   if (options.status) params.set("status", options.status);
+  if (options.source) params.set("source", options.source);
   if (options.limit) params.set("limit", String(options.limit));
+  if (options.offset) params.set("offset", String(options.offset));
+  if (options.q?.trim()) params.set("q", options.q.trim());
+  if (options.costOnly) params.set("costOnly", "1");
   if (options.includeReferences) params.set("includeReferences", "1");
+  if (options.cursor?.event_at && options.cursor.task_key) {
+    params.set("cursorAt", options.cursor.event_at);
+    params.set("cursorKey", options.cursor.task_key);
+  }
   return httpRequest<MonitoringTaskDetails>(`/api/monitoring/tasks?${params.toString()}`);
+}
+
+export async function fetchUpstreamBillingSummary(options: {
+  source?: UpstreamBillingSource;
+  startAt?: string;
+  endAt?: string;
+} = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.source) params.set("source", options.source);
+  if (options.startAt) params.set("startAt", options.startAt);
+  if (options.endAt) params.set("endAt", options.endAt);
+  return httpRequest<UpstreamBillingSummary>(`/api/billing/summary?${params.toString()}`);
+}
+
+export async function fetchUpstreamBillingRecords(options: {
+  source?: UpstreamBillingSource;
+  startAt?: string;
+  endAt?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+} = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.source) params.set("source", options.source);
+  if (options.startAt) params.set("startAt", options.startAt);
+  if (options.endAt) params.set("endAt", options.endAt);
+  if (options.q?.trim()) params.set("q", options.q.trim());
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.offset) params.set("offset", String(options.offset));
+  return httpRequest<UpstreamBillingRecords>(`/api/billing/records?${params.toString()}`);
+}
+
+export async function fetchUpstreamBillingSyncStatus() {
+  return httpRequest<UpstreamBillingSyncStatus>(`/api/billing/sync-status?_t=${Date.now()}`);
+}
+
+export async function syncUpstreamBilling(days = 2) {
+  const params = new URLSearchParams({ days: String(Math.min(30, Math.max(1, days))) });
+  return httpRequest<{
+    ok: boolean;
+    provider: string;
+    scope: string;
+    days: number;
+    records_seen: number;
+    records_upserted: number;
+    window_from: string;
+    window_to: string;
+    sync: UpstreamBillingSyncStatus;
+  }>(`/api/billing/sync?${params.toString()}`, { method: "POST" });
 }
 
 export async function fetchVideoGenerationQueue() {
@@ -1090,10 +1413,11 @@ export async function startImageAgentRun(body: {
   });
 }
 
-export async function uploadAgentVideos(files: File[], conversationId = "") {
+export async function uploadAgentVideos(files: File[], conversationId = "", analyze = false) {
   const formData = new FormData();
   files.forEach((file) => formData.append("videos", file, file.name));
   if (conversationId) formData.append("conversation_id", conversationId);
+  if (analyze) formData.append("analyze", "true");
   return httpRequest<AgentVideoUploadResponse>("/api/image-agent/videos", {
     method: "POST",
     body: formData,
@@ -1264,6 +1588,44 @@ export async function streamAgentRunEvents(
   }
 }
 
+export async function streamRealtimeEvents(
+  onEvent: (event: RealtimeEvent) => void | Promise<void>,
+  options: { signal?: AbortSignal } = {},
+) {
+  const authKey = await getStoredAuthKey();
+  const response = await fetch(`${webConfig.apiUrl}/api/events/stream`, {
+    method: "GET",
+    headers: {
+      Accept: "text/event-stream",
+      ...(authKey ? { Authorization: `Bearer ${authKey}` } : {}),
+    },
+    signal: options.signal,
+  });
+  if (!response.ok) throw new Error(`实时事件连接失败 (${response.status})`);
+  if (!response.body) throw new Error("当前浏览器无法读取实时事件流");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      let eventType = "message";
+      const dataLines: string[] = [];
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith("event:")) eventType = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+      }
+      if (!dataLines.length || (eventType !== "announcement" && eventType !== "image_task_progress")) continue;
+      await onEvent({ type: eventType, data: JSON.parse(dataLines.join("\n")) } as RealtimeEvent);
+    }
+    if (done) break;
+  }
+}
+
 export async function createImageGenerationTask(
   clientTaskId: string,
   prompt: string,
@@ -1278,6 +1640,7 @@ export async function createImageGenerationTask(
   batchIndex = 0,
   batchTotal = 1,
   promptEngineMode: PromptEngineMode = "standard",
+  imageOptions: ImageTaskImageOptions = {},
 ) {
   return httpRequest<ImageTask>("/api/image-tasks/generations", {
     method: "POST",
@@ -1287,6 +1650,12 @@ export async function createImageGenerationTask(
       ...(model ? { model } : {}),
       ...(size ? { size } : {}),
       quality,
+      ...(imageOptions.aspectRatio ? { aspect_ratio: imageOptions.aspectRatio } : {}),
+      ...(imageOptions.imageSize ? { image_size: imageOptions.imageSize } : {}),
+      ...(imageOptions.thinkingLevel ? { thinking_level: imageOptions.thinkingLevel } : {}),
+      ...(imageOptions.imageCount ? { n: Math.min(4, Math.max(1, Math.round(imageOptions.imageCount))) } : {}),
+      ...(imageOptions.source ? { source: imageOptions.source } : {}),
+      ...(imageOptions.source === "canvas" ? { canvas_units: Math.max(1, Math.round(imageOptions.canvasUnits || imageOptions.imageCount || 1)) } : {}),
       prompt_engine_mode: promptEngineMode,
       ...(conversationId ? { conversation_id: conversationId } : {}),
       ...(turnId ? { turn_id: turnId } : {}),
@@ -1316,6 +1685,7 @@ export async function createImageEditTask(
   referenceUploadMs = 0,
   referenceCacheHits = 0,
   promptEngineMode: PromptEngineMode = "standard",
+  imageOptions: ImageTaskImageOptions = {},
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
@@ -1335,6 +1705,24 @@ export async function createImageEditTask(
     formData.append("size", size);
   }
   formData.append("quality", quality);
+  if (imageOptions.aspectRatio) {
+    formData.append("aspect_ratio", imageOptions.aspectRatio);
+  }
+  if (imageOptions.imageSize) {
+    formData.append("image_size", imageOptions.imageSize);
+  }
+  if (imageOptions.thinkingLevel) {
+    formData.append("thinking_level", imageOptions.thinkingLevel);
+  }
+  if (imageOptions.imageCount) {
+    formData.append("n", String(Math.min(4, Math.max(1, Math.round(imageOptions.imageCount)))));
+  }
+  if (imageOptions.source) {
+    formData.append("source", imageOptions.source);
+  }
+  if (imageOptions.source === "canvas") {
+    formData.append("canvas_units", String(Math.max(1, Math.round(imageOptions.canvasUnits || imageOptions.imageCount || 1))));
+  }
   formData.append("prompt_engine_mode", promptEngineMode);
   formData.append("preserve_subject", preserveSubject ? "true" : "false");
   if (conversationId) {
@@ -1397,8 +1785,21 @@ export async function fetchImageTasks(ids: string[]) {
   };
 }
 
-export async function fetchImageConversationsRemote() {
-  return httpRequest<ImageConversationListResponse>(`/api/image-conversations?_t=${Date.now()}`);
+export async function fetchImageConversationsRemote(options: {
+  limit?: number;
+  cursor?: ImageConversationCursor | null;
+} = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor?.updated_at && options.cursor.id) {
+    params.set("cursorAt", options.cursor.updated_at);
+    params.set("cursorId", options.cursor.id);
+  }
+  return httpRequest<ImageConversationListResponse>(`/api/image-conversations?${params.toString()}`);
+}
+
+export async function fetchImageConversationCount() {
+  return httpRequest<{ count: number }>(`/api/image-conversations/count?_t=${Date.now()}`);
 }
 
 export async function upsertImageConversationRemote(conversation: ImageConversationApiPayload, headers?: Record<string, string>) {
@@ -1483,7 +1884,7 @@ export async function downloadImageTaskZip(body: {
         folder_name: body.folderName,
         items: body.items.map((item) => ({
           task_id: item.taskId,
-          image_index: item.imageIndex || 0,
+          image_index: item.imageIndex ?? 0,
           filename: item.filename,
         })),
       },
@@ -1513,37 +1914,53 @@ export async function createVideoGenerationTask(body: {
   model: string;
   mode?: "text_to_video" | "image_to_video";
   aspectRatio?: string;
-  durationSecs?: number;
+  durationSecs?: VideoGenerationDuration;
   quality?: string;
   resolution?: string;
   imageUrls?: string[];
   params?: Record<string, unknown>;
   conversationId?: string;
   turnId?: string;
+  source?: "standard" | "canvas";
+  canvasUnits?: number;
 }) {
   return httpRequest<VideoGenerationTask>("/api/video-generation/tasks", {
     method: "POST",
+    timeout: 30_000,
     body: {
       client_task_id: body.clientTaskId,
       prompt: body.prompt,
       model: body.model,
       mode: body.mode || (body.imageUrls?.length ? "image_to_video" : "text_to_video"),
       aspect_ratio: body.aspectRatio || "16:9",
-      duration_secs: body.durationSecs || 5,
+      duration_secs: body.durationSecs ?? 5,
       quality: body.quality || "standard",
       resolution: body.resolution || "",
       image_urls: body.imageUrls || [],
       params: body.params || {},
       conversation_id: body.conversationId || "",
       turn_id: body.turnId || "",
+      source: body.source || "standard",
+      canvas_units: body.source === "canvas" ? Math.max(1, Math.round(body.canvasUnits || 1)) : 1,
     },
   });
 }
 
-export async function fetchVideoGenerationTasks(ids: string[] = []) {
+export async function fetchVideoGenerationTasks(
+  ids: string[] = [],
+  options: { limit?: number; cursor?: string; status?: VideoGenerationTask["status"]; q?: string; allOwners?: boolean; ownerId?: string; conversationId?: string } = {},
+) {
   const uniqueIds = Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)));
   if (!uniqueIds.length) {
-    return httpRequest<VideoGenerationTaskListResponse>(`/api/video-generation/tasks?_t=${Date.now()}`);
+    const params = new URLSearchParams({ _t: String(Date.now()) });
+    if (options.limit) params.set("limit", String(options.limit));
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.status) params.set("status", options.status);
+    if (options.q?.trim()) params.set("q", options.q.trim());
+    if (options.allOwners) params.set("all_owners", "true");
+    if (options.ownerId?.trim()) params.set("owner_id", options.ownerId.trim());
+    if (options.conversationId?.trim()) params.set("conversation_id", options.conversationId.trim());
+    return httpRequest<VideoGenerationTaskListResponse>(`/api/video-generation/tasks?${params.toString()}`, { timeout: 30_000 });
   }
   const chunkSize = 100;
   const chunks = Array.from(
@@ -1555,18 +1972,180 @@ export async function fetchVideoGenerationTasks(ids: string[] = []) {
       httpRequest<VideoGenerationTaskListResponse>("/api/video-generation/tasks/query", {
         method: "POST",
         body: { ids: chunk },
+        timeout: 30_000,
       }),
     ),
   );
   return {
     items: responses.flatMap((response) => response.items),
-    missing_ids: responses.flatMap((response) => response.missing_ids),
+    missing_ids: responses.flatMap((response) => response.missing_ids || []),
   } as VideoGenerationTaskListResponse;
 }
 
 export async function cancelVideoGenerationTask(taskId: string) {
   return httpRequest<VideoGenerationTask>(`/api/video-generation/tasks/${encodeURIComponent(taskId)}/cancel`, {
     method: "POST",
+  });
+}
+
+export async function reconcileVideoGenerationTask(taskId: string) {
+  return httpRequest<VideoGenerationTask>(`/api/video-generation/tasks/${encodeURIComponent(taskId)}/reconcile`, {
+    method: "POST",
+  });
+}
+
+export async function deleteVideoGenerationTask(taskId: string) {
+  return httpRequest<{ ok: boolean; deleted: number }>(`/api/video-generation/tasks/${encodeURIComponent(taskId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function deleteVideoGenerationConversation(conversationId: string) {
+  return httpRequest<{ ok: boolean; deleted: number }>(`/api/video-generation/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function createVideoAgentPlan(body: {
+  prompt: string;
+  conversationId?: string;
+  turnId?: string;
+  images?: ReferenceUploadItem[];
+  videos?: AgentVideoAsset[];
+}) {
+  return httpRequest<VideoAgentPlan>("/api/video-agent/plans", {
+    method: "POST",
+    body: {
+      prompt: body.prompt,
+      conversation_id: body.conversationId || "",
+      turn_id: body.turnId || "",
+      images: (body.images || []).map((item) => ({
+        name: item.filename || "image",
+        filename: item.filename || "",
+        type: item.mime_type || "image/jpeg",
+        mime_type: item.mime_type || "image/jpeg",
+        url: item.url,
+        sha256: item.sha256 || "",
+        size: item.file_size || 0,
+      })),
+      videos: (body.videos || []).map((item) => ({
+        video_id: item.videoId,
+        name: item.name || item.filename || "video.mp4",
+        filename: item.filename || item.name || "video.mp4",
+        type: item.type || item.mimeType || "video/mp4",
+        mime_type: item.mimeType || item.type || "video/mp4",
+        url: item.url,
+        sha256: item.sha256 || "",
+        size: item.size || item.fileSize || 0,
+      })),
+    },
+  });
+}
+
+export async function streamVideoAgentPlan(
+  body: {
+    prompt: string;
+    conversationId?: string;
+    turnId?: string;
+    images?: ReferenceUploadItem[];
+    videos?: AgentVideoAsset[];
+  },
+  onEvent: (event: VideoAgentPlanStreamEvent) => void | Promise<void>,
+  options: { signal?: AbortSignal } = {},
+) {
+  const authKey = await getStoredAuthKey();
+  const response = await fetch(`${webConfig.apiUrl}/api/video-agent/plans/stream`, {
+    method: "POST",
+    headers: {
+      Accept: "text/event-stream",
+      "Content-Type": "application/json",
+      ...(authKey ? { Authorization: `Bearer ${authKey}` } : {}),
+    },
+    body: JSON.stringify({
+      prompt: body.prompt,
+      conversation_id: body.conversationId || "",
+      turn_id: body.turnId || "",
+      reasoning: true,
+      images: (body.images || []).map((item) => ({
+        name: item.filename || "image",
+        filename: item.filename || "",
+        type: item.mime_type || "image/jpeg",
+        mime_type: item.mime_type || "image/jpeg",
+        url: item.url,
+        sha256: item.sha256 || "",
+        size: item.file_size || 0,
+      })),
+      videos: (body.videos || []).map((item) => ({
+        video_id: item.videoId,
+        name: item.name || item.filename || "video.mp4",
+        filename: item.filename || item.name || "video.mp4",
+        type: item.type || item.mimeType || "video/mp4",
+        mime_type: item.mimeType || item.type || "video/mp4",
+        url: item.url,
+        sha256: item.sha256 || "",
+        size: item.size || item.fileSize || 0,
+      })),
+    }),
+    signal: options.signal,
+  });
+  if (!response.ok) {
+    let message = `推理请求失败 (${response.status})`;
+    try {
+      const payload = await response.json() as {
+        detail?: string | { error?: string | { message?: string } };
+      };
+      const detail = payload.detail;
+      if (typeof detail === "string") message = detail;
+      else if (typeof detail?.error === "string") message = detail.error;
+      else if (detail?.error?.message) message = detail.error.message;
+    } catch {
+      // Keep the HTTP status fallback when the server did not return JSON.
+    }
+    throw new Error(message);
+  }
+  if (!response.body) throw new Error("当前浏览器无法读取推理事件流");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || "";
+    for (const frame of frames) {
+      const data = frame
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n");
+      if (!data) continue;
+      const event = JSON.parse(data) as VideoAgentPlanStreamEvent;
+      if (event.type === "error") throw new Error(event.message || "推理请求失败");
+      await onEvent(event);
+    }
+    if (done) break;
+  }
+}
+
+export async function fetchVideoAgentPlans(options: { limit?: number; conversationId?: string } = {}) {
+  const params = new URLSearchParams({
+    limit: String(options.limit || 200),
+    _t: String(Date.now()),
+  });
+  if (options.conversationId?.trim()) params.set("conversation_id", options.conversationId.trim());
+  return httpRequest<VideoAgentPlanListResponse>(`/api/video-agent/plans?${params.toString()}`);
+}
+
+export async function deleteVideoAgentPlan(planId: string) {
+  return httpRequest<{ ok: boolean; deleted: number }>(`/api/video-agent/plans/${encodeURIComponent(planId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function deleteVideoAgentConversation(conversationId: string) {
+  return httpRequest<{ ok: boolean; deleted: number }>(`/api/video-agent/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "DELETE",
   });
 }
 
@@ -1638,7 +2217,6 @@ export async function fetchImageLibrary(options: {
   favorite?: boolean;
   allOwners?: boolean;
   ownerId?: string;
-  includeReferences?: boolean;
 } = {}) {
   const {
     limit = 80,
@@ -1650,7 +2228,6 @@ export async function fetchImageLibrary(options: {
     favorite = false,
     allOwners = false,
     ownerId = "",
-    includeReferences = false,
   } = options;
   const params = new URLSearchParams({
     limit: String(limit),
@@ -1679,10 +2256,13 @@ export async function fetchImageLibrary(options: {
   if (ownerId.trim()) {
     params.set("owner_id", ownerId.trim());
   }
-  if (includeReferences) {
-    params.set("includeReferences", "1");
-  }
   return httpRequest<ImageLibraryResponse>(`/api/image-library?${params.toString()}`);
+}
+
+export async function fetchImageLibraryItem(id: number, options: { includeReferences?: boolean } = {}) {
+  const params = new URLSearchParams({ _t: String(Date.now()) });
+  if (options.includeReferences) params.set("includeReferences", "1");
+  return httpRequest<ImageLibraryItem>(`/api/image-library/${id}?${params.toString()}`);
 }
 
 export async function updateImageLibraryItem(id: number, body: { favorite?: boolean; deleted?: boolean }) {
@@ -1792,8 +2372,8 @@ export async function updatePromptTemplate(id: number, body: Partial<PromptTempl
   });
 }
 
-export async function disablePromptTemplate(id: number) {
-  return httpRequest<PromptTemplate>(`/api/prompt-templates/${id}`, {
+export async function deletePromptTemplate(id: number) {
+  return httpRequest<{ ok: boolean; deleted: boolean; id: number; name: string }>(`/api/prompt-templates/${id}`, {
     method: "DELETE",
   });
 }

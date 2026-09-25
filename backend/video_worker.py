@@ -20,6 +20,7 @@ from services.ecommerce.video_analysis_queue_service import (  # noqa: E402
     video_analysis_queue_service,
 )
 from services.ecommerce.video_analysis_service import professional_video_analysis_service  # noqa: E402
+from services.video.video_agent_service import video_agent_message_service  # noqa: E402
 from services.platform.runtime_requirements import validate_enterprise_runtime  # noqa: E402
 
 
@@ -73,6 +74,13 @@ def _retry_or_dead_letter(message: VideoAnalysisQueueMessage, error: BaseExcepti
         owner_id=message.owner_id,
         error=final_error,
     )
+    try:
+        video_agent_message_service.process_pending_messages_for_video(
+            message.video_id,
+            owner_id=message.owner_id,
+        )
+    except Exception:
+        LOGGER.exception("Could not fail pending video agent messages for %s", message.video_id)
     dead_id = video_analysis_queue_service.dead_letter(message, attempt=next_attempt, error=final_error)
     video_analysis_queue_service.release_pending(video_id=message.video_id, owner_id=message.owner_id)
     LOGGER.error(
@@ -96,6 +104,13 @@ def _process_message(message: VideoAnalysisQueueMessage, *, stop_event: threadin
     if current.get("analysisStatus") == "ready":
         video_analysis_queue_service.release_pending(video_id=message.video_id, owner_id=message.owner_id)
         video_analysis_queue_service.ack(message)
+        try:
+            video_agent_message_service.process_pending_messages_for_video(
+                message.video_id,
+                owner_id=message.owner_id,
+            )
+        except Exception:
+            LOGGER.exception("Could not resume pending video agent messages for %s", message.video_id)
         return
 
     lease = video_analysis_queue_service.acquire_execution(owner_id=message.owner_id)
@@ -113,6 +128,10 @@ def _process_message(message: VideoAnalysisQueueMessage, *, stop_event: threadin
     heartbeat.start()
     try:
         professional_video_analysis_service.analyze_video_safely(message.video_id, owner_id=message.owner_id)
+        video_agent_message_service.process_pending_messages_for_video(
+            message.video_id,
+            owner_id=message.owner_id,
+        )
         video_analysis_queue_service.release_pending(video_id=message.video_id, owner_id=message.owner_id)
         video_analysis_queue_service.ack(message)
     except Exception as exc:

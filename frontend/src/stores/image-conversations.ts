@@ -7,6 +7,7 @@ import {
   renameImageConversationRemote,
   upsertImageConversationRemote,
   type ImageConversationApiPayload,
+  type ImageConversationCursor,
   type AgentEvent,
   type AgentRun,
   type ImageAgentAdvisor,
@@ -17,7 +18,10 @@ import {
   type ProfessionalSceneType,
   type SubjectMutationPolicy,
 } from "@/lib/api";
+import { storageName } from "@/lib/storage-namespace";
 import { getStoredAuthKey, getStoredAuthSession } from "@/stores/auth";
+
+export type { ImageConversationCursor } from "@/lib/api";
 
 export type ImageConversationMode = "generate" | "edit";
 
@@ -162,18 +166,26 @@ export type ImageConversation = {
   turns: ImageTurn[];
 };
 
+export type ImageConversationRemotePage = {
+  items: ImageConversation[];
+  total: number;
+  limit: number;
+  hasMore: boolean;
+  nextCursor: ImageConversationCursor | null;
+};
+
 export type ImageConversationStats = {
   queued: number;
   running: number;
 };
 
 const legacyImageConversationStorage = localforage.createInstance({
-  name: "gmkraw",
+  name: storageName("gmkraw"),
   storeName: "image_conversations",
 });
 
 const singleImageConversationStorage = localforage.createInstance({
-  name: "gmkraw",
+  name: storageName("gmkraw"),
   storeName: "image_single_conversations",
 });
 
@@ -181,6 +193,7 @@ const IMAGE_CONVERSATIONS_KEY = "items";
 const ACCOUNT_IMAGE_CONVERSATIONS_PREFIX = "items:account:";
 const ANONYMOUS_IMAGE_CONVERSATIONS_KEY = "items:anonymous";
 const IMAGE_CONVERSATIONS_LEGACY_MIGRATION_KEY = "legacy_migration_v1";
+const REMOTE_CONVERSATION_SYNC_ENABLED = import.meta.env.VITE_REMOTE_CONVERSATION_SYNC_ENABLED !== "false";
 let imageConversationWriteQueue: Promise<void> = Promise.resolve();
 let imageConversationRemoteWriteQueue: Promise<void> = Promise.resolve();
 let imageConversationMigrationPromise: Promise<void> | null = null;
@@ -618,7 +631,10 @@ function compactConversationForStorage(conversation: ImageConversation): ImageCo
 }
 
 function sortImageConversations(conversations: ImageConversation[]): ImageConversation[] {
-  return [...conversations].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return [...conversations].sort((a, b) => {
+    const timestampOrder = b.updatedAt.localeCompare(a.updatedAt);
+    return timestampOrder || b.id.localeCompare(a.id);
+  });
 }
 
 function getTimestamp(value: string) {
@@ -855,6 +871,7 @@ async function readStoredImageConversations(): Promise<ImageConversation[]> {
 }
 
 async function syncRemoteConversation(conversation: ImageConversation, headers?: Record<string, string>) {
+  if (!REMOTE_CONVERSATION_SYNC_ENABLED) return;
   try {
     await upsertImageConversationRemote(slimConversationForRemote(conversation), headers);
   } catch {
@@ -863,6 +880,7 @@ async function syncRemoteConversation(conversation: ImageConversation, headers?:
 }
 
 async function syncRemoteConversations(conversations: ImageConversation[]) {
+  if (!REMOTE_CONVERSATION_SYNC_ENABLED) return;
   const headers = await currentAuthHeaders();
   await Promise.allSettled(
     conversations.map((conversation) => (
@@ -875,37 +893,69 @@ export async function listLocalImageConversations(): Promise<ImageConversation[]
   return sortImageConversations(await readStoredImageConversations());
 }
 
+function normalizeRemoteCursor(value: unknown): ImageConversationCursor | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as { updated_at?: unknown; id?: unknown };
+  const updatedAt = typeof candidate.updated_at === "string" ? candidate.updated_at.trim() : "";
+  const id = typeof candidate.id === "string" ? candidate.id.trim() : "";
+  return updatedAt && id ? { updated_at: updatedAt, id } : null;
+}
+
+function mergeRemoteConversations(
+  localItems: ImageConversation[],
+  remoteItems: ImageConversation[],
+): ImageConversation[] {
+  const conversationMap = new Map(localItems.map((item) => [item.id, item]));
+  for (const conversation of remoteItems) {
+    const current = conversationMap.get(conversation.id);
+    conversationMap.set(conversation.id, current ? pickLatestConversation(current, conversation) : conversation);
+  }
+  return sortImageConversations([...conversationMap.values()]);
+}
+
+export async function refreshImageConversationsRemotePage(
+  localItems?: ImageConversation[],
+  options: { limit?: number; cursor?: ImageConversationCursor | null } = {},
+): Promise<ImageConversationRemotePage> {
+  const baseLocalItems = sortImageConversations(
+    (localItems || await readStoredImageConversations()).map(normalizeConversation),
+  );
+  const requestedLimit = Math.max(1, Math.min(200, Math.round(Number(options.limit) || 50)));
+  if (!REMOTE_CONVERSATION_SYNC_ENABLED) {
+    return {
+      items: baseLocalItems,
+      total: baseLocalItems.length,
+      limit: requestedLimit,
+      hasMore: false,
+      nextCursor: null,
+    };
+  }
+
+  const remote = await fetchImageConversationsRemote({ limit: requestedLimit, cursor: options.cursor });
+  const remoteItems = sortImageConversations(
+    (remote.items || []).map((item) => normalizeConversation(item as ImageConversation & Record<string, unknown>)),
+  );
+  const mergedItems = mergeRemoteConversations(baseLocalItems, remoteItems);
+  await writeStoredImageConversations(mergedItems);
+  const nextCursor = normalizeRemoteCursor(remote.next_cursor);
+  return {
+    items: mergedItems,
+    total: Number.isFinite(Number(remote.total)) ? Number(remote.total) : remoteItems.length,
+    limit: Number.isFinite(Number(remote.limit)) ? Number(remote.limit) : requestedLimit,
+    hasMore: remote.has_more === true && Boolean(nextCursor),
+    nextCursor: remote.has_more === true ? nextCursor : null,
+  };
+}
+
 export async function refreshImageConversationsRemote(
   localItems?: ImageConversation[],
 ): Promise<ImageConversation[]> {
   const baseLocalItems = sortImageConversations((localItems || await readStoredImageConversations()).map(normalizeConversation));
   try {
-    const remote = await fetchImageConversationsRemote();
-    const remoteItems = sortImageConversations(
-      remote.items.map((item) => normalizeConversation(item as ImageConversation & Record<string, unknown>)),
-    );
-    if (remoteItems.length) {
-      const conversationMap = new Map(baseLocalItems.map((item) => [item.id, item]));
-      for (const conversation of remoteItems) {
-        const current = conversationMap.get(conversation.id);
-        conversationMap.set(conversation.id, current ? pickLatestConversation(current, conversation) : conversation);
-      }
-      const mergedItems = sortImageConversations([...conversationMap.values()]);
-      await writeStoredImageConversations(mergedItems);
-      return mergedItems;
-    }
-    if (baseLocalItems.length) {
-      void syncRemoteConversations(baseLocalItems);
-      return baseLocalItems;
-    }
-    return [];
+    return (await refreshImageConversationsRemotePage(baseLocalItems)).items;
   } catch {
     return baseLocalItems;
   }
-}
-
-export async function listImageConversations(): Promise<ImageConversation[]> {
-  return refreshImageConversationsRemote(await listLocalImageConversations());
 }
 
 export async function saveImageConversations(

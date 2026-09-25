@@ -2,6 +2,7 @@ param(
     [string]$EnvFile = ".env.intranet",
     [int]$WorkerReplicas = 2,
     [int]$AgentWorkerReplicas = 2,
+    [int]$VideoCompositionWorkerReplicas = 1,
     [switch]$Build
 )
 
@@ -29,6 +30,10 @@ if ($AgentWorkerReplicas -lt 1 -or $AgentWorkerReplicas -gt 4) {
     throw "AgentWorkerReplicas must be between 1 and 4 for this deployment profile"
 }
 
+if ($VideoCompositionWorkerReplicas -lt 1 -or $VideoCompositionWorkerReplicas -gt 4) {
+    throw "VideoCompositionWorkerReplicas must be between 1 and 4"
+}
+
 $compose = @(
     "compose",
     "--env-file", $ResolvedEnvFile,
@@ -42,10 +47,11 @@ if ($Build) {
 $up += @(
     "--scale", "worker=$WorkerReplicas",
     "--scale", "agent-worker=$AgentWorkerReplicas",
-    "mysql", "redis", "schema-init", "app", "worker", "agent-worker"
+    "--scale", "video-composition-worker=$VideoCompositionWorkerReplicas",
+    "mysql", "redis", "schema-init", "app", "worker", "agent-worker", "video-worker", "video-composition-worker"
 )
 
-Write-Host "Starting intranet stack with $WorkerReplicas image worker replica(s) and $AgentWorkerReplicas Agent worker replica(s)..."
+Write-Host "Starting intranet stack with $WorkerReplicas image worker replica(s), $AgentWorkerReplicas Agent worker replica(s), and $VideoCompositionWorkerReplicas composition worker replica(s)..."
 & docker @compose @up
 
 Write-Host ""

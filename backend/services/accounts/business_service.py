@@ -338,6 +338,18 @@ class BusinessService:
             changed = False
             for item in DEFAULT_TEMPLATES:
                 key = (_clean(item.get("name")), _clean(item.get("category")))
+                was_deleted = (
+                    session.query(AuditLogModel.id)
+                    .filter(
+                        AuditLogModel.action == "delete",
+                        AuditLogModel.target_type == "template",
+                        AuditLogModel.detail == key[0],
+                    )
+                    .first()
+                    is not None
+                )
+                if was_deleted:
+                    continue
                 row = (
                     session.query(PromptTemplateModel)
                     .filter(
@@ -590,11 +602,13 @@ class BusinessService:
                     like = f"%{keyword}%"
                     query = query.filter(or_(PromptTemplateModel.name.like(like), PromptTemplateModel.content.like(like)))
                 rows = query.order_by(desc(PromptTemplateModel.updated_at), desc(PromptTemplateModel.id)).limit(500).all()
+                owner_names = self._template_owner_names(session, rows) if is_admin else {}
                 return {
                     "items": [
                         self._public_template(
                             row,
                             can_manage=is_admin or _clean(row.owner_id) == owner_id,
+                            owner_name=(owner_names.get(_clean(row.owner_id), "系统模板" if _clean(row.created_by) == "system" else _clean(row.owner_id)) if is_admin else None),
                         )
                         for row in rows
                     ],
@@ -604,6 +618,23 @@ class BusinessService:
                 session.close()
 
         return self._list_cache.get_or_set(cache_key, _build)
+
+    @staticmethod
+    def _template_owner_names(session, rows: list[PromptTemplateModel]) -> dict[str, str]:
+        owner_ids = {_clean(row.owner_id) for row in rows if _clean(row.owner_id) and _clean(row.owner_id) != "local-admin"}
+        names = {"local-admin": "系统模板"}
+        if not owner_ids:
+            return names
+        try:
+            user_rows = session.execute(text("SELECT id, username, name FROM business_users")).mappings().all()
+        except Exception:
+            return names
+        for user in user_rows:
+            user_id = _clean(user.get("id"))
+            if user_id not in owner_ids:
+                continue
+            names[user_id] = _clean(user.get("name")) or _clean(user.get("username")) or user_id
+        return names
 
     def create_template(self, *, identity: dict[str, object], data: dict[str, object]) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "local-admin"
@@ -621,11 +652,6 @@ class BusinessService:
                 name=name,
                 category=_clean(data.get("category"), "main"),
                 content=content,
-                model=_clean(data.get("model")) or None,
-                size=_clean(data.get("size")) or None,
-                quality=_clean(data.get("quality")) or None,
-                preserve_subject=1 if data.get("preserve_subject") else 0,
-                enabled=1 if data.get("enabled", True) else 0,
             )
             session.add(row)
             session.flush()
@@ -650,7 +676,7 @@ class BusinessService:
             row = query.one_or_none()
             if row is None:
                 return None
-            for field in ("name", "category", "content", "model", "size", "quality"):
+            for field in ("name", "category", "content"):
                 if field in data:
                     value = _clean(data.get(field))
                     if field in {"name", "content"} and not value:
@@ -659,15 +685,35 @@ class BusinessService:
                         setattr(row, field, value or "main")
                     else:
                         setattr(row, field, value or None)
-            if "preserve_subject" in data:
-                row.preserve_subject = 1 if data.get("preserve_subject") else 0
-            if "enabled" in data:
-                row.enabled = 1 if data.get("enabled") else 0
             row.updated_at = _now()
             self._log(session, identity, "update", "template", row.id, row.name)
             session.commit()
             self._invalidate_list_cache()
             return self._public_template(row, can_manage=True)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def delete_template(self, *, identity: dict[str, object], template_id: int) -> dict[str, Any] | None:
+        owner_id = _clean(identity.get("id")) or "local-admin"
+        is_admin = _clean(identity.get("role")) == "admin"
+        session = self._session()
+        try:
+            query = session.query(PromptTemplateModel).filter(PromptTemplateModel.id == template_id)
+            if not is_admin:
+                query = query.filter(PromptTemplateModel.owner_id == owner_id)
+            row = query.one_or_none()
+            if row is None:
+                return None
+            deleted_id = row.id
+            deleted_name = row.name
+            self._log(session, identity, "delete", "template", deleted_id, deleted_name)
+            session.delete(row)
+            session.commit()
+            self._invalidate_list_cache()
+            return {"ok": True, "deleted": True, "id": deleted_id, "name": deleted_name}
         except Exception:
             session.rollback()
             raise
@@ -728,22 +774,20 @@ class BusinessService:
         }
 
     @staticmethod
-    def _public_template(row: PromptTemplateModel, *, can_manage: bool | None = None) -> dict[str, Any]:
+    def _public_template(row: PromptTemplateModel, *, can_manage: bool | None = None, owner_name: str | None = None) -> dict[str, Any]:
         item = {
             "id": row.id,
             "name": row.name,
             "category": row.category,
             "content": row.content,
-            "model": row.model,
-            "size": row.size,
-            "quality": row.quality,
-            "preserve_subject": bool(row.preserve_subject),
-            "enabled": bool(row.enabled),
             "created_at": row.created_at.strftime("%Y-%m-%d %H:%M:%S") if row.created_at else "",
             "updated_at": row.updated_at.strftime("%Y-%m-%d %H:%M:%S") if row.updated_at else "",
         }
         if can_manage is not None:
             item["can_manage"] = bool(can_manage)
+        if owner_name is not None:
+            item["owner_id"] = row.owner_id
+            item["owner_name"] = owner_name
         return item
 
     @staticmethod

@@ -496,6 +496,15 @@ wheels = [
 ]
 
 [[package]]
+name = "ffmpy"
+version = "1.0.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/7d/d2/1c4c582d71bcc65c76fa69fab85de6257d50fdf6fd4a2317c53917e9a581/ffmpy-1.0.0.tar.gz", hash = "sha256:b12932e95435c8820f1cd041024402765f821971e4bae753b327fc02a6e12f8b" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/55/56/dd3669eccebb6d8ac81e624542ebd53fe6f08e1b8f2f8d50aeb7e3b83f99/ffmpy-1.0.0-py3-none-any.whl", hash = "sha256:5640e5f0fd03fb6236d0e119b16ccf6522db1c826fdf35dcb87087b60fd7504f" },
+]
+
+[[package]]
 name = "frozenlist"
 version = "1.8.0"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
@@ -604,6 +613,7 @@ dependencies = [
     { name = "croniter" },
     { name = "curl-cffi" },
     { name = "fastapi" },
+    { name = "ffmpy" },
     { name = "gitpython" },
     { name = "json-repair" },
     { name = "markdownify" },
@@ -641,6 +651,7 @@ requires-dist = [
     { name = "croniter", specifier = ">=2.0.0" },
     { name = "curl-cffi", specifier = ">=0.15.0" },
     { name = "fastapi", specifier = ">=0.136.0" },
+    { name = "ffmpy", specifier = ">=1.0.0" },
     { name = "gitpython", specifier = ">=3.1.0" },
     { name = "json-repair", specifier = ">=0.44.0" },
     { name = "markdownify", specifier = ">=1.2.2" },

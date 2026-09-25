@@ -93,8 +93,8 @@ def ensure_thumbnail(relative_path: str) -> Path:
         image_source = source if source is not None else io.BytesIO(image_storage_service.get_bytes(relative_path))
         with Image.open(image_source) as image:
             image = ImageOps.exif_transpose(image)
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            if image.mode not in {"RGB", "RGBA"} or "transparency" in image.info:
+                image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
             image.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
             image.save(target, format="PNG", optimize=True)
     except HTTPException:

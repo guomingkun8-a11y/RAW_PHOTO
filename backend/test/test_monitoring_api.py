@@ -79,6 +79,20 @@ class MonitoringApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(reversed_range.status_code, 400)
 
+    def test_summary_forwards_video_source(self):
+        with (
+            mock.patch.object(monitoring_api, "require_admin", return_value={"id": "admin"}),
+            mock.patch.object(monitoring_api, "_build_summary", return_value={"source": "video"}) as build_summary,
+        ):
+            response = self.client.get(
+                "/api/monitoring/summary",
+                params={"source": "video", "startAt": "2026-08-01T10:00", "endAt": "2026-08-01T12:00"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"source": "video"})
+        self.assertEqual(build_summary.call_args.args[2], "video")
+
     def test_task_details_forwards_filters(self):
         expected = {"items": [], "record_count": 0, "image_count": 0}
         with (
@@ -112,6 +126,60 @@ class MonitoringApiTests(unittest.TestCase):
         self.assertEqual(kwargs["limit"], 50)
         self.assertTrue(kwargs["include_references"])
         self.assertNotIn("include_model_tokens", kwargs)
+
+    def test_task_details_uses_video_monitoring_service_for_video_source(self):
+        expected = {"source": "video", "items": []}
+        with (
+            mock.patch.object(monitoring_api, "require_admin", return_value={"id": "admin"}),
+            mock.patch.object(monitoring_api.video_generation_monitoring_service, "task_details", return_value=expected) as task_details,
+        ):
+            response = self.client.get(
+                "/api/monitoring/tasks",
+                params={"source": "video", "status": "success", "limit": 25},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), expected)
+        task_details.assert_called_once()
+        self.assertEqual(task_details.call_args.kwargs["status"], "success")
+        self.assertEqual(task_details.call_args.kwargs["limit"], 25)
+
+    def test_video_task_details_forwards_ledger_cursor_and_canceled_status(self):
+        expected = {"source": "video", "items": [], "next_cursor": None}
+        with (
+            mock.patch.object(monitoring_api, "require_admin", return_value={"id": "admin"}),
+            mock.patch.object(
+                monitoring_api.video_generation_monitoring_service,
+                "task_details",
+                return_value=expected,
+            ) as task_details,
+        ):
+            response = self.client.get(
+                "/api/monitoring/tasks",
+                params={
+                    "source": "video",
+                    "status": "canceled",
+                    "cursorAt": "2026-09-13T12:00:00",
+                    "cursorKey": "owner:task",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), expected)
+        self.assertEqual(task_details.call_args.kwargs["status"], "canceled")
+        self.assertEqual(task_details.call_args.kwargs["cursor"], {
+            "event_at": "2026-09-13T12:00:00",
+            "task_key": "owner:task",
+        })
+
+    def test_monitoring_cursor_requires_both_fields(self):
+        with mock.patch.object(monitoring_api, "require_admin", return_value={"id": "admin"}):
+            response = self.client.get(
+                "/api/monitoring/tasks",
+                params={"source": "video", "cursorAt": "2026-09-13T12:00:00"},
+            )
+
+        self.assertEqual(response.status_code, 400)
 
 
 if __name__ == "__main__":

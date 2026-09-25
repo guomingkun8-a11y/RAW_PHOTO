@@ -30,6 +30,16 @@ legacy/react-web-dist/
 
 data/
 
+# Local runtime databases and generated test reports
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+.coverage
+coverage/
+htmlcov/
+
 *.log
 *.out
 *.err

@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -21,6 +23,7 @@ from utils.helper import sse_json_stream
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+logger = logging.getLogger(__name__)
 
 
 class LogService:
@@ -111,6 +114,139 @@ class LogService:
 
 
 log_service = LogService(DATA_DIR / "logs.jsonl")
+
+
+def _safe_log_value(value: object, *, depth: int = 0) -> object:
+    if depth >= 4:
+        return str(value)[:500]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:100]: _safe_log_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:30]
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_safe_log_value(item, depth=depth + 1) for item in list(value)[:30]]
+    return str(value)[:500]
+
+
+def _log_cost(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _log_error(value: object) -> str:
+    if isinstance(value, HTTPException):
+        detail = value.detail
+        if isinstance(detail, Mapping):
+            nested = detail.get("error")
+            if isinstance(nested, Mapping):
+                detail = nested.get("message") or nested.get("error") or "upstream request failed"
+            else:
+                detail = nested or detail.get("message") or "upstream request failed"
+        value = detail
+    return " ".join(str(value or "unknown error").split())[:1000]
+
+
+@dataclass
+class AuxiliaryCallLog:
+    """Records one auxiliary model call without storing prompt content."""
+
+    operation: str
+    identity: Mapping[str, object] | None = None
+    source_module: str = "infinite_canvas"
+    model: str = ""
+    workflow_id: str = ""
+    node_id: str = ""
+    media_id: str = ""
+    owner_id: str = ""
+    started_at: datetime = field(default_factory=datetime.now)
+    started: float = field(default_factory=time.monotonic)
+    _finished: bool = field(default=False, init=False, repr=False)
+
+    def success(
+        self,
+        *,
+        cost: object = None,
+        upstream_ids: Sequence[object] | None = None,
+        usage: Mapping[str, object] | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        self._finish(status="success", cost=cost, upstream_ids=upstream_ids, usage=usage, metadata=metadata)
+
+    def failure(
+        self,
+        error: object,
+        *,
+        cost: object = None,
+        upstream_ids: Sequence[object] | None = None,
+        usage: Mapping[str, object] | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        self._finish(status="failed", error=error, cost=cost, upstream_ids=upstream_ids, usage=usage, metadata=metadata)
+
+    def _finish(
+        self,
+        *,
+        status: str,
+        error: object = None,
+        cost: object = None,
+        upstream_ids: Sequence[object] | None = None,
+        usage: Mapping[str, object] | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        identity = dict(self.identity or {})
+        owner_id = str(self.owner_id or identity.get("id") or identity.get("username") or "anonymous").strip()
+        detail: dict[str, object] = {
+            "source_module": str(self.source_module or "infinite_canvas")[:100],
+            "operation": str(self.operation or "auxiliary_model_call")[:100],
+            "owner_id": owner_id or "anonymous",
+            "model": str(self.model or "")[:191],
+            "status": status,
+            "started_at": self.started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "ended_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_ms": max(0, int((time.monotonic() - self.started) * 1000)),
+        }
+        for source_key, target_key in (("username", "owner_username"), ("name", "owner_name")):
+            value = str(identity.get(source_key) or "").strip()
+            if value:
+                detail[target_key] = value[:191]
+        for key, value in (("workflow_id", self.workflow_id), ("node_id", self.node_id), ("media_id", self.media_id)):
+            normalized = str(value or "").strip()
+            if normalized:
+                detail[key] = normalized[:191]
+        normalized_cost = _log_cost(cost)
+        if normalized_cost is not None:
+            detail["cost"] = normalized_cost
+        normalized_ids = list(dict.fromkeys(
+            str(item or "").strip()[:191]
+            for item in (upstream_ids or [])
+            if str(item or "").strip()
+        ))
+        if normalized_ids:
+            detail["upstream_ids"] = normalized_ids
+        if usage:
+            detail["usage"] = _safe_log_value(usage)
+        if metadata:
+            detail["metadata"] = _safe_log_value(metadata)
+        if error is not None:
+            detail["error"] = _log_error(error)
+        suffix = "调用完成" if status == "success" else "调用失败"
+        try:
+            log_service.add(LOG_TYPE_CALL, f"{self.operation} {suffix}", detail)
+        except Exception:
+            logger.exception("Unable to write auxiliary call log for %s", self.operation)
 
 
 def _collect_urls(value: object) -> list[str]:

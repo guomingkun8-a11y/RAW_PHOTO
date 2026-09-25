@@ -220,25 +220,44 @@ def _extend_image_to_canvas(image_data: bytes, target: tuple[int, int]) -> bytes
     """Preserve the full image and extend its background to the requested canvas."""
 
     with Image.open(io.BytesIO(image_data)) as opened:
-        source = ImageOps.exif_transpose(opened).convert("RGB")
+        source = ImageOps.exif_transpose(opened)
+        has_alpha = "A" in source.getbands() or "transparency" in source.info
+        source = source.convert("RGBA" if has_alpha else "RGB")
 
     # The fallback must never create a crop, even for the blurred backdrop.
     # Fit only the sharp foreground; the background uses every source pixel and
     # is allowed to stretch because it is intentionally blurred behind it.
     contained = ImageOps.contain(source, target, method=Image.Resampling.LANCZOS)
-    backdrop = contained.resize(target, Image.Resampling.LANCZOS)
-    blur_radius = max(18, round(max(target) * 0.04))
-    backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    average_color = source.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
-    backdrop = Image.blend(backdrop, Image.new("RGB", target, average_color), 0.24)
+    if has_alpha:
+        backdrop = Image.new("RGBA", target, (0, 0, 0, 0))
+    else:
+        backdrop = contained.resize(target, Image.Resampling.LANCZOS)
+        blur_radius = max(18, round(max(target) * 0.04))
+        backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        average_color = source.resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
+        backdrop = Image.blend(backdrop, Image.new("RGB", target, average_color), 0.24)
 
-    foreground = ImageOps.contain(source, target, method=Image.Resampling.LANCZOS)
-    left = (target[0] - foreground.width) // 2
-    top = (target[1] - foreground.height) // 2
-    backdrop.paste(foreground, (left, top))
+    left = (target[0] - contained.width) // 2
+    top = (target[1] - contained.height) // 2
+    backdrop.paste(contained, (left, top))
 
     output = io.BytesIO()
     backdrop.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _resize_image_to_canvas(image_data: bytes, target: tuple[int, int], *, extend_background: bool) -> bytes:
+    if extend_background:
+        return _extend_image_to_canvas(image_data, target)
+
+    with Image.open(io.BytesIO(image_data)) as opened:
+        source = ImageOps.exif_transpose(opened)
+        has_alpha = "A" in source.getbands() or "transparency" in source.info
+        source = source.convert("RGBA" if has_alpha else "RGB")
+        resized = source.resize(target, Image.Resampling.LANCZOS)
+
+    output = io.BytesIO()
+    resized.save(output, format="PNG", optimize=True)
     return output.getvalue()
 
 
@@ -277,19 +296,27 @@ def normalize_task_result(
             actual: tuple[int, int] | None = None
             source_actual: tuple[int, int] | None = None
             aspect_corrected = False
+            resolution_corrected = False
             if target is not None:
                 with Image.open(io.BytesIO(image_data)) as image:
                     actual = image.size
                 source_actual = actual
-                if not _aspect_ratio_matches(actual, target):
-                    if policy == "reject":
-                        raise ImageAspectRatioMismatchError(expected=target, actual=actual)
-                    if policy == "conform":
-                        image_data = _extend_image_to_canvas(image_data, target)
-                        filename = f"{Path(filename).stem or f'image-{index + 1}'}-canvas.png"
-                        mime_type = "image/png"
-                        actual = target
-                        aspect_corrected = True
+                aspect_matches = _aspect_ratio_matches(actual, target)
+                if not aspect_matches and policy == "reject":
+                    raise ImageAspectRatioMismatchError(expected=target, actual=actual)
+                should_conform_aspect = not aspect_matches and policy == "conform"
+                should_correct_resolution = aspect_matches and actual != target
+                if should_conform_aspect or should_correct_resolution:
+                    image_data = _resize_image_to_canvas(
+                        image_data,
+                        target,
+                        extend_background=should_conform_aspect,
+                    )
+                    filename = f"{Path(filename).stem or f'image-{index + 1}'}-canvas.png"
+                    mime_type = "image/png"
+                    actual = target
+                    aspect_corrected = should_conform_aspect
+                    resolution_corrected = True
             stored = storage_service.save_task_asset(
                 image_data,
                 owner_id=owner_id,
@@ -312,6 +339,10 @@ def normalize_task_result(
                 replacement["source_width"] = source_actual[0]
                 replacement["source_height"] = source_actual[1]
                 replacement["aspect_correction"] = "contain_with_extended_background"
+            if resolution_corrected and source_actual is not None:
+                replacement["resolution_corrected"] = True
+                replacement.setdefault("source_width", source_actual[0])
+                replacement.setdefault("source_height", source_actual[1])
             normalized.append(replacement)
         except ImageAspectRatioMismatchError:
             raise

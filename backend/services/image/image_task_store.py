@@ -2,15 +2,41 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, text
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, or_, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
+T = TypeVar("T")
+MYSQL_RETRYABLE_TRANSACTION_CODES = {1205, 1213}
+MYSQL_TRANSACTION_MAX_ATTEMPTS = 3
+
+
+class OwnerPendingLimitError(ValueError):
+    pass
+
+
+def _mysql_error_code(exc: BaseException) -> int | None:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        for value in getattr(current, "args", ()):
+            try:
+                code = int(value)
+            except (TypeError, ValueError):
+                continue
+            if code in MYSQL_RETRYABLE_TRANSACTION_CODES:
+                return code
+        nested = getattr(current, "orig", None) or getattr(current, "__cause__", None)
+        current = nested if isinstance(nested, BaseException) else None
+    return None
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -41,6 +67,53 @@ def _task_workload_key(task: dict[str, Any]) -> str:
         if value:
             return f"{field}:{value}"
     return f"task:{_clean(task.get('id'))}"
+
+
+def _merge_projection_updates(task: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    """Merge a delivery attempt without reopening an already delivered projection."""
+    merged = dict(task)
+    monitoring_pending = bool(task.get("monitoring_pending")) and bool(
+        updates.get("monitoring_pending", task.get("monitoring_pending"))
+    )
+    library_pending = bool(task.get("library_pending")) and bool(
+        updates.get("library_pending", task.get("library_pending"))
+    )
+    merged["monitoring_pending"] = monitoring_pending
+    merged["library_pending"] = library_pending
+
+    if not monitoring_pending and not library_pending:
+        merged["projection_attempts"] = 0
+        merged["projection_next_attempt_at"] = None
+        merged["projection_last_error"] = ""
+        return merged
+
+    try:
+        current_attempts = max(0, int(task.get("projection_attempts") or 0))
+    except (TypeError, ValueError):
+        current_attempts = 0
+    try:
+        attempted_count = max(0, int(updates.get("projection_attempts") or 0))
+    except (TypeError, ValueError):
+        attempted_count = 0
+    merged["projection_attempts"] = max(current_attempts, attempted_count)
+
+    current_retry = task.get("projection_next_attempt_at")
+    attempted_retry = updates.get("projection_next_attempt_at")
+    current_retry_at = _parse_datetime(current_retry)
+    attempted_retry_at = _parse_datetime(attempted_retry)
+    if current_retry_at is not None and (
+        attempted_retry_at is None or current_retry_at >= attempted_retry_at
+    ):
+        merged["projection_next_attempt_at"] = current_retry
+    else:
+        merged["projection_next_attempt_at"] = attempted_retry
+
+    attempted_error = _clean(updates.get("projection_last_error"))
+    if attempted_error:
+        merged["projection_last_error"] = attempted_error
+    else:
+        merged["projection_last_error"] = _clean(task.get("projection_last_error"))
+    return merged
 
 
 def can_claim_task_fairly(
@@ -99,13 +172,19 @@ class ImageTaskStore(Protocol):
     def list_unfinished(self) -> list[tuple[str, dict[str, Any]]]:
         ...
 
-    def list_terminal(self) -> list[dict[str, Any]]:
+    def list_projection_pending(self, *, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
         ...
 
     def save_task(self, key: str, task: dict[str, Any]) -> None:
         ...
 
-    def create_task(self, key: str, task: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    def create_task(
+        self,
+        key: str,
+        task: dict[str, Any],
+        *,
+        owner_pending_limit: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
         ...
 
     def update_task(
@@ -118,6 +197,9 @@ class ImageTaskStore(Protocol):
     ) -> dict[str, Any] | None:
         ...
 
+    def merge_projection_state(self, key: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        ...
+
     def recover_unfinished(self, *, requeue: bool, message: str) -> int:
         ...
 
@@ -125,6 +207,9 @@ class ImageTaskStore(Protocol):
         ...
 
     def count_tasks(self, owner_id: str, statuses: set[str]) -> int:
+        ...
+
+    def count_active_owners(self) -> int:
         ...
 
     def claim_task(self, key: str, *, owner_concurrency: int, updates: dict[str, Any]) -> dict[str, Any] | None:
@@ -218,23 +303,45 @@ class JsonImageTaskStore:
             if task.get("status") in {"queued", "running"}
         ]
 
-    def list_terminal(self) -> list[dict[str, Any]]:
-        return [
-            task
-            for task in self.load_all().values()
-            if task.get("status") in {"success", "error", "canceled"}
-        ]
+    def list_projection_pending(self, *, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
+        now = datetime.now()
+        items: list[tuple[str, dict[str, Any]]] = []
+        for key, task in self.load_all().items():
+            if not (task.get("monitoring_pending") or task.get("library_pending")):
+                continue
+            next_attempt_at = _parse_datetime(task.get("projection_next_attempt_at"))
+            if next_attempt_at is not None and next_attempt_at > now:
+                continue
+            items.append((key, task))
+        items.sort(key=lambda item: str(item[1].get("updated_at") or ""))
+        return items[: max(1, int(limit or 100))]
 
     def save_task(self, key: str, task: dict[str, Any]) -> None:
         tasks = self.load_all()
         tasks[key] = task
         self.save_all(tasks)
 
-    def create_task(self, key: str, task: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    def create_task(
+        self,
+        key: str,
+        task: dict[str, Any],
+        *,
+        owner_pending_limit: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
         tasks = self.load_all()
         existing = tasks.get(key)
         if existing is not None:
             return existing, False
+        if owner_pending_limit is not None:
+            owner_id = _clean(task.get("owner_id"), "anonymous")
+            active_count = sum(
+                1
+                for item in tasks.values()
+                if _clean(item.get("owner_id"), "anonymous") == owner_id
+                and item.get("status") in {"queued", "running"}
+            )
+            if active_count >= max(1, int(owner_pending_limit)):
+                raise OwnerPendingLimitError("user task queue is full; wait for existing tasks to finish")
         tasks[key] = task
         self.save_all(tasks)
         return task, True
@@ -259,6 +366,16 @@ class JsonImageTaskStore:
         self.save_all(tasks)
         return task
 
+    def merge_projection_state(self, key: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        tasks = self.load_all()
+        task = tasks.get(key)
+        if task is None:
+            return None
+        merged = _merge_projection_updates(task, updates)
+        tasks[key] = merged
+        self.save_all(tasks)
+        return merged
+
     def recover_unfinished(self, *, requeue: bool, message: str) -> int:
         tasks = self.load_all()
         changed = 0
@@ -280,6 +397,8 @@ class JsonImageTaskStore:
             key
             for key, task in tasks.items()
             if task.get("status") in {"success", "error", "canceled"}
+            and not task.get("monitoring_pending")
+            and not task.get("library_pending")
             and _parse_datetime(task.get("updated_at")) is not None
             and _parse_datetime(task.get("updated_at")) < cutoff
         ]
@@ -292,6 +411,13 @@ class JsonImageTaskStore:
             for task in self.load_all().values()
             if task.get("owner_id") == owner_id and task.get("status") in statuses
         )
+
+    def count_active_owners(self) -> int:
+        return len({
+            _clean(task.get("owner_id"), "anonymous")
+            for task in self.load_all().values()
+            if task.get("status") in {"queued", "running"}
+        })
 
     def claim_task(self, key: str, *, owner_concurrency: int, updates: dict[str, Any]) -> dict[str, Any] | None:
         tasks = self.load_all()
@@ -360,7 +486,16 @@ class ImageTaskModel(Base):
     batch_total = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True, index=True)
+    projection_pending = Column(Integer, nullable=False, default=0, index=True)
+    projection_next_attempt_at = Column(DateTime, nullable=True)
     task_json = Column(Text, nullable=False)
+
+
+class ImageTaskOwnerGuardModel(Base):
+    __tablename__ = "image_task_owner_guards"
+
+    owner_id = Column(String(191), primary_key=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class DatabaseImageTaskStore:
@@ -380,6 +515,23 @@ class DatabaseImageTaskStore:
         self._ensure_indexes()
         self.Session = sessionmaker(bind=self.engine)
 
+    def _run_write_transaction(self, operation: Callable[[Any], T]) -> T:
+        attempts = MYSQL_TRANSACTION_MAX_ATTEMPTS if self.engine.dialect.name == "mysql" else 1
+        for attempt in range(attempts):
+            session = self.Session()
+            try:
+                result = operation(session)
+                session.commit()
+                return result
+            except Exception as exc:
+                session.rollback()
+                if _mysql_error_code(exc) is None or attempt + 1 >= attempts:
+                    raise
+                time.sleep(random.uniform(0.025, 0.075) * (2**attempt))
+            finally:
+                session.close()
+        raise RuntimeError("database transaction retry exhausted")
+
     def _ensure_indexes(self) -> None:
         if self.engine.dialect.name == "sqlite":
             self._ensure_columns()
@@ -393,6 +545,7 @@ class DatabaseImageTaskStore:
             "CREATE INDEX idx_image_tasks_status_updated ON image_tasks (status, updated_at)",
             "CREATE INDEX idx_image_tasks_owner_batch ON image_tasks (owner_id, batch_id, updated_at)",
             f"CREATE INDEX idx_image_tasks_owner_status_key ON image_tasks (owner_id, status, {key_column})",
+            "CREATE INDEX idx_image_tasks_projection_due ON image_tasks (projection_pending, projection_next_attempt_at)",
         ]
         with self.engine.begin() as connection:
             for statement in statements:
@@ -435,11 +588,13 @@ class DatabaseImageTaskStore:
             "batch_id": "VARCHAR(191)",
             "batch_index": "INTEGER",
             "batch_total": "INTEGER",
+            "projection_pending": "INTEGER NOT NULL DEFAULT 0",
+            "projection_next_attempt_at": "TIMESTAMP",
         }
         with self.engine.begin() as connection:
             for name, definition in definitions.items():
                 if name not in existing:
-                    connection.execute(text(f"ALTER TABLE image_tasks ADD COLUMN {name} {definition} NULL"))
+                    connection.execute(text(f"ALTER TABLE image_tasks ADD COLUMN {name} {definition}"))
 
     @staticmethod
     def _row_to_task(row: ImageTaskModel) -> dict[str, Any] | None:
@@ -462,7 +617,29 @@ class DatabaseImageTaskStore:
         row.batch_total = int(task.get("batch_total")) if task.get("batch_total") is not None else None
         row.created_at = _parse_datetime(task.get("created_at"))
         row.updated_at = _parse_datetime(task.get("updated_at"))
+        row.projection_pending = 1 if task.get("monitoring_pending") or task.get("library_pending") else 0
+        row.projection_next_attempt_at = _parse_datetime(task.get("projection_next_attempt_at"))
         row.task_json = json.dumps(task, ensure_ascii=False, separators=(",", ":"))
+
+    @classmethod
+    def _row_values(cls, key: str, task: dict[str, Any]) -> dict[str, Any]:
+        row = ImageTaskModel(key=key)
+        cls._apply_row(row, key, task)
+        return {
+            "owner_id": row.owner_id,
+            "task_id": row.task_id,
+            "status": row.status,
+            "mode": row.mode,
+            "model": row.model,
+            "batch_id": row.batch_id,
+            "batch_index": row.batch_index,
+            "batch_total": row.batch_total,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+            "projection_pending": row.projection_pending,
+            "projection_next_attempt_at": row.projection_next_attempt_at,
+            "task_json": row.task_json,
+        }
 
     def load_all(self) -> dict[str, dict[str, Any]]:
         session = self.Session()
@@ -538,59 +715,100 @@ class DatabaseImageTaskStore:
         finally:
             session.close()
 
-    def list_terminal(self) -> list[dict[str, Any]]:
+    def list_projection_pending(self, *, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
         session = self.Session()
         try:
             rows = (
                 session.query(ImageTaskModel)
-                .filter(ImageTaskModel.status.in_(["success", "error", "canceled"]))
-                .order_by(ImageTaskModel.updated_at.desc())
+                .filter(
+                    ImageTaskModel.projection_pending == 1,
+                    or_(
+                        ImageTaskModel.projection_next_attempt_at.is_(None),
+                        ImageTaskModel.projection_next_attempt_at <= datetime.now(),
+                    ),
+                )
+                .order_by(ImageTaskModel.projection_next_attempt_at.asc(), ImageTaskModel.updated_at.asc())
+                .limit(max(1, int(limit or 100)))
                 .all()
             )
-            return [task for row in rows if (task := self._row_to_task(row)) is not None]
+            return [
+                (row.key, task)
+                for row in rows
+                if (task := self._row_to_task(row)) is not None
+            ]
         finally:
             session.close()
 
     def save_task(self, key: str, task: dict[str, Any]) -> None:
-        session = self.Session()
-        try:
+        def operation(session):
             row = session.query(ImageTaskModel).filter(ImageTaskModel.key == key).one_or_none()
             if row is None:
                 row = ImageTaskModel(key=key)
                 session.add(row)
             self._apply_row(row, key, task)
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+            return None
 
-    def create_task(self, key: str, task: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        session = self.Session()
-        try:
+        self._run_write_transaction(operation)
+
+    def _ensure_owner_guard(self, session, owner_id: str) -> None:
+        if self.engine.dialect.name == "mysql":
+            statement = (
+                "INSERT IGNORE INTO image_task_owner_guards (owner_id, updated_at) "
+                "VALUES (:owner_id, :updated_at)"
+            )
+        elif self.engine.dialect.name == "postgresql":
+            statement = (
+                "INSERT INTO image_task_owner_guards (owner_id, updated_at) "
+                "VALUES (:owner_id, :updated_at) ON CONFLICT (owner_id) DO NOTHING"
+            )
+        else:
+            statement = (
+                "INSERT OR IGNORE INTO image_task_owner_guards (owner_id, updated_at) "
+                "VALUES (:owner_id, :updated_at)"
+            )
+        session.execute(text(statement), {"owner_id": owner_id, "updated_at": datetime.now()})
+        session.query(ImageTaskOwnerGuardModel).filter(
+            ImageTaskOwnerGuardModel.owner_id == owner_id
+        ).with_for_update().one()
+
+    def create_task(
+        self,
+        key: str,
+        task: dict[str, Any],
+        *,
+        owner_pending_limit: int | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        def operation(session):
+            owner_id = _clean(task.get("owner_id"), "anonymous")
+            self._ensure_owner_guard(session, owner_id)
             existing = session.query(ImageTaskModel).filter(ImageTaskModel.key == key).one_or_none()
             if existing is not None:
                 stored = self._row_to_task(existing)
                 return (stored or {}, False)
+            if owner_pending_limit is not None:
+                active_count = int(
+                    session.query(ImageTaskModel)
+                    .filter(
+                        ImageTaskModel.owner_id == owner_id,
+                        ImageTaskModel.status.in_(["queued", "running"]),
+                    )
+                    .count()
+                )
+                if active_count >= max(1, int(owner_pending_limit)):
+                    raise OwnerPendingLimitError("user task queue is full; wait for existing tasks to finish")
             row = ImageTaskModel(key=key)
             self._apply_row(row, key, task)
             session.add(row)
-            try:
-                session.commit()
-                return task, True
-            except IntegrityError:
-                session.rollback()
-                existing = session.query(ImageTaskModel).filter(ImageTaskModel.key == key).one_or_none()
-                if existing is None:
-                    raise
-                stored = self._row_to_task(existing)
-                return (stored or {}, False)
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+            session.flush()
+            return task, True
+
+        try:
+            return self._run_write_transaction(operation)
+        except IntegrityError:
+            existing = self.get_task(key)
+            if existing is None:
+                raise
+            return existing, False
 
     def update_task(
         self,
@@ -600,8 +818,7 @@ class DatabaseImageTaskStore:
         expected_status: str | None = None,
         reject_status: str | None = None,
     ) -> dict[str, Any] | None:
-        session = self.Session()
-        try:
+        def operation(session):
             row = (
                 session.query(ImageTaskModel)
                 .filter(ImageTaskModel.key == key)
@@ -619,13 +836,28 @@ class DatabaseImageTaskStore:
                 return None
             task.update(updates)
             self._apply_row(row, key, task)
-            session.commit()
             return task
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+
+        return self._run_write_transaction(operation)
+
+    def merge_projection_state(self, key: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        def operation(session):
+            row = (
+                session.query(ImageTaskModel)
+                .filter(ImageTaskModel.key == key)
+                .with_for_update()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            task = self._row_to_task(row)
+            if task is None:
+                return None
+            merged = _merge_projection_updates(task, updates)
+            self._apply_row(row, key, merged)
+            return merged
+
+        return self._run_write_transaction(operation)
 
     def recover_unfinished(self, *, requeue: bool, message: str) -> int:
         session = self.Session()
@@ -664,6 +896,7 @@ class DatabaseImageTaskStore:
             query = session.query(ImageTaskModel).filter(
                 ImageTaskModel.status.in_(["success", "error", "canceled"]),
                 ImageTaskModel.updated_at < cutoff,
+                ImageTaskModel.projection_pending == 0,
             )
             count = query.delete(synchronize_session=False)
             session.commit()
@@ -688,20 +921,33 @@ class DatabaseImageTaskStore:
         finally:
             session.close()
 
-    def claim_task(self, key: str, *, owner_concurrency: int, updates: dict[str, Any]) -> dict[str, Any] | None:
+    def count_active_owners(self) -> int:
         session = self.Session()
         try:
+            return int(
+                session.query(ImageTaskModel.owner_id)
+                .filter(ImageTaskModel.status.in_(["queued", "running"]))
+                .distinct()
+                .count()
+            )
+        finally:
+            session.close()
+
+    def claim_task(self, key: str, *, owner_concurrency: int, updates: dict[str, Any]) -> dict[str, Any] | None:
+        def operation(session):
             row = (
                 session.query(ImageTaskModel)
                 .filter(ImageTaskModel.key == key)
+                .with_for_update()
                 .one_or_none()
             )
             if row is None or row.status != "queued":
                 return None
-            owner_id = row.owner_id
-            # Lock this owner's active rows in a deterministic order. Locking
-            # the target row first lets two workers claim different queued rows
-            # for the same owner and then deadlock when both count active rows.
+            task = self._row_to_task(row)
+            if task is None:
+                return None
+            owner_id = _clean(task.get("owner_id"), "anonymous")
+            self._ensure_owner_guard(session, owner_id)
             active_rows = (
                 session.query(ImageTaskModel)
                 .filter(
@@ -709,37 +955,26 @@ class DatabaseImageTaskStore:
                     ImageTaskModel.status.in_(["queued", "running"]),
                 )
                 .order_by(ImageTaskModel.key.asc())
-                .with_for_update()
                 .all()
             )
-            row = next((active_row for active_row in active_rows if active_row.key == key), None)
-            if row is None or row.status != "queued":
-                return None
-            task = self._row_to_task(row)
-            if task is None:
-                return None
-            active_tasks = []
-            for active_row in active_rows:
-                active_task = self._row_to_task(active_row)
-                if active_task is None:
-                    active_task = {
-                        "id": active_row.task_id,
-                        "owner_id": active_row.owner_id,
-                        "status": active_row.status,
-                        "batch_id": active_row.batch_id,
-                    }
-                active_tasks.append(active_task)
+            active_tasks = [
+                active_task
+                for active_row in active_rows
+                if (active_task := self._row_to_task(active_row)) is not None
+            ]
             if not can_claim_task_fairly(active_tasks, task, owner_concurrency):
                 return None
             task.update(updates)
-            self._apply_row(row, key, task)
-            session.commit()
+            affected = (
+                session.query(ImageTaskModel)
+                .filter(ImageTaskModel.key == key, ImageTaskModel.status == "queued")
+                .update(self._row_values(key, task), synchronize_session=False)
+            )
+            if int(affected or 0) != 1:
+                return None
             return task
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+
+        return self._run_write_transaction(operation)
 
     def retry_task(
         self,
@@ -748,8 +983,7 @@ class DatabaseImageTaskStore:
         max_retries: int,
         updates: dict[str, Any],
     ) -> dict[str, Any] | None:
-        session = self.Session()
-        try:
+        def operation(session):
             row = (
                 session.query(ImageTaskModel)
                 .filter(ImageTaskModel.key == key)
@@ -766,13 +1000,9 @@ class DatabaseImageTaskStore:
                 return None
             task.update({**updates, "status": "queued", "attempts": attempts})
             self._apply_row(row, key, task)
-            session.commit()
             return task
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
+
+        return self._run_write_transaction(operation)
 
     def get_batch_progress(self, owner_id: str, batch_id: str) -> dict[str, int | str]:
         session = self.Session()

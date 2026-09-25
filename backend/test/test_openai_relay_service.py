@@ -574,6 +574,32 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(get.call_args_list[0].args[0], "https://relay.example/v1/media/status")
         self.assertEqual(get.call_args_list[1].args[0], "https://relay.example/v1/skills/task-status")
 
+    def test_media_image_model_keeps_polling_waiting_final_status(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "waiting-task"}}),
+            ),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                side_effect=[
+                    FakeResponse(payload={"data": {"is_final": True, "status": "\u7b49\u5f85\u4e2d"}}),
+                    FakeResponse(payload={"data": {"is_final": True, "status": "success", "result_url": "https://cdn.example.test/waiting.png"}}),
+                ],
+            ) as get,
+            mock.patch.object(openai_relay_service.time, "sleep"),
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "banana-2",
+                "prompt": "cat",
+            })
+
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/waiting.png")
+        self.assertEqual(get.call_count, 2)
+
     def test_seedream_image_model_uses_media_task_api(self):
         with (
             mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),

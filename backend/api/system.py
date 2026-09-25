@@ -13,7 +13,10 @@ from services.accounts.business_service import business_service
 from services.platform.config import config
 from services.image.image_service import get_image_response, get_thumbnail_response
 from services.platform.system_announcement_service import system_announcement_service
+from services.platform.realtime_event_service import realtime_event_service
 from services.accounts.user_service import AVATAR_DIR, AVATAR_EXTENSIONS, user_service
+from services.audio.audio_generation_storage import audio_generation_storage_service
+from services.video.video_generation_storage import video_generation_storage_service
 
 
 class LoginRequest(BaseModel):
@@ -401,6 +404,7 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"创建公告：{item.get('title')}",
         )
+        realtime_event_service.publish("announcement", item)
         return item
 
     @router.patch("/api/system/announcements/{announcement_id}")
@@ -420,6 +424,7 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"更新公告：{item.get('title')}",
         )
+        realtime_event_service.publish("announcement", item)
         return item
 
     @router.delete("/api/system/announcements/{announcement_id}")
@@ -435,6 +440,7 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"停用公告：{item.get('title')}",
         )
+        realtime_event_service.publish("announcement", item)
         return item
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
@@ -444,6 +450,34 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
+
+    @router.get("/video-assets/{video_path:path}", include_in_schema=False)
+    async def get_video_asset(
+        video_path: str,
+        expires: int = Query(default=0),
+        signature: str = Query(default="", max_length=256),
+    ):
+        return FileResponse(
+            video_generation_storage_service.local_file(
+                video_path,
+                expires=expires,
+                signature=signature,
+            )
+        )
+
+    @router.get("/audio-assets/{audio_path:path}", include_in_schema=False)
+    async def get_audio_asset(
+        audio_path: str,
+        expires: int = Query(default=0),
+        signature: str = Query(default="", max_length=256),
+    ):
+        return FileResponse(
+            audio_generation_storage_service.local_file(
+                audio_path,
+                expires=expires,
+                signature=signature,
+            )
+        )
 
     @router.get("/avatars/{avatar_path:path}", include_in_schema=False)
     async def get_avatar(avatar_path: str):

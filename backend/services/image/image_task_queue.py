@@ -11,6 +11,13 @@ class ImageTaskQueueError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class ImageTaskDelivery:
+    key: str
+    token: str
+    priority: str = "agent"
+
+
 class ImageTaskQueue:
     def enqueue(self, task_key: str, priority: str = "agent") -> None:
         raise NotImplementedError
@@ -60,6 +67,24 @@ class ImageTaskQueue:
         time.sleep(min(1.0, max(0.05, float(timeout_secs))))
         return False
 
+    def acquire_owner_slot(
+        self,
+        owner_id: str,
+        token: str,
+        limit: int,
+        timeout_secs: float = 5.0,
+    ) -> bool:
+        return True
+
+    def release_owner_slot(self, owner_id: str, token: str) -> None:
+        return None
+
+    def acquire_maintenance_lock(self, token: str, timeout_secs: int = 60) -> bool:
+        return True
+
+    def release_maintenance_lock(self, token: str) -> None:
+        return None
+
 
 @dataclass
 class RedisImageTaskQueue(ImageTaskQueue):
@@ -82,6 +107,11 @@ class RedisImageTaskQueue(ImageTaskQueue):
         self._client = redis.Redis.from_url(self.redis_url, decode_responses=True, protocol=2)
         self._slot_key = f"{self.queue_name}:slots"
         self._worker_key = f"{self.queue_name}:workers"
+        self._pending_key = f"{self.queue_name}:pending"
+        self._processing_key = f"{self.queue_name}:processing"
+        self._delivery_lease_key = f"{self.queue_name}:delivery_leases"
+        self._task_priority_key = f"{self.queue_name}:task_priorities"
+        self._maintenance_lock_key = f"{self.queue_name}:maintenance_lock"
         self._priority_queues = {
             "standard": f"{self.queue_name}:standard",
             "agent": self.queue_name,
@@ -99,6 +129,106 @@ class RedisImageTaskQueue(ImageTaskQueue):
                 return 1
             end
             return 0
+            """
+        )
+        self._enqueue_script = self._client.register_script(
+            """
+            if redis.call('HEXISTS', KEYS[3], ARGV[1]) == 1 then
+                return 0
+            end
+            if redis.call('SADD', KEYS[2], ARGV[1]) == 0 then
+                return 0
+            end
+            redis.call('HSET', KEYS[4], ARGV[1], ARGV[2])
+            redis.call('RPUSH', KEYS[1], ARGV[1])
+            return 1
+            """
+        )
+        self._reserve_script = self._client.register_script(
+            """
+            local function queue_for(priority)
+                if priority == 'standard' then return KEYS[1] end
+                if priority == 'batch' then return KEYS[3] end
+                return KEYS[2]
+            end
+
+            local expired = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[1], 'LIMIT', 0, 100)
+            for _, task_key in ipairs(expired) do
+                redis.call('HDEL', KEYS[5], task_key)
+                redis.call('ZREM', KEYS[6], task_key)
+                local priority = redis.call('HGET', KEYS[7], task_key) or 'agent'
+                if redis.call('SADD', KEYS[4], task_key) == 1 then
+                    redis.call('RPUSH', queue_for(priority), task_key)
+                end
+            end
+
+            local task_key = nil
+            local priority = nil
+            for queue_index = 1, 3 do
+                repeat
+                    task_key = redis.call('LPOP', KEYS[queue_index])
+                until not task_key or redis.call('SISMEMBER', KEYS[4], task_key) == 1
+                if task_key then
+                    priority = queue_index == 1 and 'standard' or (queue_index == 3 and 'batch' or 'agent')
+                    break
+                end
+            end
+            if not task_key then return nil end
+
+            redis.call('SREM', KEYS[4], task_key)
+            if redis.call('HEXISTS', KEYS[5], task_key) == 1 then return nil end
+            redis.call('HSET', KEYS[5], task_key, ARGV[3])
+            redis.call('HSET', KEYS[7], task_key, priority)
+            redis.call('ZADD', KEYS[6], ARGV[2], task_key)
+            return {task_key, priority}
+            """
+        )
+        self._settle_delivery_script = self._client.register_script(
+            """
+            if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2] then return 0 end
+            redis.call('HDEL', KEYS[3], ARGV[1])
+            redis.call('ZREM', KEYS[4], ARGV[1])
+            if ARGV[3] == '1' then
+                redis.call('HSET', KEYS[5], ARGV[1], ARGV[4])
+                if redis.call('SADD', KEYS[2], ARGV[1]) == 1 then
+                    redis.call('RPUSH', KEYS[1], ARGV[1])
+                end
+            else
+                redis.call('HDEL', KEYS[5], ARGV[1])
+            end
+            return 1
+            """
+        )
+        self._renew_delivery_script = self._client.register_script(
+            """
+            if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+            redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+            return 1
+            """
+        )
+        self._recover_deliveries_script = self._client.register_script(
+            """
+            local function queue_for(priority)
+                if priority == 'standard' then return KEYS[1] end
+                if priority == 'batch' then return KEYS[3] end
+                return KEYS[2]
+            end
+            local expired = redis.call('ZRANGEBYSCORE', KEYS[6], '-inf', ARGV[1], 'LIMIT', 0, 100)
+            for _, task_key in ipairs(expired) do
+                redis.call('HDEL', KEYS[5], task_key)
+                redis.call('ZREM', KEYS[6], task_key)
+                local priority = redis.call('HGET', KEYS[7], task_key) or 'agent'
+                if redis.call('SADD', KEYS[4], task_key) == 1 then
+                    redis.call('RPUSH', queue_for(priority), task_key)
+                end
+            end
+            return #expired
+            """
+        )
+        self._release_lock_script = self._client.register_script(
+            """
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+            return redis.call('DEL', KEYS[1])
             """
         )
         self._adaptive_throttle_script = self._client.register_script(
@@ -153,29 +283,110 @@ class RedisImageTaskQueue(ImageTaskQueue):
         value = str(task_key or "").strip()
         if not value:
             return
-        self._client.rpush(self._queue_for_priority(priority), value)
+        normalized_priority = self._normalize_priority(priority)
+        self._enqueue_script(
+            keys=[
+                self._queue_for_priority(normalized_priority),
+                self._pending_key,
+                self._processing_key,
+                self._task_priority_key,
+            ],
+            args=[value, normalized_priority],
+        )
+
+    def _delivery_keys(self) -> list[str]:
+        return [
+            self._priority_queues["standard"],
+            self._priority_queues["agent"],
+            self._priority_queues["batch"],
+            self._pending_key,
+            self._processing_key,
+            self._delivery_lease_key,
+            self._task_priority_key,
+        ]
+
+    def reserve(self, timeout_secs: int = 5, lease_secs: int = 90) -> ImageTaskDelivery | None:
+        deadline = time.monotonic() + max(0.0, float(timeout_secs or 0))
+        lease = max(30, int(lease_secs or 90))
+        while True:
+            token = uuid.uuid4().hex
+            now = time.time()
+            result = self._reserve_script(
+                keys=self._delivery_keys(),
+                args=[now, now + lease, token],
+            )
+            if result:
+                return ImageTaskDelivery(
+                    key=str(result[0]),
+                    token=token,
+                    priority=self._normalize_priority(result[1]),
+                )
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
+
+    def ack(self, delivery: ImageTaskDelivery) -> bool:
+        return bool(
+            self._settle_delivery_script(
+                keys=[
+                    self._queue_for_priority(delivery.priority),
+                    self._pending_key,
+                    self._processing_key,
+                    self._delivery_lease_key,
+                    self._task_priority_key,
+                ],
+                args=[delivery.key, delivery.token, "0", delivery.priority],
+            )
+        )
+
+    def retry(self, delivery: ImageTaskDelivery, priority: str | None = None) -> bool:
+        normalized_priority = self._normalize_priority(priority or delivery.priority)
+        return bool(
+            self._settle_delivery_script(
+                keys=[
+                    self._queue_for_priority(normalized_priority),
+                    self._pending_key,
+                    self._processing_key,
+                    self._delivery_lease_key,
+                    self._task_priority_key,
+                ],
+                args=[delivery.key, delivery.token, "1", normalized_priority],
+            )
+        )
+
+    def renew_delivery(self, delivery: ImageTaskDelivery, lease_secs: int = 90) -> bool:
+        return bool(
+            self._renew_delivery_script(
+                keys=[self._processing_key, self._delivery_lease_key],
+                args=[delivery.key, delivery.token, time.time() + max(30, int(lease_secs or 90))],
+            )
+        )
+
+    def recover_deliveries(self) -> int:
+        return int(self._recover_deliveries_script(
+            keys=self._delivery_keys(),
+            args=[time.time()],
+        ) or 0)
+
+    def contains_task(self, task_key: str) -> bool:
+        value = str(task_key or "").strip()
+        if not value:
+            return False
+        pipe = self._client.pipeline(transaction=False)
+        pipe.sismember(self._pending_key, value)
+        pipe.hexists(self._processing_key, value)
+        pending, processing = pipe.execute()
+        return bool(pending or processing)
+
+    def processing_count(self) -> int:
+        return int(self._client.hlen(self._processing_key) or 0)
 
     def dequeue(self, timeout_secs: int = 5) -> str | None:
-        timeout = max(1, int(timeout_secs or 5))
-        try:
-            item = self._client.blpop(
-                [
-                    self._priority_queues["standard"],
-                    self._priority_queues["agent"],
-                    self._priority_queues["batch"],
-                ],
-                timeout=timeout,
-            )
-        except (TimeoutError, socket.timeout):
+        delivery = self.reserve(timeout_secs=timeout_secs)
+        if delivery is None:
             return None
-        except Exception as exc:
-            if "timeout reading from socket" in str(exc).lower():
-                return None
-            raise
-        if not item:
-            return None
-        _, task_key = item
-        return str(task_key or "").strip() or None
+        self.ack(delivery)
+        return delivery.key
 
     def queue_depth(self) -> int:
         return sum(self.queue_depths().values())
@@ -216,6 +427,54 @@ class RedisImageTaskQueue(ImageTaskQueue):
     def release_slot(self, token: str) -> None:
         if token:
             self._client.zrem(self._slot_key, token)
+
+    def _owner_slot_key(self, owner_id: str) -> str:
+        digest = hashlib.sha256(str(owner_id or "anonymous").encode("utf-8")).hexdigest()[:32]
+        return f"{self.queue_name}:owner_slots:{digest}"
+
+    def acquire_owner_slot(
+        self,
+        owner_id: str,
+        token: str,
+        limit: int,
+        timeout_secs: float = 5.0,
+    ) -> bool:
+        normalized_limit = max(1, int(limit or 1))
+        deadline = time.monotonic() + max(0.1, float(timeout_secs))
+        lease_secs = max(60, int(self.slot_lease_secs or 7200))
+        slot_key = self._owner_slot_key(owner_id)
+        while time.monotonic() < deadline:
+            now = int(time.time())
+            result = self._acquire_slot_script(
+                keys=[slot_key],
+                args=[now, normalized_limit, now + lease_secs, token, lease_secs],
+            )
+            if int(result or 0) == 1:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def release_owner_slot(self, owner_id: str, token: str) -> None:
+        if token:
+            self._client.zrem(self._owner_slot_key(owner_id), token)
+
+    def acquire_maintenance_lock(self, token: str, timeout_secs: int = 60) -> bool:
+        value = str(token or "").strip()
+        if not value:
+            return False
+        return bool(
+            self._client.set(
+                self._maintenance_lock_key,
+                value,
+                nx=True,
+                ex=max(10, int(timeout_secs or 60)),
+            )
+        )
+
+    def release_maintenance_lock(self, token: str) -> None:
+        value = str(token or "").strip()
+        if value:
+            self._release_lock_script(keys=[self._maintenance_lock_key], args=[value])
 
     def effective_concurrency_limit(self) -> int:
         configured = max(0, int(self.max_concurrency or 0))

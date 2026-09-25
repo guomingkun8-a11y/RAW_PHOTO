@@ -33,6 +33,7 @@ dependencies = [
     "pyyaml>=6.0",
     "markdownify>=1.2.2",
     "playwright>=1.57.0",
+    "ffmpy>=1.0.0",
 ]
 
 [dependency-groups]

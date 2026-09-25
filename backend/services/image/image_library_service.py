@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from curl_cffi import requests
 from PIL import Image
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, and_, create_engine, desc, or_, text
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, desc, text, tuple_
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from services.platform.cache_utils import TTLCache
@@ -82,18 +82,21 @@ def _database_url() -> str:
 
 
 def _parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
     text_value = _clean(value)
     if not text_value:
         return None
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        pass
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(text_value[:19], fmt)
         except ValueError:
             continue
-    try:
-        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
-    except Exception:
-        return None
+    return None
 
 
 def _parse_image_rel(url: str) -> str:
@@ -321,7 +324,7 @@ class ImageLibraryService:
         self.engine = None
         self.Session = None
         self._init_error = ""
-        self._count_cache = TTLCache[tuple[Any, ...], int](ttl_seconds=3.0, max_items=256)
+        self._count_cache = TTLCache[tuple[Any, ...], int](ttl_seconds=10.0, max_items=256)
         self._init_engine()
 
     def _init_engine(self) -> None:
@@ -482,25 +485,9 @@ class ImageLibraryService:
                 row.duration_ms = task.get("duration_ms") if isinstance(task.get("duration_ms"), int) else None
                 row.updated_at = datetime.now()
             session.commit()
-            self._count_cache.clear()
         except Exception:
             session.rollback()
             raise
-        finally:
-            session.close()
-
-    def has_task_result(self, task_id: str) -> bool:
-        normalized_task_id = _clean(task_id)
-        if not normalized_task_id:
-            return False
-        session = self._session()
-        try:
-            return bool(
-                session.query(self.Model.id)
-                .filter(self.Model.task_id == normalized_task_id)
-                .limit(1)
-                .first()
-            )
         finally:
             session.close()
 
@@ -520,7 +507,6 @@ class ImageLibraryService:
         include_deleted: bool = False,
         include_all_owners: bool = False,
         owner_id_filter: str = "",
-        include_references: bool = False,
     ) -> dict[str, Any]:
         owner_id = _clean(identity.get("id")) or "local-admin"
         is_admin = _clean(identity.get("role")) == "admin"
@@ -560,15 +546,7 @@ class ImageLibraryService:
             total = self._count_cache.get_or_set(total_key, lambda: query.count())
             cursor_time = _parse_datetime(cursor_created_at)
             if cursor_time and cursor_id > 0:
-                query = query.filter(
-                    or_(
-                        Model.created_at < cursor_time,
-                        and_(
-                            Model.created_at == cursor_time,
-                            Model.id < cursor_id,
-                        ),
-                    )
-                )
+                query = query.filter(tuple_(Model.created_at, Model.id) < (cursor_time, cursor_id))
             page_limit = max(1, min(200, limit))
             rows = (
                 query.order_by(desc(Model.created_at), desc(Model.id))
@@ -578,19 +556,14 @@ class ImageLibraryService:
             )
             has_more = len(rows) > page_limit
             visible_rows = rows[:page_limit]
+            if cursor_time is None:
+                total = max(total, max(0, offset) + len(visible_rows) + (1 if has_more else 0))
             items = [self._public_item(row, base_url) for row in visible_rows]
-            if include_references:
-                references = _reference_images_for_library_items(items, base_url=base_url)
-                for item in items:
-                    item["reference_images"] = references.get(
-                        (_clean(item.get("owner_id")), _clean(item.get("task_id"))),
-                        [],
-                    )
             next_cursor = None
             if has_more and visible_rows:
                 last = visible_rows[-1]
                 next_cursor = {
-                    "created_at": last.created_at.strftime("%Y-%m-%d %H:%M:%S") if last.created_at else "",
+                    "created_at": last.created_at.isoformat(sep=" ", timespec="microseconds") if last.created_at else "",
                     "id": last.id,
                 }
             return {
@@ -644,6 +617,7 @@ class ImageLibraryService:
         base_url: str,
         image_ids: list[int],
         include_deleted: bool = False,
+        include_references: bool = False,
     ) -> list[dict[str, Any]]:
         owner_id = _clean(identity.get("id")) or "local-admin"
         is_admin = _clean(identity.get("role")) == "admin"
@@ -661,7 +635,15 @@ class ImageLibraryService:
                 query = query.filter(Model.deleted_at.is_(None))
             rows = query.all()
             row_map = {int(row.id): row for row in rows}
-            return [self._public_item(row_map[image_id], base_url) for image_id in ids if image_id in row_map]
+            items = [self._public_item(row_map[image_id], base_url) for image_id in ids if image_id in row_map]
+            if include_references:
+                references = _reference_images_for_library_items(items, base_url=base_url)
+                for item in items:
+                    item["reference_images"] = references.get(
+                        (_clean(item.get("owner_id")), _clean(item.get("task_id"))),
+                        [],
+                    )
+            return items
         finally:
             session.close()
 

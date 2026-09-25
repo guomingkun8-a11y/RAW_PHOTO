@@ -435,6 +435,9 @@ def distill_conversation_job(job: Mapping[str, Any]) -> bool:
                 content=json.dumps(payload, ensure_ascii=False),
                 max_tokens=1600,
                 temperature=0.1,
+                billing_owner_id=owner_id,
+                billing_local_task_id=f"memory-distill:{job_id or run_id or conversation_id}",
+                billing_local_source="agent_memory",
             )
         except Exception:
             parsed = {}
@@ -506,6 +509,9 @@ def deep_dream_job(job: Mapping[str, Any]) -> bool:
             content=json.dumps(payload, ensure_ascii=False),
             max_tokens=2200,
             temperature=0.1,
+            billing_owner_id=owner_id,
+            billing_local_task_id=f"memory-dream:{job_id or owner_id}",
+            billing_local_source="agent_memory",
         )
     except Exception:
         return True
