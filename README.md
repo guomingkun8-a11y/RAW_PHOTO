@@ -1,18 +1,37 @@
 # RAW_PHOTO
 
-RAW_PHOTO 是一个面向电商场景的 AI 生图工作台，主要用于主图、车图、白底图、套图换图、详情页素材等图片生产。项目支持多账号登录、管理员账号管理、任务队列、API Key 池、单用户并发限制、图片历史保存、对象存储和内网部署。
+RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，覆盖图片、视频、音频和无限画布工作流。项目将模型调用、异步队列、素材历史、提示词模板、实时进度、费用监控和团队权限集中在同一套内网系统中。
 
 ## 功能概览
 
-- 电商生图：支持文生图、图生图、参考图生成、文件夹批量生图、批量换商品和多画布比例。
+- 图片生成：支持文生图、图生图、多图参考、文件夹批量生图、批量换商品和多画布比例。
+- 专业图片 Agent：支持多轮创作、商品与人物一致性、视觉分析、营销策略、知识检索、长期记忆和批量方案执行。
+- 视频生成：支持文生视频、图生视频、多图参考、首尾帧、任务取消、失败重试、结果持久化和历史管理。
+- 视频助手与时间线：支持视频理解、创作方案、素材编排、配音、语音转写、字幕及异步合成任务。
+- 音频生成：支持 `doubao-tts-2.0` 和 `gem-3.1-tts`，覆盖多音色、语速、情感、单人朗读和双人对话。
+- 无限画布：支持图片、视频和文本节点编排、工作流保存、创意助手、分镜脚本以及生成任务状态跟踪。
+- 提示词模板：支持模板创建、管理和一键应用，沉淀团队常用创作方案。
+- 统一历史：集中查看和管理图片、视频、音频及生成任务记录。
 - 账号系统：支持用户注册、登录、普通用户和管理员角色。
-- 管理后台：管理员可管理用户、查看监控、查看任务状态和系统运行情况。
-- 任务队列：生成任务进入队列，由 worker 消费，避免多人同时使用时互相拖垮服务。
+- 管理后台：管理员可管理用户、查看任务状态、队列、模型费用和系统运行情况。
+- 实时通知：使用 SSE 推送系统公告和图片任务状态变化，页面无需持续高频刷新。
+- 任务队列：图片、视频、音频、Agent 和视频合成任务由独立 Worker 异步消费。
 - 并发控制：支持全局并发、单用户并发、单用户排队上限和 API Key 池。
 - API Key 池：可配置多个 OpenAI-compatible 中转站 Key，按池化方式分配生成任务。
-- 图片资产：支持本地保存，也支持 WebDAV、MinIO/S3 兼容存储、阿里云 OSS S3 兼容模式。
-- 监控与压测：内置任务队列压测脚本、监控接口和运行状态页面。
+- 素材存储：支持本地、WebDAV、MinIO/S3 兼容存储和阿里云 OSS，并可为结果生成受控访问地址。
+- 监控与计费：提供任务明细、成功/失败统计、队列状态、用户/模型费用和上游用量对账。
 - 内网部署：支持本地局域网运行，也支持 Docker Compose 部署到服务器。
+
+## 当前内置模型
+
+| 类型 | 模型 |
+| --- | --- |
+| 图片 | `banana-2`、`gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst` |
+| 文生视频 | `hailuo-h3`、`doubao-seedance-2-5-260628`、`kling-v3-video` |
+| 图生视频 | `hailuo-h3-cankaosheng`、`hailuo-h3-max-shouweizhen`、`gk-video-3.5`、`doubao-seedance-2-5-cankaosheng` |
+| 音频 | `doubao-tts-2.0`、`gem-3.1-tts` |
+
+模型是否可用仍取决于实际配置的上游渠道、API Key 和账户权限。
 
 ## 技术栈
 
@@ -20,31 +39,38 @@ RAW_PHOTO 是一个面向电商场景的 AI 生图工作台，主要用于主图
 | --- | --- |
 | 前端 | Vue 3、Vite、TypeScript、Tailwind CSS、lucide-vue |
 | 后端 | Python 3.13、FastAPI、Uvicorn |
-| 队列 | Redis、Celery 或轻量 Redis worker |
+| 队列与实时事件 | Redis、Celery 或轻量 Redis Worker、SSE |
 | 数据库 | MySQL / PostgreSQL / SQLite，生产建议 MySQL 或 PostgreSQL |
-| 图片处理 | Pillow |
-| 对象存储 | 本地、WebDAV、MinIO/S3 兼容存储、阿里云 OSS S3 兼容模式 |
+| 向量检索 | Qdrant、OpenAI-compatible Embedding |
+| 媒体处理 | Pillow、FFmpeg / FFprobe |
+| 对象存储 | 本地、WebDAV、MinIO/S3 兼容存储、阿里云 OSS |
 | 部署 | Docker、Docker Compose |
-| 测试 | unittest、k6、本地 mock 压测脚本 |
+| 测试 | unittest、Playwright、k6、本地 mock 压测脚本 |
 
 ## 项目结构
 
 ```text
 RAW_PHOTO/
 ├── backend/                  # FastAPI 接口、业务服务、测试和迁移脚本
-│   ├── api/                  # 登录、用户、图片任务、监控等 API
-│   ├── services/             # 核心业务逻辑
+│   ├── api/                  # 图片、视频、音频、画布、计费和系统 API
+│   ├── services/             # 图片、视频、音频、Agent、存储和平台服务
 │   ├── scripts/              # 数据库迁移、压测、初始化脚本
 │   └── test/                 # 后端单元测试
 ├── frontend/                 # Vue 前端项目
-│   ├── src/components/       # 页面组件
-│   ├── src/pages/            # 登录、图片工作台、图库、用户管理、监控页
+│   ├── src/components/       # 通用组件和图片工作台组件
+│   ├── src/features/         # 音频、无限画布、视频时间线和计费模块
+│   ├── src/pages/            # 图片、视频、音频、画布、历史和管理页面
 │   └── vite.config.ts        # 开发代理和构建配置
 ├── docs/                     # 部署、队列、安全和监控文档
 ├── scripts/                  # Windows 内网部署辅助脚本
 ├── data/                     # 本地运行数据，已被 Git 忽略
 ├── main.py                   # 后端应用入口
-├── worker.py                 # 生图任务 worker 入口
+├── worker.py                 # 图片生成 Worker
+├── agent_worker.py           # 专业图片 Agent Worker
+├── video_worker.py           # 视频分析 Worker
+├── video_generation_worker.py # 视频生成 Worker
+├── audio_generation_worker.py # 音频生成 Worker
+├── video_composition_worker.py # 视频合成 Worker
 ├── Dockerfile
 ├── docker-compose.enterprise.yml
 ├── .env.example              # 环境变量示例
@@ -160,7 +186,7 @@ http://127.0.0.1:8002
 http://127.0.0.1:8002/docs
 ```
 
-### 6. 启动 worker
+### 6. 启动任务 Worker
 
 新开一个 PowerShell：
 
@@ -169,20 +195,30 @@ cd "D:\raw photo"
 .\.venv\Scripts\python.exe worker.py
 ```
 
-worker 负责真正消费生图任务。只启动后端和前端，任务会入队但不会被处理。
+`worker.py` 负责真正消费图片生成任务。只启动后端和前端，图片任务会入队但不会被处理。
 
-### 7. 启动 Agent worker
-
-再新开一个 PowerShell：
+根据启用的功能，分别启动对应 Worker：
 
 ```powershell
-cd "D:\raw photo"
+# 专业图片 Agent
 .\.venv\Scripts\python.exe agent_worker.py
+
+# 视频分析
+.\.venv\Scripts\python.exe video_worker.py
+
+# 视频生成
+.\.venv\Scripts\python.exe video_generation_worker.py
+
+# 音频生成
+.\.venv\Scripts\python.exe audio_generation_worker.py
+
+# 视频配音、字幕和时间线合成
+.\.venv\Scripts\python.exe video_composition_worker.py
 ```
 
-Agent worker 负责专业模式的对话、文件夹分析、批计划执行和长期记忆蒸馏。
+未在配置中启用的队列不需要启动相应 Worker。专业 Agent Worker 负责对话、文件夹分析、批计划执行和长期记忆蒸馏。
 
-### 8. 启动前端
+### 7. 启动前端
 
 新开一个 PowerShell：
 
@@ -259,6 +295,9 @@ GMKRAW_OSS_BUCKET
 ```text
 http://服务器局域网IP:8000
 http://服务器局域网IP:8000/image
+http://服务器局域网IP:8000/video-generation
+http://服务器局域网IP:8000/audio-generation
+http://服务器局域网IP:8000/infinite-canvas
 http://服务器局域网IP:8000/monitoring
 ```
 
@@ -360,8 +399,8 @@ GMKRAW_MINIO_SECURE=true
 
 项目当前设计为两类角色：
 
-- 普通用户：登录后使用图片生成、查看自己的任务和图片历史。
-- 管理员：管理用户、查看监控、处理账号启停和权限调整。
+- 普通用户：登录后使用图片、视频、音频、无限画布、模板中心和自己的历史资产。
+- 管理员：管理用户、查看监控与费用、处理账号启停和权限调整。
 
 当前不设计复杂的超级管理员体系，适合公司内部工具场景。管理员账号应只分配给少数维护人员。
 
@@ -450,7 +489,7 @@ scripts/k6-image-workspace.js
 
 ### 为什么要保留 worker？
 
-前端点击生成后，后端只负责创建任务和入队。真正调用生图接口的是 worker。worker 没有运行时，任务会一直排队。
+前端点击生成后，后端只负责创建任务和入队。真正调用模型或执行媒体处理的是对应 Worker；图片、视频、音频和视频合成都有各自的 Worker，未运行时相应任务会一直排队。
 
 ### 生成图片要不要永久保存？
 
