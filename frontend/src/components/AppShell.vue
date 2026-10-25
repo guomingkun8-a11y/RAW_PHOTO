@@ -1,28 +1,19 @@
 <script setup lang="ts">
 import {
-  Activity,
-  AudioLines,
   Bell,
   Camera,
   Clock3,
-  History,
   ImageIcon,
   KeyRound,
-  Library,
   LoaderCircle,
   LogOut,
   Menu,
   Moon,
-  PanelsTopLeft,
   PanelLeftClose,
   PanelLeftOpen,
-  ReceiptText,
-  Sparkles,
+  Settings2,
   Sun,
   UserRound,
-  Users,
-  Video,
-  WandSparkles,
   X,
 } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
@@ -30,7 +21,10 @@ import { useRoute, useRouter } from "vue-router";
 import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
-import { changePassword, fetchImageConversationCount, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, streamRealtimeEvents, updateCurrentUserProfile, uploadAvatar, type RealtimeEvent, type SystemAnnouncement } from "@/lib/api";
+import FeedbackLauncher from "@/features/feedback/components/FeedbackLauncher.vue";
+import { fetchNavigationLayout, navigationLayout, navItems } from "@/features/system/navigation";
+import { useAnnouncementUnread } from "@/features/system/useAnnouncementUnread";
+import { changePassword, fetchImageConversationCount, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, streamRealtimeEvents, updateCurrentUserProfile, uploadAvatar, type RealtimeAnnouncementEvent, type RealtimeEvent, type SystemAnnouncement } from "@/lib/api";
 import { storageKey } from "@/lib/storage-namespace";
 import { clearStoredAuthSession, setStoredAuthSession } from "@/stores/auth";
 import { sessionState, setSession } from "@/stores/session";
@@ -43,7 +37,7 @@ const showNotifications = ref(false);
 const announcements = ref<SystemAnnouncement[]>([]);
 const announcementsLoading = ref(false);
 const announcementsLoadedAt = ref(0);
-const announcementUnread = ref(false);
+const announcementUnreadCount = useAnnouncementUnread(announcements, showNotifications);
 const showUserMenu = ref(false);
 const isDark = ref(document.documentElement.classList.contains("dark"));
 const passwordOpen = ref(false);
@@ -62,6 +56,7 @@ const profileSaving = ref(false);
 const avatarInput = ref<HTMLInputElement | null>(null);
 const avatarUploading = ref(false);
 let taskTimer = 0;
+let navigationTimer = 0;
 let announcementSyncTimer = 0;
 let taskCountLoadedAt = 0;
 let taskCountPromise: Promise<void> | null = null;
@@ -81,20 +76,11 @@ const contentInsetTransitioning = ref(false);
 let routeAnimation: Animation | null = null;
 let contentInsetTransitionTimer = 0;
 
-const navItems = [
-  { href: "/image", label: "图片生成", detail: "AI 创作台", icon: WandSparkles },
-  { href: "/video-generation", label: "视频生成", detail: "文生视频 / 图生视频", icon: Video },
-  { href: "/audio-generation", label: "音频生成", detail: "音频创作", icon: AudioLines },
-  { href: "/infinite-canvas", label: "无限画布", detail: "图片与视频生成", icon: PanelsTopLeft },
-  { href: "/prompt-templates", label: "模板中心", detail: "提示词资产", icon: Sparkles },
-  { href: "/image-library", label: "历史", detail: "图片、视频与音频资产", icon: Library },
-  { href: "/monitoring", label: "监控看板", detail: "运行状态", icon: Activity, adminOnly: true },
-  { href: "/costs", label: "费用记录", detail: "模型与用户费用", icon: ReceiptText, adminOnly: true },
-  { href: "/users", label: "成员权限", detail: "团队管理", icon: Users, adminOnly: true },
-  { href: "/image?history=1", activePath: "/image", activeQuery: { history: "1" }, label: "生成记录", detail: "图片、视频与音频任务", icon: History },
-];
-
-const visibleNavItems = computed(() => navItems.filter((item) => !item.adminOnly || sessionState.session?.role === "admin"));
+const isSuperAdmin = computed(() => sessionState.session?.role === "admin" && sessionState.session.subjectId === "local-admin");
+const visibleNavItems = computed(() => navigationLayout.value.flatMap(({ id, visible }) => {
+  const item = navItems.find((definition) => definition.id === id);
+  return visible && item && (!item.adminOnly || sessionState.session?.role === "admin") ? [item] : [];
+}));
 const isFullscreenRoute = computed(() => route.meta.fullscreen === true);
 const contentInsetClass = computed(() => (
   isFullscreenRoute.value || sidebarCollapsed.value ? "lg:pl-0" : "lg:pl-[var(--studio-content-left)]"
@@ -104,6 +90,10 @@ const userInitial = computed(() => {
   return source.trim().slice(0, 1).toUpperCase();
 });
 const userAvatarUrl = computed(() => resolveApiAssetUrl(sessionState.session?.avatarUrl));
+
+function refreshNavigationWhenVisible() {
+  if (!document.hidden) void fetchNavigationLayout().catch(() => {});
+}
 
 function isActive(item: (typeof navItems)[number]) {
   const targetPath = item.activePath || item.href.split("?")[0] || item.href;
@@ -151,14 +141,13 @@ async function loadAnnouncements(force = false) {
     announcements.value = response.items;
     announcementsLoadedAt.value = Date.now();
   } catch {
-    announcements.value = [];
-    announcementsLoadedAt.value = Date.now();
+    // Keep the last successful announcement list when a refresh fails.
   } finally {
     announcementsLoading.value = false;
   }
 }
 
-function applyRealtimeAnnouncement(item: SystemAnnouncement) {
+function applyRealtimeAnnouncement(item: RealtimeAnnouncementEvent) {
   if (!item || typeof item.id !== "number") return;
   if (!item.enabled) {
     announcements.value = announcements.value.filter((current) => current.id !== item.id);
@@ -168,7 +157,6 @@ function applyRealtimeAnnouncement(item: SystemAnnouncement) {
       .slice(0, 5);
   }
   announcementsLoadedAt.value = Date.now();
-  announcementUnread.value = true;
 }
 
 function scheduleRealtimeReconnect() {
@@ -201,7 +189,6 @@ async function connectRealtimeEvents() {
 function toggleNotifications() {
   showNotifications.value = !showNotifications.value;
   showUserMenu.value = false;
-  if (showNotifications.value) announcementUnread.value = false;
   if (showNotifications.value) void loadAnnouncements();
 }
 
@@ -449,6 +436,9 @@ watch(() => route.fullPath, async () => {
 });
 
 onMounted(() => {
+  refreshNavigationWhenVisible();
+  document.addEventListener("visibilitychange", refreshNavigationWhenVisible);
+  navigationTimer = window.setInterval(refreshNavigationWhenVisible, 60_000);
   realtimeStopped = false;
   void loadTaskCount(true);
   void loadAnnouncements(true);
@@ -458,6 +448,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("visibilitychange", refreshNavigationWhenVisible);
+  window.clearInterval(navigationTimer);
   window.clearInterval(taskTimer);
   window.clearInterval(announcementSyncTimer);
   announcementSyncTimer = 0;
@@ -499,9 +491,9 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="relative flex min-w-0 items-center justify-end gap-2">
-          <button type="button" class="studio-button inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" @click="toggleNotifications">
+          <button type="button" class="studio-button relative inline-flex size-10 items-center justify-center rounded-2xl border border-black/[0.06] bg-white text-slate-600 shadow-sm dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300" aria-label="通知" :aria-description="announcementUnreadCount ? `${announcementUnreadCount} 条未读公告` : '暂无未读公告'" :aria-expanded="showNotifications" @click="toggleNotifications">
             <Bell class="size-4" />
-            <span v-if="announcementUnread" class="pointer-events-none absolute left-6 top-1.5 size-2 rounded-full bg-rose-500 ring-2 ring-white dark:ring-[#0f1115]" />
+            <span v-if="announcementUnreadCount" data-testid="announcement-unread-count" aria-hidden="true" class="pointer-events-none absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-rose-600 px-1 text-[11px] font-semibold leading-none text-white ring-2 ring-white tabular-nums dark:ring-[#0f1115]">{{ announcementUnreadCount > 99 ? '99+' : announcementUnreadCount }}</span>
           </button>
           <div v-if="showNotifications" class="absolute right-24 top-12 z-50 w-[320px] rounded-2xl border border-black/[0.06] bg-white p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] dark:border-white/10 dark:bg-[#171a21]">
             <div class="px-2 pb-2 pt-1 text-xs font-semibold text-slate-500 dark:text-stone-400">更新公告</div>
@@ -516,9 +508,9 @@ onBeforeUnmount(() => {
               <div v-for="item in announcements" :key="item.id" class="rounded-2xl bg-slate-50 px-4 py-3 dark:bg-white/[0.06]">
                 <div class="flex items-start gap-2 text-sm font-semibold text-slate-950 dark:text-stone-50">
                   <span class="mt-1.5 size-2 shrink-0 rounded-full" :class="announcementDotClass(item.type)" />
-                  <span class="min-w-0 flex-1">{{ item.title }}</span>
+                  <span class="min-w-0 flex-1 break-words">{{ item.title }}</span>
                 </div>
-                <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">{{ item.content }}</p>
+                <p class="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-slate-500 dark:text-stone-400">{{ item.content }}</p>
                 <div class="mt-2 text-[11px] font-medium text-slate-400 dark:text-stone-500">{{ item.created_at }}</div>
               </div>
             </div>
@@ -527,6 +519,7 @@ onBeforeUnmount(() => {
               <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-stone-400">暂无新的更新公告。</p>
             </div>
           </div>
+          <FeedbackLauncher />
           <RouterLink to="/image-library" class="studio-button hidden h-10 items-center gap-2 rounded-2xl bg-slate-950 px-3 text-[13px] text-white shadow-[0_14px_32px_rgba(17,24,39,0.14)] dark:bg-white dark:text-slate-950 sm:inline-flex">
             <Clock3 class="size-4" />最近任务 {{ taskCount }}
           </RouterLink>
@@ -551,7 +544,7 @@ onBeforeUnmount(() => {
               </button>
               <div class="min-w-0 flex-1">
                 <div class="truncate text-sm font-semibold text-slate-950 dark:text-stone-50">{{ sessionState.session?.name || sessionState.session?.username || '用户' }}</div>
-                <div class="mt-1 text-xs text-slate-500 dark:text-stone-400">{{ sessionState.session?.role === 'admin' ? '管理员' : '成员' }}</div>
+                <div class="mt-1 text-xs text-slate-500 dark:text-stone-400">{{ isSuperAdmin ? '超级管理员' : sessionState.session?.role === 'admin' ? '管理员' : '成员' }}</div>
               </div>
             </div>
             <button type="button" class="mb-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-100 disabled:cursor-wait disabled:opacity-60 dark:text-stone-200 dark:hover:bg-white/[0.08]" :disabled="avatarUploading || !sessionState.session" @click="openAvatarPicker">
@@ -565,6 +558,7 @@ onBeforeUnmount(() => {
             </button>
             <div class="my-1 h-px bg-slate-200 dark:bg-white/10" />
             <RouterLink to="/image" class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-slate-700 hover:bg-slate-100 dark:text-stone-200 dark:hover:bg-white/[0.08]"><ImageIcon class="size-4" />创作工作台</RouterLink>
+            <RouterLink v-if="isSuperAdmin" to="/system-management" class="mt-1 flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm text-slate-700 hover:bg-slate-100 dark:text-stone-200 dark:hover:bg-white/[0.08]"><Settings2 class="size-4" />系统管理</RouterLink>
             <button type="button" class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-stone-200 dark:hover:bg-white/[0.08]" @click="openPasswordModal"><KeyRound class="size-4" />修改密码</button>
             <button type="button" class="mt-1 flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm text-rose-600 hover:bg-rose-50 dark:text-rose-300 dark:hover:bg-rose-950/30" @click="handleLogout"><LogOut class="size-4" />退出登录</button>
           </div>
@@ -572,7 +566,7 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <aside v-if="!isFullscreenRoute" data-testid="studio-sidebar" class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl transition-[transform,opacity] duration-300 ease-[var(--studio-ease)] dark:border-white/10 dark:bg-white/[0.055] lg:flex" :class="sidebarCollapsed ? 'pointer-events-none -translate-x-[260px] opacity-0' : 'translate-x-0 opacity-100'">
+    <aside v-if="!isFullscreenRoute" data-testid="studio-sidebar" class="fixed bottom-5 left-[var(--studio-sidebar-left)] top-[96px] z-20 hidden w-[var(--studio-sidebar-width)] flex-col overflow-y-auto rounded-[20px] border border-black/[0.06] bg-white/82 p-3 shadow-[0_12px_28px_rgba(15,23,42,0.07)] backdrop-blur-2xl transition-[transform,opacity] duration-300 ease-[var(--studio-ease)] dark:border-white/10 dark:bg-white/[0.055] lg:flex" :class="sidebarCollapsed ? 'pointer-events-none -translate-x-[260px] opacity-0' : 'translate-x-0 opacity-100'">
       <nav class="flex flex-col gap-2">
         <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="group relative flex min-h-[58px] items-center gap-3 rounded-2xl border px-3.5 py-3 text-left transition" :class="isActive(item) ? 'border-[#4F7CFF]/20 bg-[#4F7CFF]/10 text-slate-950 shadow-[0_8px_18px_rgba(79,124,255,0.12)] dark:text-white' : 'border-transparent text-slate-600 hover:border-black/[0.04] hover:bg-[#4F7CFF]/[0.08] hover:text-slate-950 dark:text-stone-300 dark:hover:border-white/10 dark:hover:text-white'">
           <span class="flex size-10 shrink-0 items-center justify-center rounded-xl" :class="isActive(item) ? 'bg-[#4F7CFF] text-white' : 'bg-slate-100 text-slate-600 dark:bg-white/[0.07] dark:text-stone-300'"><component :is="item.icon" class="size-4" /></span>
@@ -581,7 +575,7 @@ onBeforeUnmount(() => {
       </nav>
     </aside>
 
-    <div v-if="mobileOpen && !isFullscreenRoute" class="fixed inset-x-3 top-[86px] z-50 rounded-[20px] border border-black/[0.06] bg-white p-3 shadow-[0_24px_70px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21] lg:hidden">
+    <div v-if="mobileOpen && !isFullscreenRoute" class="fixed inset-x-3 top-[86px] z-50 max-h-[calc(100dvh-100px)] overflow-y-auto rounded-[20px] border border-black/[0.06] bg-white p-3 shadow-[0_24px_70px_rgba(15,23,42,0.18)] dark:border-white/10 dark:bg-[#171a21] lg:hidden">
       <nav class="flex flex-col gap-2">
         <RouterLink v-for="item in visibleNavItems" :key="item.href" :to="item.href" class="flex items-center gap-3 rounded-2xl px-3.5 py-3 text-slate-700 hover:bg-[#4F7CFF]/10 dark:text-stone-200" :class="isActive(item) ? 'bg-[#4F7CFF]/10 text-slate-950 dark:text-white' : ''"><component :is="item.icon" class="size-4" />{{ item.label }}</RouterLink>
       </nav>

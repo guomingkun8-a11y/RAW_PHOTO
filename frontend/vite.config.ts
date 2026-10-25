@@ -30,7 +30,7 @@ export default defineConfig({
     port: 4399,
     strictPort: true,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8002", changeOrigin: false },
+      "/api": { target: "http://127.0.0.1:8002", changeOrigin: false, ws: true },
       "/auth": { target: "http://127.0.0.1:8002", changeOrigin: false },
       "/v1": { target: "http://127.0.0.1:8002", changeOrigin: false },
       "/images": { target: "http://127.0.0.1:8002", changeOrigin: false },

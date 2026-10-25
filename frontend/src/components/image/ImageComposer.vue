@@ -3,6 +3,7 @@ import {
   ArrowUp,
   Brain,
   Bot,
+  ChevronDown,
   FolderUp,
   ImagePlus,
   LoaderCircle,
@@ -11,6 +12,7 @@ import {
   PackageCheck,
   RectangleHorizontal,
   RectangleVertical,
+  Ratio,
   Replace,
   ShieldCheck,
   SlidersHorizontal,
@@ -22,9 +24,18 @@ import {
 } from "@lucide/vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 
-import { analyzeImagePrompt, type ImageModel, type PromptEngineMode } from "@/lib/api";
+import {
+  analyzeImagePrompt,
+  fetchAgentRun,
+  streamAgentRunEvents,
+  type AgentRun,
+  type ImageModel,
+  type ImagePromptAnalysisResponse,
+  type PromptEngineMode,
+} from "@/lib/api";
 import type { AgentFolderAsset } from "@/lib/api";
 import { formatImageModel, imageModelFeatures } from "@/lib/image-models";
+import { resolveSourceImageSize, sourceRatioLabel } from "@/lib/image-output-size";
 import type { StoredAgentVideo, StoredReferenceImage } from "@/stores/image-conversations";
 import EngineSwitch from "@/components/image/EngineSwitch.vue";
 
@@ -58,6 +69,7 @@ const emit = defineEmits<{
   clearBatch: [];
   openLightbox: [images: Array<{ id: string; src: string; name?: string }>, index: number];
   openMemory: [];
+  ratioSelected: [];
 }>();
 
 const isHome = computed(() => props.variant === "home");
@@ -76,14 +88,18 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const videoInput = ref<HTMLInputElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const settingCards = ref<HTMLElement | null>(null);
+const settingPanel = ref<HTMLElement | null>(null);
 const isDragging = ref(false);
 const isFocused = ref(false);
+const isCompactSettings = ref(false);
+let compactSettingsQuery: MediaQueryList | null = null;
 type SettingCard = "engine" | "model" | "canvas" | "count" | "more" | "preferences";
 type PromptAssistAction = "suggest" | "optimize" | "enhance";
 const openSettingCard = ref<SettingCard | null>(null);
 const renderedSettingCard = ref<SettingCard | null>(null);
 const promptAssistAction = ref<PromptAssistAction | null>(null);
 const promptAssistNote = ref("");
+let promptAssistAbortController: AbortController | null = null;
 
 const assistOptions: { action: PromptAssistAction; label: string; description: string }[] = [
   { action: "suggest", label: "建议", description: "根据参考图生成方向" },
@@ -96,29 +112,59 @@ const qualityOptions = [
   { value: "medium", label: "均衡", description: "兼顾生成速度和细节" },
   { value: "high", label: "精细", description: "优先细节，允许一次原生比例重试" },
 ];
-const aspectOptions = [
+type AspectOption = {
+  ratio: string;
+  tier: string;
+  width: string;
+  height: string;
+  label: string;
+  detail?: string;
+  icon: typeof Square;
+};
+const fixedAspectOptions: AspectOption[] = [
   { ratio: "1:1", tier: "1k", width: "1024", height: "1024", label: "1:1", icon: Square },
   { ratio: "2:3", tier: "1k", width: "1024", height: "1536", label: "2:3", icon: RectangleVertical },
   { ratio: "3:2", tier: "1k", width: "1536", height: "1024", label: "3:2", icon: RectangleHorizontal },
   { ratio: "3:4", tier: "1k", width: "1024", height: "1365", label: "3:4", icon: RectangleVertical },
   { ratio: "9:16", tier: "1k", width: "1088", height: "1920", label: "9:16", icon: RectangleVertical },
   { ratio: "16:9", tier: "1k", width: "1920", height: "1088", label: "16:9", icon: RectangleHorizontal },
-  { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "自动", icon: Zap },
+  { ratio: "auto", tier: "auto", width: "1024", height: "1024", label: "智能构图", icon: Zap },
 ];
 const countOptions = ["1", "2", "3", "4", "6", "8", "10", "12", "16", "20"];
 const STANDARD_COUNT_MAX = 100;
 const AGENT_COUNT_MAX = 20;
 const AGENT_FOLDER_COUNT_MAX = 300;
+const REFERENCE_IMAGE_MAX = 20;
 const previewWidth = 280;
 const previewMaxHeight = 340;
 const videoExtensionPattern = /\.(mp4|mov|m4v|webm|avi|mkv)$/i;
 const promptMinHeight = computed(() => (isHome.value ? 28 : 108));
 const promptMaxHeight = computed(() => (isHome.value ? 148 : 240));
 
+const sourceRatioImages = computed(() => {
+  if (props.batchFolderImages.length) return props.batchFolderImages;
+  const workingImage = props.referenceImages.find((image) => image.role === "working_canvas") || props.referenceImages[0];
+  return workingImage ? [workingImage] : [];
+});
+const sourceRatioDetail = computed(() => {
+  const labels = Array.from(new Set(sourceRatioImages.value.map(sourceRatioLabel).filter(Boolean)));
+  if (labels.length === 1) return labels[0];
+  return labels.length > 1 ? `${labels.length} 种比例` : "";
+});
+const sourceRatioText = computed(() => sourceRatioDetail.value ? `跟随原图 · ${sourceRatioDetail.value}` : "跟随原图");
+const sourceOutputLabel = computed(() => {
+  if (imageRatio.value !== "source") return "";
+  if (sourceRatioImages.value.length > 1) return "逐张匹配";
+  const resolved = resolveSourceImageSize(sourceRatioImages.value[0], `${imageWidth.value || 1024}x${imageHeight.value || 1024}`);
+  return resolved.replace("x", " × ");
+});
+const aspectOptions = computed<AspectOption[]>(() => sourceRatioImages.value.length
+  ? [{ ratio: "source", tier: "1k", width: "1024", height: "1024", label: "跟随原图", detail: sourceRatioDetail.value, icon: Ratio }, ...fixedAspectOptions]
+  : fixedAspectOptions);
 const modelLabel = computed(() => formatImageModel(imageModel.value));
 const modelFeatures = computed(() => imageModelFeatures(imageModel.value));
 const qualityLabel = computed(() => qualityOptions.find((item) => item.value === imageQuality.value)?.label || "自动");
-const canvasLabel = computed(() => imageRatio.value === "auto" ? "自动" : imageRatio.value);
+const canvasLabel = computed(() => imageRatio.value === "source" ? sourceRatioText.value : imageRatio.value === "auto" ? "智能构图" : imageRatio.value);
 const countLabel = computed(() => `${normalizeCountValue(imageCount.value, countMaxForCurrentMode())} 张`);
 const preferencesLabel = computed(() => `${canvasLabel.value} · ${countLabel.value}`);
 const hasReferences = computed(() => props.referenceImages.length > 0);
@@ -198,11 +244,12 @@ function resizePromptTextarea() {
   element.style.height = `${nextHeight}px`;
   element.style.overflowY = element.scrollHeight > promptMaxHeight.value ? "auto" : "hidden";
 }
-function setAspect(option: typeof aspectOptions[number]) {
+function setAspect(option: AspectOption) {
   imageRatio.value = option.ratio;
   imageTier.value = option.tier;
   imageWidth.value = option.width;
   imageHeight.value = option.height;
+  emit("ratioSelected");
 }
 function showReferencePreview(image: StoredReferenceImage, index: number, event: MouseEvent | FocusEvent) {
   const target = event.currentTarget as HTMLElement | null;
@@ -258,8 +305,11 @@ function closeSettingCards() {
 function onDocumentPointerDown(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
-  if (settingCards.value?.contains(target)) return;
+  if (settingCards.value?.contains(target) || settingPanel.value?.contains(target)) return;
   openSettingCard.value = null;
+}
+function syncCompactSettings(event?: MediaQueryListEvent) {
+  isCompactSettings.value = event?.matches ?? compactSettingsQuery?.matches ?? false;
 }
 function runPromptAssist(action: PromptAssistAction) {
   openSettingCard.value = null;
@@ -336,25 +386,72 @@ function videoStatusLabel(video: StoredAgentVideo) {
   if (video.analysisStatus === "processing" || video.status === "processing") return "解析中";
   return "待解析";
 }
+function updatePromptAnalysisStatus(eventType: string) {
+  if (eventType === "run.queued") promptAssistNote.value = "参考图分析排队中...";
+  else if (eventType === "run.retrying") promptAssistNote.value = "上游连接波动，等待自动重试...";
+  else if (eventType === "run.started" || eventType === "agent.update") promptAssistNote.value = "AI 正在分析参考图...";
+}
+async function waitForPromptAnalysis(initialRun: AgentRun<ImagePromptAnalysisResponse>) {
+  let run = initialRun;
+  const activeStatuses = new Set(["pending", "running"]);
+  if (activeStatuses.has(run.status)) {
+    const controller = new AbortController();
+    promptAssistAbortController?.abort();
+    promptAssistAbortController = controller;
+    try {
+      const after = run.events?.at(-1)?.sequence || 0;
+      await streamAgentRunEvents(run.runId, (event) => updatePromptAnalysisStatus(event.type), {
+        after,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      promptAssistNote.value = "实时状态连接中断，正在查询分析结果...";
+    } finally {
+      if (promptAssistAbortController === controller) promptAssistAbortController = null;
+    }
+  }
+
+  const deadline = Date.now() + 600_000;
+  do {
+    run = (await fetchAgentRun<ImagePromptAnalysisResponse>(run.runId, true)).agentRun;
+    if (!activeStatuses.has(run.status)) break;
+    updatePromptAnalysisStatus(run.status === "pending" ? "run.queued" : "run.started");
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+  } while (Date.now() < deadline);
+
+  if (run.status === "failed") throw new Error(run.error || "参考图分析失败");
+  if (run.status === "canceled") throw new Error("参考图分析已取消");
+  if (run.status !== "completed") throw new Error("参考图分析等待超时，请稍后重试");
+  if (!run.result) throw new Error("参考图分析结果为空");
+  return run.result;
+}
 async function assist(action: PromptAssistAction) {
   if (!hasReferences.value || promptAssistAction.value) {
     promptAssistNote.value = "请先上传商品参考图，再让 AI 分析图片并生成 Prompt。";
     return;
   }
   promptAssistAction.value = action;
-  promptAssistNote.value = "AI 正在分析参考图...";
+  promptAssistNote.value = "正在提交参考图分析...";
   try {
     const analyzableImages = props.referenceImages
-      .filter((image) => image.dataUrl)
-      .slice(0, 6)
-      .map((image) => ({ name: image.name, dataUrl: image.dataUrl || "" }));
-    if (!analyzableImages.length) throw new Error("当前历史参考图已瘦身为 URL，请先加入本地图片后再分析");
-    const result = await analyzeImagePrompt({
+      .filter((image) => image.dataUrl || image.url)
+      .slice(0, REFERENCE_IMAGE_MAX)
+      .map((image) => {
+        const url = String(image.url || "").trim();
+        return /^https?:\/\//i.test(url)
+          ? { name: image.name, url }
+          : { name: image.name, dataUrl: image.dataUrl || "" };
+      });
+    if (!analyzableImages.length) throw new Error("没有可分析的参考图");
+    const queued = await analyzeImagePrompt({
       action,
       mode: "single",
       prompt: prompt.value.trim(),
       images: analyzableImages,
     });
+    promptAssistNote.value = queued.agentRun.status === "pending" ? "参考图分析排队中..." : "AI 正在分析参考图...";
+    const result = await waitForPromptAnalysis(queued.agentRun);
     const analysis = [
       result.analysis.subject && `主体识别：${result.analysis.subject}`,
       result.analysis.materials && `材质/细节：${result.analysis.materials}`,
@@ -379,12 +476,19 @@ watch(prompt, () => {
 }, { flush: "post" });
 
 onMounted(() => {
+  compactSettingsQuery = window.matchMedia("(max-width: 640px)");
+  syncCompactSettings();
+  compactSettingsQuery.addEventListener("change", syncCompactSettings);
   void nextTick(resizePromptTextarea);
   window.addEventListener("resize", resizePromptTextarea);
   document.addEventListener("pointerdown", onDocumentPointerDown);
 });
 
 onBeforeUnmount(() => {
+  promptAssistAbortController?.abort();
+  promptAssistAbortController = null;
+  compactSettingsQuery?.removeEventListener("change", syncCompactSettings);
+  compactSettingsQuery = null;
   window.removeEventListener("resize", resizePromptTextarea);
   document.removeEventListener("pointerdown", onDocumentPointerDown);
 });
@@ -514,28 +618,32 @@ watch(promptEngineMode, () => {
             <button
               v-if="!isAgentMode"
               type="button"
-              class="composer-inline-setting"
+              class="composer-inline-setting composer-inline-setting--select"
               :class="{ 'is-selected': openSettingCard === 'model' }"
               :aria-expanded="openSettingCard === 'model'"
+              :aria-label="`选择模型，当前 ${modelLabel}`"
               aria-controls="composer-model-card-panel"
               data-testid="image-model-card-toggle"
               @click="toggleSettingCard('model')"
             >
               <span class="composer-inline-label">模型</span>
               <strong>{{ modelLabel }}</strong>
+              <ChevronDown class="composer-setting-chevron" :class="{ 'is-open': openSettingCard === 'model' }" aria-hidden="true" />
             </button>
             <button
               v-if="!isAgentMode"
               type="button"
-              class="composer-inline-setting"
+              class="composer-inline-setting composer-inline-setting--select composer-inline-setting--ratio"
               :class="{ 'is-selected': openSettingCard === 'canvas' }"
               :aria-expanded="openSettingCard === 'canvas'"
+              :aria-label="`选择图片比例，当前 ${canvasLabel}`"
               aria-controls="composer-canvas-card-panel"
               data-testid="image-canvas-card-toggle"
               @click="toggleSettingCard('canvas')"
             >
-              <span class="composer-inline-label">画布</span>
+              <span class="composer-inline-label">图片比例</span>
               <strong>{{ canvasLabel }}</strong>
+              <ChevronDown class="composer-setting-chevron" :class="{ 'is-open': openSettingCard === 'canvas' }" aria-hidden="true" />
             </button>
             <button
               v-if="isAgentMode"
@@ -694,7 +802,8 @@ watch(promptEngineMode, () => {
           </div>
         </div>
 
-          <div class="composer-setting-card-panel-clip" :class="{ 'is-open': Boolean(openSettingCard) }" :aria-hidden="!openSettingCard" :inert="!openSettingCard">
+        <Teleport to="body" :disabled="!isCompactSettings">
+          <div ref="settingPanel" class="composer-setting-card-panel-clip" :class="{ 'is-open': Boolean(openSettingCard) }" :aria-hidden="!openSettingCard" :inert="!openSettingCard" @keydown.escape="closeSettingCards">
             <div v-if="renderedSettingCard" class="composer-setting-card-panel mt-2 rounded-xl border border-black/[0.06] bg-[#F8FAFC] p-3 dark:border-white/10 dark:bg-white/[0.04]">
               <div v-if="renderedSettingCard === 'preferences'" id="composer-preferences-card-panel" class="composer-preferences-panel">
                 <div class="composer-preferences-heading">
@@ -711,11 +820,12 @@ watch(promptEngineMode, () => {
                     </select>
                   </label>
                   <fieldset class="composer-preference-field composer-preference-field--canvas">
-                    <legend>画布比例</legend>
+                    <legend>图片比例</legend>
                     <div class="grid grid-cols-4 gap-2 sm:grid-cols-7">
-                      <button v-for="option in aspectOptions" :key="`agent-${option.ratio}-${option.label}`" type="button" class="studio-button flex min-h-11 flex-col items-center justify-center gap-0.5 rounded-lg border text-xs font-medium" :class="option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300'" @click="setAspect(option)">
+                      <button v-for="option in aspectOptions" :key="`agent-${option.ratio}-${option.label}`" type="button" class="studio-button flex min-h-11 flex-col items-center justify-center gap-0.5 rounded-lg border text-xs font-medium" :class="[option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300', option.ratio === 'source' ? 'col-span-2 px-2' : '']" @click="setAspect(option)">
                         <component :is="option.icon" class="size-3.5" />
                         <span>{{ option.label }}</span>
+                        <small v-if="option.detail" class="text-[10px] opacity-70">{{ option.detail }}</small>
                       </button>
                     </div>
                   </fieldset>
@@ -764,20 +874,22 @@ watch(promptEngineMode, () => {
 
               <div v-else-if="renderedSettingCard === 'canvas'" id="composer-canvas-card-panel" class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
                 <div>
-                  <label class="mb-2 block text-xs font-semibold text-slate-500">画布比例</label>
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">图片比例</label>
                   <div class="grid grid-cols-3 gap-2 sm:grid-cols-7">
-                    <button v-for="option in aspectOptions" :key="`${option.ratio}-${option.tier}-${option.label}`" type="button" class="studio-button flex h-[58px] flex-col items-center justify-center gap-1 rounded-xl border text-[13px] font-medium" :class="option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300'" @click="setAspect(option)">
+                    <button v-for="option in aspectOptions" :key="`${option.ratio}-${option.tier}-${option.label}`" type="button" class="studio-button flex h-[58px] flex-col items-center justify-center gap-0.5 rounded-xl border text-[13px] font-medium" :class="[option.ratio === imageRatio && option.tier === imageTier && option.width === imageWidth && option.height === imageHeight ? 'border-[#4F7CFF]/35 bg-[#4F7CFF]/10 text-[#315be8]' : 'border-black/[0.06] bg-white text-slate-700 hover:bg-[#4F7CFF]/[0.08] dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-300', option.ratio === 'source' ? 'col-span-2 px-2' : '']" @click="setAspect(option)">
                       <component :is="option.icon" class="size-4" />
                       <span>{{ option.label }}</span>
+                      <small v-if="option.detail" class="text-[10px] opacity-70">{{ option.detail }}</small>
                     </button>
                   </div>
                 </div>
                 <div>
-                  <label class="mb-2 block text-xs font-semibold text-slate-500">自定义尺寸</label>
-                  <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-                    <input v-model="imageWidth" type="number" min="1" class="studio-input h-10 px-3 text-center" />
+                  <label class="mb-2 block text-xs font-semibold text-slate-500">输出尺寸</label>
+                  <output v-if="imageRatio === 'source'" class="studio-input flex h-10 items-center justify-center px-3 text-sm font-semibold text-slate-700 dark:text-stone-200">{{ sourceOutputLabel }}</output>
+                  <div v-else class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                    <input v-model="imageWidth" type="number" min="1" class="studio-input h-10 px-3 text-center" @input="emit('ratioSelected')" />
                     <span class="text-sm text-slate-400">x</span>
-                    <input v-model="imageHeight" type="number" min="1" class="studio-input h-10 px-3 text-center" />
+                    <input v-model="imageHeight" type="number" min="1" class="studio-input h-10 px-3 text-center" @input="emit('ratioSelected')" />
                   </div>
                 </div>
               </div>
@@ -811,6 +923,7 @@ watch(promptEngineMode, () => {
               </div>
             </div>
           </div>
+        </Teleport>
       </div>
 
       <div v-if="promptAssistNote" class="mt-2 text-[12px] font-medium text-[#4F7CFF]">{{ promptAssistNote }}</div>
@@ -1262,6 +1375,10 @@ watch(promptEngineMode, () => {
   .composer-setting-card-panel-clip.is-open {
     transform: none;
   }
+
+  .composer-setting-chevron {
+    transition: none;
+  }
 }
 
 @media (hover: none) {
@@ -1501,6 +1618,46 @@ watch(promptEngineMode, () => {
 
 .composer-inline-setting--engine {
   cursor: default;
+}
+
+.composer-inline-setting--select {
+  min-height: 2.35rem;
+  padding: 0 0.7rem;
+  border: 1px solid rgb(15 23 42 / 0.09);
+  border-radius: 8px;
+  background: rgb(248 250 252);
+}
+
+.composer-inline-setting--select:hover,
+.composer-inline-setting--select:focus-visible,
+.composer-inline-setting--select.is-selected {
+  border-color: rgb(79 124 255 / 0.35);
+  background: rgb(79 124 255 / 0.07);
+}
+
+.composer-inline-setting--select strong {
+  max-width: 10.5rem;
+}
+
+.composer-inline-setting--ratio {
+  flex: none;
+}
+
+.composer-inline-setting--ratio strong {
+  max-width: none;
+}
+
+.composer-setting-chevron {
+  width: 0.9rem;
+  height: 0.9rem;
+  flex: none;
+  color: rgb(100 116 139);
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), color 160ms ease;
+}
+
+.composer-setting-chevron.is-open {
+  color: rgb(49 91 232);
+  transform: rotate(180deg);
 }
 
 .composer-inline-setting:hover,
@@ -1802,6 +1959,18 @@ watch(promptEngineMode, () => {
   color: rgb(214 211 209);
 }
 
+.dark .composer-inline-setting--select {
+  border-color: rgb(255 255 255 / 0.12);
+  background: rgb(255 255 255 / 0.055);
+}
+
+.dark .composer-inline-setting--select:hover,
+.dark .composer-inline-setting--select:focus-visible,
+.dark .composer-inline-setting--select.is-selected {
+  border-color: rgb(157 179 255 / 0.42);
+  background: rgb(79 124 255 / 0.12);
+}
+
 .dark .composer-inline-label,
 .dark .composer-count-value span,
 .dark .composer-tool-button,
@@ -1894,6 +2063,15 @@ watch(promptEngineMode, () => {
     padding: 0 0.55rem;
   }
 
+  .composer-inline-setting.composer-inline-setting--select {
+    padding: 0 0.65rem;
+    border-right: 1px solid rgb(15 23 42 / 0.09);
+  }
+
+  .dark .composer-inline-setting.composer-inline-setting--select {
+    border-right-color: rgb(255 255 255 / 0.12);
+  }
+
   .composer-inline-setting:first-child {
     padding-left: 0.55rem;
   }
@@ -1929,7 +2107,7 @@ watch(promptEngineMode, () => {
   .composer-settings-backdrop {
     position: fixed;
     inset: 0;
-    z-index: 9;
+    z-index: 50;
     display: block;
     width: 100%;
     height: 100%;
@@ -1955,7 +2133,7 @@ watch(promptEngineMode, () => {
     right: 0.5rem;
     bottom: max(0.5rem, env(safe-area-inset-bottom));
     left: 0.5rem;
-    z-index: 30;
+    z-index: 60;
     max-height: min(76dvh, 640px);
     overflow-y: auto;
     margin: 0 !important;

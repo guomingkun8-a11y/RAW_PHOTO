@@ -17,6 +17,7 @@ from services.image.image_prompt_compliance import IMAGE_PROMPT_DIRECTOR_MARKER,
 from services.image.image_task_assets import ImageAspectRatioMismatchError
 from services.image.image_task_service import ImageTaskService
 from services.image.image_task_store import DatabaseImageTaskStore
+from services.providers.openai_relay_pool import RelaySubmittedHTTPException
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -457,6 +458,22 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertNotIn("reference_upload_ms", received[0])
             self.assertNotIn("reference_cache_hits", received[0])
 
+    def test_edit_rejects_more_than_fourteen_generation_references(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+
+            with self.assertRaises(ValueError) as ctx:
+                service.submit_edit(
+                    OWNER,
+                    client_task_id="too-many-references",
+                    prompt="edit product",
+                    model="gpt-image-2",
+                    size="1024x1024",
+                    image_urls=[f"https://cdn.example.test/{index}.png" for index in range(15)],
+                )
+
+            self.assertIn("at most 14 reference images", str(ctx.exception))
+
     def test_worker_thread_count_respects_queue_and_account_limits(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             queue = MemoryTaskQueue()
@@ -784,7 +801,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 for store in stores:
                     store.close()
 
-    def test_cancel_running_task_ignores_late_success(self):
+    def test_cancel_running_task_requires_confirmation_and_keeps_late_success(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             handler_started = threading.Event()
             allow_finish = threading.Event()
@@ -804,19 +821,98 @@ class ImageTaskServiceTests(unittest.TestCase):
                 base_url="http://local.test",
             )
             self.assertTrue(handler_started.wait(1))
-            task = service.cancel_task(OWNER, "cancel-task")
+            preview = service.cancel_task(OWNER, "cancel-task", dry_run=True)
+            self.assertTrue(preview["requires_confirmation"])
 
-            self.assertEqual(task["status"], "canceled")
-            self.assertEqual(task["error"], "任务已中止")
+            task = service.cancel_task(OWNER, "cancel-task", confirm_upstream=True)
+
+            self.assertTrue(task["cancellation_pending"])
+            self.assertEqual(task["status"], "running")
 
             allow_finish.set()
             time.sleep(0.08)
             result = service.list_tasks(OWNER, ["cancel-task"])
             stored = result["items"][0]
 
-            self.assertEqual(stored["status"], "canceled")
-            self.assertEqual(stored.get("data"), [])
-            self.assertNotEqual(stored.get("data"), [{"url": "http://example.test/late.png"}])
+            self.assertEqual(stored["status"], "success")
+            self.assertEqual(stored.get("data"), [{"url": "http://example.test/late.png"}])
+            self.assertTrue(stored.get("cancel_requested"))
+
+    def test_queued_relay_task_cancels_without_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                task_queue=MemoryTaskQueue(),
+                run_inline=False,
+            )
+            service.relay_enabled_getter = lambda: True
+            try:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="queued-cancel-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+                preview = service.cancel_task(OWNER, "queued-cancel-task", dry_run=True)
+                canceled = service.cancel_task(OWNER, "queued-cancel-task")
+
+                self.assertFalse(preview.get("requires_confirmation"))
+                self.assertEqual(canceled["status"], "canceled")
+            finally:
+                service.close()
+
+    def test_relay_cancel_requires_confirmation_and_keeps_late_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            handler_started = threading.Event()
+            allow_finish = threading.Event()
+
+            def handler(_payload):
+                handler_started.set()
+                allow_finish.wait(1)
+                return {
+                    "data": [{"url": "http://example.test/late.png"}],
+                    "cost": 0.0327,
+                    "_media_task_id": "upstream-image-1",
+                }
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.relay_enabled_getter = lambda: True
+            relay_handler = mock.patch(
+                "services.image.image_task_service.openai_relay_service.image_generations",
+                side_effect=handler,
+            )
+            relay_handler.start()
+            try:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="relay-cancel-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                self.assertTrue(handler_started.wait(1))
+
+                preview = service.cancel_task(OWNER, "relay-cancel-task", dry_run=True)
+                self.assertTrue(preview["requires_confirmation"])
+                self.assertEqual(preview["status"], "running")
+
+                requested = service.cancel_task(OWNER, "relay-cancel-task", confirm_upstream=True)
+                self.assertTrue(requested["cancellation_pending"])
+                self.assertEqual(requested["status"], "running")
+
+                allow_finish.set()
+                stored = wait_for_task(service, OWNER, "relay-cancel-task", "success")
+                self.assertTrue(stored["cancel_requested"])
+                self.assertEqual(stored["data"][0]["url"], "http://example.test/late.png")
+                self.assertEqual(stored["cost"], 0.0327)
+            finally:
+                allow_finish.set()
+                relay_handler.stop()
+                service.close()
 
     def test_other_owner_cannot_cancel_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -940,6 +1036,116 @@ class ImageTaskServiceTests(unittest.TestCase):
                 task = wait_for_task(service, OWNER, "relay-task", "success")
                 self.assertEqual(task["data"][0]["url"], "http://relay.test/image.png")
                 relay_handler.assert_called_once()
+
+    def test_relay_media_task_is_reconciled_after_submission(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler=lambda _payload: (_ for _ in ()).throw(RuntimeError("local handler should not run")),
+            )
+            service.relay_enabled_getter = lambda: True
+            with (
+                mock.patch(
+                    "services.image.image_task_service.openai_relay_service.image_generations",
+                    return_value={
+                        "data": [],
+                        "_media_pending": True,
+                        "_media_task_id": "upstream-task-1",
+                        "_media_task_ids": ["upstream-task-1"],
+                    },
+                ) as relay_handler,
+                mock.patch(
+                    "services.image.image_task_service.openai_relay_service.get_media_image_task_status",
+                    return_value={
+                        "state": "success",
+                        "url": "http://relay.test/reconciled.png",
+                        "cost": 1.5,
+                    },
+                ) as reconcile,
+            ):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="relay-reconciliation-task",
+                    prompt="cat",
+                    model="banana-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+                task = wait_for_task(service, OWNER, "relay-reconciliation-task", "success")
+
+            self.assertEqual(task["data"][0]["url"], "http://relay.test/reconciled.png")
+            self.assertEqual(task["cost"], 1.5)
+            relay_handler.assert_called_once()
+            self.assertTrue(relay_handler.call_args.args[0]["_defer_media_poll"])
+            reconcile.assert_called_once_with("upstream-task-1")
+
+    def test_relay_submitted_timeout_requires_manual_check_without_resubmission(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                handler=lambda _payload: (_ for _ in ()).throw(RuntimeError("local handler should not run")),
+            )
+            service.relay_enabled_getter = lambda: True
+            timeout = RelaySubmittedHTTPException(
+                status_code=504,
+                detail={"error": "media generation timed out"},
+                upstream_task_ids=["upstream-timeout-task"],
+                submission_uncertain=True,
+            )
+            with (
+                mock.patch(
+                    "services.image.image_task_service.openai_relay_service.image_generations",
+                    side_effect=timeout,
+                ) as relay_handler,
+                mock.patch(
+                    "services.image.image_task_service.openai_relay_service.get_media_image_task_status",
+                ) as reconcile,
+            ):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="relay-timeout-reconciliation-task",
+                    prompt="cat",
+                    model="banana-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+
+                task = wait_for_task(service, OWNER, "relay-timeout-reconciliation-task", "error")
+
+            self.assertTrue(task["reconciliation_required"])
+            self.assertEqual(task["upstream_task_id"], "upstream-timeout-task")
+            relay_handler.assert_called_once()
+            reconcile.assert_not_called()
+
+    def test_reconciliation_state_survives_database_service_reload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = DatabaseImageTaskStore(f"sqlite:///{Path(tmp_dir) / 'tasks.db'}")
+            store.save_task(
+                "owner-1:reconciling-task",
+                {
+                    "id": "reconciling-task",
+                    "owner_id": "owner-1",
+                    "status": "reconciling",
+                    "mode": "generate",
+                    "model": "banana-2",
+                    "created_at": "2026-10-18 10:00:00",
+                    "updated_at": "2026-10-18 10:00:01",
+                    "reconciliation_required": True,
+                    "reconciliation": {"accepted_task_ids": ["upstream-task"]},
+                    "upstream_task_ids": ["upstream-task"],
+                },
+            )
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                task_store=store,
+            )
+
+            task = service.list_tasks(OWNER, ["reconciling-task"])["items"][0]
+
+            self.assertEqual(task["status"], "running")
+            self.assertTrue(task["reconciliation_required"])
+            service.close()
 
     def test_success_task_records_library_and_monitoring(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1282,6 +1488,100 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+
+    def test_refunded_reference_read_failure_retries_once(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            store = DatabaseImageTaskStore(f"sqlite:///{root / 'tasks.db'}")
+            queue = MemoryTaskQueue()
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RelaySubmittedHTTPException(
+                        status_code=422,
+                        detail={"error": "media generation failed: 参考图处理失败: unexpected EOF（已退款）"},
+                        upstream_task_ids=["refunded-task"],
+                        submission_uncertain=False,
+                        upstream_finished=True,
+                        refunded=True,
+                    )
+                return {"data": [{"url": "http://example.test/image.png"}], "_media_task_id": "retry-task"}
+
+            service = self.make_service(
+                root / "image_tasks.json",
+                handler,
+                task_store=store,
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 3,
+            )
+            try:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="reference-retry",
+                    prompt="product image",
+                    model="banana-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                first = service.work_once(timeout_secs=0)
+                queued = store.get_task("owner-1:reference-retry")
+                self.assertEqual(first["status"], "queued")
+                self.assertEqual(queued["attempts"], 1)
+                self.assertEqual(queued["max_retries"], 1)
+                self.assertEqual(queue.queue_depth(), 1)
+
+                second = service.work_once(timeout_secs=0)
+                self.assertEqual(second["status"], "success")
+                self.assertEqual(second["upstream_task_id"], "retry-task")
+                self.assertEqual(calls, 2)
+                self.assertEqual(queue.queue_depth(), 0)
+            finally:
+                service.close()
+
+    def test_reference_read_failure_without_refund_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            queue = MemoryTaskQueue()
+            calls = 0
+
+            def handler(_payload):
+                nonlocal calls
+                calls += 1
+                raise RelaySubmittedHTTPException(
+                    status_code=422,
+                    detail={"error": "media generation failed: 参考图处理失败: unexpected EOF"},
+                    upstream_task_ids=["unrefunded-task"],
+                    submission_uncertain=False,
+                    upstream_finished=True,
+                    refunded=False,
+                )
+
+            service = self.make_service(
+                root / "image_tasks.json",
+                handler,
+                task_store=DatabaseImageTaskStore(f"sqlite:///{root / 'tasks.db'}"),
+                task_queue=queue,
+                run_inline=False,
+                max_retries_getter=lambda: 3,
+            )
+            try:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="unrefunded-reference-failure",
+                    prompt="product image",
+                    model="banana-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                self.assertEqual(service.work_once(timeout_secs=0)["status"], "error")
+                self.assertEqual(queue.queue_depth(), 0)
+                self.assertEqual(calls, 1)
+            finally:
+                service.close()
 
 
 if __name__ == "__main__":

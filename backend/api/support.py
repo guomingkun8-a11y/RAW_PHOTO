@@ -6,7 +6,7 @@ from fastapi import HTTPException, Request
 
 from services.accounts.auth_service import auth_service
 from services.platform.config import config
-from services.accounts.user_service import user_service
+from services.accounts.user_service import DEFAULT_ADMIN_ID, user_service
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 WEB_DIST_DIRS = [
@@ -49,6 +49,13 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     identity = require_identity(authorization)
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "admin role required"})
+    return identity
+
+
+def require_super_admin(authorization: str | None) -> dict[str, object]:
+    identity = require_admin(authorization)
+    if identity.get("id") != DEFAULT_ADMIN_ID:
+        raise HTTPException(status_code=403, detail={"error": "super administrator required"})
     return identity
 
 

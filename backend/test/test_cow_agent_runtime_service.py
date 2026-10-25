@@ -358,8 +358,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual("ready", runtime._video_context()[0]["analysisStatus"])
         self.assertEqual("视频里展示了商品使用场景", runtime._video_context()[0]["analysis"]["summary"])
 
-    def test_remote_reference_url_is_downloaded_for_edit_task(self):
-        payload = b"remote-product-reference"
+    def test_remote_reference_url_is_not_duplicated_as_an_edit_file(self):
         run = self._run(
             images=[{
                 "name": "product.png",
@@ -375,15 +374,7 @@ class CowAgentRuntimeTests(unittest.TestCase):
                 "data": [{"url": "https://example.test/edited.png"}],
             }),
         )
-        response = SimpleNamespace(
-            status_code=200,
-            headers={"content-type": "image/png", "content-length": str(len(payload))},
-            content=payload,
-        )
-        with (
-            mock.patch.object(cow_runtime, "image_task_service", task_service),
-            mock.patch.object(cow_runtime.requests, "get", return_value=response),
-        ):
+        with mock.patch.object(cow_runtime, "image_task_service", task_service):
             runtime = cow_runtime.CowAgentRunRuntime(run)
             runtime.save_attachments()
             result = runtime.generate_images(
@@ -394,9 +385,26 @@ class CowAgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(1, result["count"])
         edit_request = task_service.submit_edit.call_args.kwargs
-        self.assertEqual(payload, edit_request["images"][0][0])
-        self.assertEqual("url-01-product.png", edit_request["images"][0][1])
+        self.assertEqual([], edit_request["images"])
         self.assertEqual(["https://example.test/product.png"], edit_request["image_urls"])
+
+    def test_reference_selection_caps_generation_at_fourteen_images(self):
+        run = self._run(images=[
+            {
+                "name": f"reference-{index}.png",
+                "type": "image/png",
+                "url": f"https://example.test/{index}.png",
+                "role": "reference",
+            }
+            for index in range(20)
+        ])
+        runtime = cow_runtime.CowAgentRunRuntime(run)
+        runtime.save_attachments()
+
+        runtime._apply_reference_selection({"imageSourcePolicy": "new_upload"})
+
+        self.assertEqual(14, len(runtime.attachment_urls))
+        self.assertEqual(14, len(runtime.reference_selection["selected"]))
 
     @staticmethod
     def _finalized_reference_policy(
@@ -2398,6 +2406,80 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual(2, captured["request"]["count"])
         state = self.memory.load_run_state(run.run_id, owner_id="cow-user")
         self.assertEqual("completed", state["status"])
+
+    def test_prompt_analysis_run_uses_agent_queue_without_creating_conversation(self):
+        queue = SimpleNamespace(
+            ensure_ready=mock.Mock(),
+            reserve_pending=mock.Mock(),
+            enqueue=mock.Mock(return_value="1-0"),
+            release_pending=mock.Mock(),
+            publish_run_event=mock.Mock(),
+            is_cancel_requested=mock.Mock(return_value=False),
+        )
+        analysis = {
+            "model": "gpt-5.6-sol",
+            "analysis": {"subject": "商品"},
+            "suggestions": ["建议一"],
+            "suggestionPrompt": "生成商品图",
+            "optimizedPrompt": "生成精致商品图",
+            "negativePrompt": "模糊",
+        }
+        with (
+            mock.patch.object(cow_runtime, "agent_queue_service", queue),
+            mock.patch.object(cow_runtime, "analyze_image_prompt", return_value=analysis) as analyze,
+        ):
+            queued = cow_runtime.start_prompt_analysis_run(
+                {
+                    "action": "optimize",
+                    "mode": "single",
+                    "images": [{"name": "product.png", "url": "https://example.test/product.png"}],
+                },
+                identity={"id": "cow-user"},
+            )
+            run_id = queued["agentRun"]["runId"]
+            completed = cow_runtime.execute_queued_cow_agent_run(run_id, "cow-user")
+
+        self.assertEqual("pending", queued["agentRun"]["status"])
+        self.assertEqual(AgentRunStatus.COMPLETED, completed.status)
+        self.assertEqual(analysis, completed.raw_result)
+        analyze.assert_called_once()
+        queue.reserve_pending.assert_called_once_with(run_id=run_id, owner_id="cow-user")
+        queue.enqueue.assert_called_once_with(run_id=run_id, owner_id="cow-user")
+        self.assertIsNone(self.memory.find_conversation_by_run(owner_id="cow-user", run_id=run_id))
+
+    def test_prompt_analysis_transient_upstream_error_stays_pending_for_worker_retry(self):
+        queue = SimpleNamespace(
+            ensure_ready=mock.Mock(),
+            reserve_pending=mock.Mock(),
+            enqueue=mock.Mock(return_value="1-0"),
+            release_pending=mock.Mock(),
+            publish_run_event=mock.Mock(),
+            is_cancel_requested=mock.Mock(return_value=False),
+        )
+        with (
+            mock.patch.object(cow_runtime, "agent_queue_service", queue),
+            mock.patch.object(
+                cow_runtime,
+                "analyze_image_prompt",
+                side_effect=RuntimeError("curl: (28) operation timed out"),
+            ),
+        ):
+            queued = cow_runtime.start_prompt_analysis_run(
+                {
+                    "action": "optimize",
+                    "mode": "single",
+                    "images": [{"name": "product.png", "url": "https://example.test/product.png"}],
+                },
+                identity={"id": "cow-user"},
+            )
+            run_id = queued["agentRun"]["runId"]
+            with self.assertRaisesRegex(RuntimeError, "curl: \\(28\\)"):
+                cow_runtime.execute_queued_cow_agent_run(run_id, "cow-user")
+
+        state = self.memory.load_run_state(run_id, owner_id="cow-user")
+        self.assertEqual("pending", state["status"])
+        self.assertEqual("", state["error"])
+        self.assertTrue(any(event["type"] == "run.retrying" for event in self.memory.load_run_events(run_id)))
 
     def test_queued_run_normalizes_invalid_persisted_size(self):
         run = self._run()

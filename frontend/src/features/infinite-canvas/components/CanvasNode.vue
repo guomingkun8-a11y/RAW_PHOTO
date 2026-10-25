@@ -18,6 +18,7 @@ import {
 
 import type { VideoGenerationModelSpec } from '@/lib/api';
 import CanvasPromptEditor from '@/features/infinite-canvas/components/CanvasPromptEditor.vue';
+import CanvasAudioNodeBody from '@/features/infinite-canvas/components/CanvasAudioNodeBody.vue';
 import CanvasTextNodeBody from '@/features/infinite-canvas/components/CanvasTextNodeBody.vue';
 import {
   type CanvasMediaReference,
@@ -44,7 +45,7 @@ const props = defineProps<{
   uploadEnabled: boolean;
   imageModels: string[];
   videoModels: VideoGenerationModelSpec[];
-  videoMode: 'text_to_video' | 'image_to_video';
+  videoMode: 'text_to_video' | 'image_to_video' | 'video_to_video';
   promptReferences: CanvasMediaReference[];
   referenceCandidates: CanvasMediaReference[];
   downloading: boolean;
@@ -79,7 +80,7 @@ const emit = defineEmits<{
 const fileInput = ref<HTMLInputElement>();
 const mediaDragActive = ref(false);
 
-const isMediaNode = computed(() => props.node.type === 'image' || props.node.type === 'video');
+const isMediaNode = computed(() => props.node.type === 'image' || props.node.type === 'video' || props.node.type === 'audio');
 const imageResultUrls = computed(() => {
   const values = Array.isArray(props.node.resultUrls) && props.node.resultUrls.length
     ? props.node.resultUrls
@@ -113,6 +114,7 @@ const mediaPreviewUrl = computed(() => {
   if (primaryImageUrl.value) return primaryImageUrl.value;
   if (props.node.resultUrl) return props.node.resultUrl;
   if (props.node.type === 'video') return props.node.inputUrl;
+  if (props.node.type === 'audio') return props.node.inputAudioUrl;
   return [...props.node.references]
     .reverse()
     .find((reference) => reference.uploadState !== 'failed')?.previewUrl;
@@ -120,7 +122,7 @@ const mediaPreviewUrl = computed(() => {
 const videoAnalysisStatus = computed(() => String(props.node.videoAnalysisStatus || 'pending').toLowerCase());
 const showsVideoAnalysisStatus = computed(() => props.node.type === 'video'
   && Boolean(props.node.inputVideoId)
-  && !props.node.resultUrl
+  && (!props.node.resultUrl || videoAnalysisStatus.value !== 'ready')
   && props.node.status !== 'uploading'
   && props.node.status !== 'generating'
   && props.node.status !== 'failed');
@@ -336,7 +338,18 @@ function startImageConnection(event: PointerEvent, imageIndex: number) {
     ><span /></button>
 
     <div class="canvas-node-visual">
-    <template v-if="isMediaNode">
+    <template v-if="node.type === 'audio'">
+      <CanvasAudioNodeBody
+        :node="node"
+        :upload-enabled="uploadEnabled"
+        :stage-height="stageHeight"
+        @select="forwardSelect"
+        @upload="chooseUpload"
+        @remove="emit('remove')"
+      />
+    </template>
+
+    <template v-else-if="isMediaNode">
       <header class="media-node-header">
         <div class="media-node-title">
           <span class="media-node-icon">
@@ -582,7 +595,7 @@ function startImageConnection(event: PointerEvent, imageIndex: number) {
         ref="fileInput"
         class="visually-hidden"
         type="file"
-        :accept="node.type === 'image' ? 'image/png,image/jpeg,image/webp' : 'video/mp4,video/webm,video/quicktime,.m4v,.avi,.mkv'"
+        :accept="node.type === 'image' ? 'image/png,image/jpeg,image/webp' : node.type === 'video' ? 'video/mp4,video/webm,video/quicktime,.m4v,.avi,.mkv' : 'audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/flac,.mp3,.wav,.m4a,.aac,.ogg,.flac'"
         @change="onFileChange"
       />
     </template>

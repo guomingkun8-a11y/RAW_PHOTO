@@ -30,6 +30,8 @@ export type StoredReferenceImage = {
   type: string;
   dataUrl?: string;
   url?: string;
+  width?: number;
+  height?: number;
   role?: "working_canvas" | "product_anchor" | "target_product" | "template_reference" | "style_reference" | "composition_reference" | "reference";
 };
 
@@ -276,6 +278,8 @@ function normalizeReferenceImage(image: StoredReferenceImage): StoredReferenceIm
     type: image.type || "image/png",
     dataUrl: typeof image.dataUrl === "string" && image.dataUrl ? image.dataUrl : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
+    width: typeof image.width === "number" && image.width > 0 ? image.width : undefined,
+    height: typeof image.height === "number" && image.height > 0 ? image.height : undefined,
     role: image.role && supportedRoles.has(image.role) ? image.role : undefined,
   };
 }
@@ -653,6 +657,8 @@ function mergeReferenceImage(
     type: latest.type || previous.type,
     dataUrl: latest.dataUrl || previous.dataUrl,
     url: latest.url || previous.url,
+    width: latest.width || previous.width,
+    height: latest.height || previous.height,
   };
 }
 

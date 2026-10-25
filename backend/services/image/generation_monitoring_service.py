@@ -17,6 +17,7 @@ Base = declarative_base()
 DEFAULT_DATABASE_URL = "mysql+pymysql://root:root@127.0.0.1:3306/raw_photo?charset=utf8mb4"
 ONLINE_WINDOW_MINUTES = 5
 LATENCY_SAMPLE_LIMIT = 5000
+REFERENCE_LIMIT_ERROR_PATTERN = "generation supports at most % reference images"
 
 
 def _database_url() -> str:
@@ -32,6 +33,11 @@ def _database_url() -> str:
 def _clean(value: object, default: str = "") -> str:
     text = str(value if value is not None else default).strip()
     return text or default
+
+
+def _is_reference_limit_failure(value: object) -> bool:
+    text = _clean(value).lower()
+    return text.startswith("generation supports at most ") and text.endswith(" reference images")
 
 
 def _int_or_none(value: object) -> int | None:
@@ -481,6 +487,8 @@ class GenerationMonitoringService:
         normalized_task_id = _clean(failure_report_id) or actual_task_id
         if not actual_task_id:
             raise ValueError("task_id is required")
+        if _is_reference_limit_failure(error):
+            return {"ok": True, "ignored": True, "reason": "validation"}
         is_cancellation_report = _is_cancellation_text(error)
 
         now = datetime.now()
@@ -770,10 +778,11 @@ class GenerationMonitoringService:
                         "SELECT owner_id, SUM(image_count) AS failed_count "
                         "FROM generation_task_events "
                         "WHERE status = 'error' AND failure_reported_at IS NOT NULL "
+                        "AND LOWER(COALESCE(error, '')) NOT LIKE :reference_limit_error_pattern "
                         f"{event_range_sql} "
                         "GROUP BY owner_id"
                     ),
-                    range_params,
+                    {**range_params, "reference_limit_error_pattern": REFERENCE_LIMIT_ERROR_PATTERN},
                 ).mappings()
             ]
             cost_rows = [
@@ -962,7 +971,11 @@ class GenerationMonitoringService:
         normalized_query = _clean(query_text).lower()
         safe_limit = max(1, min(500, int(limit or 100)))
         safe_offset = max(0, int(offset or 0))
-        params: dict[str, Any] = {"limit": safe_limit + 1, "offset": safe_offset}
+        params: dict[str, Any] = {
+            "limit": safe_limit + 1,
+            "offset": safe_offset,
+            "reference_limit_error_pattern": REFERENCE_LIMIT_ERROR_PATTERN,
+        }
         cursor_time = None
         cursor_source_type = ""
         cursor_source_id = 0
@@ -1045,7 +1058,8 @@ class GenerationMonitoringService:
                 "e.cost, e.upstream_task_id, e.error, "
                 "e.task_updated_at AS completed_at, "
                 "NULL AS image_url FROM generation_task_events e "
-                "WHERE e.status = 'error' AND e.failure_reported_at IS NOT NULL"
+                "WHERE e.status = 'error' AND e.failure_reported_at IS NOT NULL "
+                "AND LOWER(COALESCE(e.error, '')) NOT LIKE :reference_limit_error_pattern"
                 f"{event_error_filters}"
             )
         union_sql = " UNION ALL ".join(sources)
@@ -1069,7 +1083,10 @@ class GenerationMonitoringService:
         if normalized_status == "success":
             cost_status_sql = "AND e.status = 'success' "
         elif normalized_status == "error":
-            cost_status_sql = "AND e.status = 'error' AND e.failure_reported_at IS NOT NULL "
+            cost_status_sql = (
+                "AND e.status = 'error' AND e.failure_reported_at IS NOT NULL "
+                "AND LOWER(COALESCE(e.error, '')) NOT LIKE :reference_limit_error_pattern "
+            )
         else:
             cost_status_sql = "AND e.status IN ('success', 'error') "
         session = self._session()

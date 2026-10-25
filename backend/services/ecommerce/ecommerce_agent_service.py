@@ -171,8 +171,8 @@ def stream_agent_run_events(
 
     cursor = max(0, int(after_sequence or 0))
     deadline = time.monotonic() + max(1.0, float(max_seconds))
-    is_persistent_cow_run = str(run.metadata.get("workflow") or "") == "cowagent_professional"
-    if is_persistent_cow_run:
+    is_persistent_run = str(run.metadata.get("workflow") or "") in {"cowagent_professional", "image_prompt_analysis"}
+    if is_persistent_run:
         from services.ecommerce.agent_queue_service import agent_queue_service
         from services.ecommerce.ecommerce_agent_memory_service import ecommerce_agent_memory_service
 

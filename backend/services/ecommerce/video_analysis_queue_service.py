@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 import socket
 import threading
@@ -83,6 +84,8 @@ class VideoAnalysisQueueFull(RuntimeError):
 
 class RedisVideoAnalysisQueue:
     GROUP_NAME = "professional-video-analysis-workers"
+    LATENCY_SAMPLE_LIMIT = 2000
+    LATENCY_RETENTION_SECS = 7 * 86400
 
     def __init__(self) -> None:
         self._client_instance = None
@@ -146,6 +149,41 @@ class RedisVideoAnalysisQueue:
 
     def _dead_letter_key(self) -> str:
         return f"{self.settings.queue_name}:dead"
+
+    def _latency_key(self) -> str:
+        return f"{self.settings.queue_name}:metrics:latency"
+
+    def record_execution_latency(self, duration_ms: int) -> None:
+        """Keep a bounded Redis sample for the queue-level P95 metric."""
+
+        duration = max(0, int(duration_ms or 0))
+        if duration <= 0:
+            return
+        try:
+            client = self._client()
+            pipe = client.pipeline(transaction=False)
+            pipe.lpush(self._latency_key(), duration)
+            pipe.ltrim(self._latency_key(), 0, self.LATENCY_SAMPLE_LIMIT - 1)
+            pipe.expire(self._latency_key(), self.LATENCY_RETENTION_SECS)
+            pipe.execute()
+        except Exception:
+            # Metrics must never make a completed queue job fail.
+            return
+
+    def _latency_snapshot(self, client) -> tuple[int, int]:
+        try:
+            values = [
+                float(value)
+                for value in client.lrange(self._latency_key(), 0, self.LATENCY_SAMPLE_LIMIT - 1)
+                if float(value) >= 0
+            ]
+        except Exception:
+            return 0, 0
+        if not values:
+            return 0, 0
+        values.sort()
+        index = min(len(values) - 1, max(0, math.ceil(len(values) * 0.95) - 1))
+        return round(values[index]), len(values)
 
     @staticmethod
     def _message_from_entry(message_id: object, fields: Mapping[str, Any]) -> VideoAnalysisQueueMessage:
@@ -453,6 +491,7 @@ class RedisVideoAnalysisQueue:
         pending = int(group.get("pending") or 0)
         lag_value = group.get("lag")
         lag = int(lag_value) if lag_value is not None else max(0, int(client.xlen(settings.queue_name) or 0) - pending)
+        p95_ms, latency_sample_size = self._latency_snapshot(client)
         return {
             "enabled": True,
             "queue": settings.queue_name,
@@ -466,6 +505,8 @@ class RedisVideoAnalysisQueue:
             "ownerPendingLimit": settings.owner_pending_limit,
             "scheduledRetries": int(client.zcard(self._retry_key()) or 0),
             "deadLetters": int(client.xlen(self._dead_letter_key()) or 0),
+            "p95_ms": p95_ms,
+            "latency_sample_size": latency_sample_size,
             "maxRetries": settings.max_retries,
         }
 

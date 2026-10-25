@@ -21,6 +21,7 @@ from services.video.video_generation_provider import run_video_generation, Video
 from services.video.video_generation_queue import RedisVideoGenerationQueue, VideoDelivery
 from services.video.video_generation_storage import video_generation_storage_service
 from services.video.video_generation_task_store import DatabaseVideoGenerationTaskStore, VideoGenerationTaskStore, encode_cursor
+from services.canvas.canvas_task_limiter import CanvasTaskReservation, canvas_task_limiter
 
 
 TASK_STATUS_QUEUED = "queued"
@@ -76,6 +77,21 @@ def _task_key(owner_id: str, task_id: str) -> str:
     return f"{owner_id}:{task_id}"
 
 
+VIDEO_URL_SUFFIXES = (".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv")
+
+
+def _looks_like_video_url(value: str) -> bool:
+    from urllib.parse import urlsplit
+
+    return urlsplit(value).path.lower().endswith(VIDEO_URL_SUFFIXES)
+
+
+def _looks_like_audio_url(value: str) -> bool:
+    from urllib.parse import urlsplit
+
+    return urlsplit(value).path.lower().endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"))
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     snapshot = task.get("identity") if isinstance(task.get("identity"), dict) else {}
     owner_id = _clean(task.get("owner_id") or snapshot.get("id"), "anonymous", 191)
@@ -117,11 +133,19 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "reconciliation_required",
         "storage_pending",
         "next_attempt_ts",
+        "source",
+        "canvas_units",
     ):
         if task.get(key) is not None and task.get(key) != "":
             item[key] = task.get(key)
     if isinstance(task.get("image_urls"), list):
         item["image_urls"] = task.get("image_urls")
+    if isinstance(task.get("reference_video_urls"), list):
+        item["reference_video_urls"] = task.get("reference_video_urls")
+    if isinstance(task.get("reference_audio_urls"), list):
+        item["reference_audio_urls"] = task.get("reference_audio_urls")
+    if isinstance(task.get("params"), dict) and task.get("params"):
+        item["params"] = task.get("params")
     if isinstance(task.get("data"), list):
         item["data"] = task.get("data")
     if task.get("cancel_requested"):
@@ -195,15 +219,19 @@ class VideoGenerationTaskService:
         client_task_id: str,
         prompt: str,
         model: str,
-        mode: str = "text_to_video",
+        mode: str | None = None,
         aspect_ratio: str = "16:9",
         duration_secs: int | str = 5,
         quality: str = "standard",
         resolution: str = "",
         image_urls: list[str] | None = None,
+        reference_video_urls: list[str] | None = None,
+        reference_audio_urls: list[str] | None = None,
         params: dict[str, Any] | None = None,
         conversation_id: str = "",
         turn_id: str = "",
+        source: str = "standard",
+        canvas_units: int = 1,
     ) -> dict[str, Any]:
         if not self.enabled_getter():
             raise ValueError("video generation is not enabled")
@@ -218,6 +246,9 @@ class VideoGenerationTaskService:
             raise ValueError("model is required")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
+        normalized_source = "canvas" if _clean(source).lower() == "canvas" else "standard"
+        normalized_canvas_units = max(1, int(canvas_units or 1))
+        reservation: CanvasTaskReservation | None = None
         with self._lock:
             existing = self.task_store.get_task(key)
             if existing is not None:
@@ -232,13 +263,37 @@ class VideoGenerationTaskService:
                 image_url = _clean(value, limit=2000)
                 if not image_url.startswith(("http://", "https://")):
                     raise ValueError("reference images must use http or https URLs")
-                normalized_image_urls.append(image_url)
-                seen_image_urls.add(image_url)
-            normalized_mode = _clean(mode, "image_to_video" if normalized_image_urls else "text_to_video", 40)
-            if normalized_mode not in {"text_to_video", "image_to_video"}:
-                normalized_mode = "image_to_video" if normalized_image_urls else "text_to_video"
-            if normalized_mode == "text_to_video" and normalized_image_urls:
-                raise ValueError("text-to-video does not support reference images")
+                if _looks_like_video_url(image_url):
+                    raise ValueError("video references must use reference_video_urls")
+                if image_url not in seen_image_urls:
+                    normalized_image_urls.append(image_url)
+                    seen_image_urls.add(image_url)
+            raw_video_urls = list(reference_video_urls or [])
+            if len(raw_video_urls) > 30:
+                raise ValueError("video generation supports at most 30 reference videos")
+            normalized_video_urls: list[str] = []
+            seen_video_urls: set[str] = set()
+            for value in raw_video_urls:
+                video_url = _clean(value, limit=2000)
+                if not video_url.startswith(("http://", "https://")):
+                    raise ValueError("reference videos must use http or https URLs")
+                if video_url not in seen_video_urls:
+                    normalized_video_urls.append(video_url)
+                    seen_video_urls.add(video_url)
+            raw_audio_urls = list(reference_audio_urls or [])
+            if len(raw_audio_urls) > 30:
+                raise ValueError("video generation supports at most 30 reference audios")
+            normalized_audio_urls: list[str] = []
+            seen_audio_urls: set[str] = set()
+            for value in raw_audio_urls:
+                audio_url = _clean(value, limit=2000)
+                if not audio_url.startswith(("http://", "https://")):
+                    raise ValueError("reference audios must use http or https URLs")
+                if _looks_like_video_url(audio_url):
+                    raise ValueError("audio references must use reference_audio_urls")
+                if audio_url not in seen_audio_urls:
+                    normalized_audio_urls.append(audio_url)
+                    seen_audio_urls.add(audio_url)
             provider_options = normalize_video_generation_options(
                 safe_model,
                 aspect_ratio=aspect_ratio,
@@ -247,17 +302,63 @@ class VideoGenerationTaskService:
                 resolution=resolution,
                 params=params,
             )
+            default_mode = (
+                "video_to_video" if normalized_video_urls
+                else "image_to_video" if normalized_image_urls
+                else "text_to_video"
+            )
+            normalized_mode = _clean(mode, default_mode, 40)
+            if normalized_mode not in {"text_to_video", "image_to_video", "video_to_video"}:
+                normalized_mode = default_mode
+            if normalized_mode == "text_to_video" and (normalized_image_urls or normalized_video_urls):
+                raise ValueError("text-to-video does not support reference media")
+            if normalized_mode == "image_to_video" and normalized_video_urls:
+                raise ValueError("video references require video-to-video mode")
+            if normalized_mode == "video_to_video" and not normalized_video_urls:
+                raise ValueError("video-to-video requires at least one reference video")
             if normalized_mode not in provider_options.get("modes", ("text_to_video", "image_to_video")):
                 raise ValueError(f"{safe_model} does not support mode: {normalized_mode}")
-            if normalized_mode == "image_to_video":
+            request_mode = _clean(provider_options.get("request_mode"), "", 80)
+            if request_mode == "shouweizhen" and (normalized_video_urls or normalized_audio_urls):
+                raise ValueError("首尾帧模式只支持图片首帧和尾帧，不支持参考视频或音频")
+            reference_mode = _clean(provider_options.get("reference_mode"), "", 80)
+            if reference_mode == "edit" and not normalized_video_urls:
+                raise ValueError("编辑视频模式需要至少一个参考视频")
+            if reference_mode == "extend":
+                if not normalized_video_urls:
+                    raise ValueError("延长视频模式需要至少一个参考视频")
+                if len(normalized_video_urls) > 3 or normalized_image_urls or normalized_audio_urls:
+                    raise ValueError("延长视频模式只支持 1 到 3 个参考视频")
+            video_input_kind = _clean(provider_options.get("video_input_kind"), "none", 40)
+            max_videos = int(provider_options.get("max_videos") or 0)
+            if normalized_video_urls and video_input_kind == "none":
+                raise ValueError(f"{provider_options.get('model_label', safe_model)} does not support reference videos")
+            if normalized_video_urls and max_videos and len(normalized_video_urls) > max_videos:
+                raise ValueError(
+                    f"{provider_options.get('model_label', safe_model)} supports at most {max_videos} reference video"
+                )
+            audio_input_kind = _clean(provider_options.get("audio_input_kind"), "none", 40)
+            max_audios = int(provider_options.get("max_audios") or 0)
+            if normalized_audio_urls and audio_input_kind == "none":
+                raise ValueError(f"{provider_options.get('model_label', safe_model)} does not support reference audio")
+            if normalized_audio_urls and max_audios and len(normalized_audio_urls) > max_audios:
+                raise ValueError(
+                    f"{provider_options.get('model_label', safe_model)} supports at most {max_audios} reference audios"
+                )
+            media_count = len(normalized_image_urls) + len(normalized_video_urls) + len(normalized_audio_urls)
+            if media_count < int(provider_options.get("min_media_inputs") or 0):
+                raise ValueError(f"{provider_options.get('model_label', safe_model)} requires at least one reference media")
+            if normalized_audio_urls and not normalized_image_urls and not normalized_video_urls and not provider_options.get("allow_audio_only"):
+                raise ValueError(f"{provider_options.get('model_label', safe_model)} requires an image or video reference")
+            if normalized_mode in {"image_to_video", "video_to_video"}:
                 image_count = len(normalized_image_urls)
-                min_images = int(provider_options.get("min_images") or 1)
+                min_images = int(provider_options.get("min_images") or (1 if normalized_mode == "image_to_video" else 0))
                 max_images = int(provider_options.get("max_images") or 30)
                 image_input_kind = _clean(provider_options.get("image_input_kind"), "reference", 40)
                 model_label = _clean(provider_options.get("model_label"), safe_model, 191)
-                if image_input_kind == "first_last_frame" and image_count < 1:
+                if normalized_mode == "image_to_video" and image_input_kind == "first_last_frame" and image_count < 1:
                     raise ValueError(f"{model_label} requires a first-frame image")
-                if image_input_kind == "first_last_frame" and image_count > 2:
+                if normalized_mode == "image_to_video" and image_input_kind == "first_last_frame" and image_count > 2:
                     raise ValueError(f"{model_label} supports at most a first frame and a last frame (2 images)")
                 if image_input_kind != "first_last_frame" and min_images == max_images and image_count != min_images:
                     noun = "image" if min_images == 1 else "images"
@@ -279,9 +380,13 @@ class VideoGenerationTaskService:
                 "quality": provider_options["quality"],
                 "resolution": provider_options.get("resolution", ""),
                 "image_urls": normalized_image_urls,
+                "reference_video_urls": normalized_video_urls,
+                "reference_audio_urls": normalized_audio_urls,
                 "params": provider_params,
                 "conversation_id": _clean(conversation_id, limit=191),
                 "turn_id": _clean(turn_id, limit=191),
+                "source": normalized_source,
+                "canvas_units": normalized_canvas_units,
                 "attempts": 0,
                 "max_retries": max(0, int(self.max_retries_getter())),
                 "progress": "queued",
@@ -290,9 +395,19 @@ class VideoGenerationTaskService:
                 "updated_at": now,
                 "created_ts": time.time(),
             }
-            task, created = self.task_store.create_task(key, task, pending_limit=max(1, int(self.owner_pending_limit_getter())))
-            if not created:
-                return _public_task(task)
+            if normalized_source == "canvas":
+                reservation = canvas_task_limiter.reserve(owner, units=normalized_canvas_units)
+                task["canvas_reservation_token"] = reservation.token
+            try:
+                task, created = self.task_store.create_task(key, task, pending_limit=max(1, int(self.owner_pending_limit_getter())))
+                if not created:
+                    if reservation:
+                        canvas_task_limiter.release(reservation)
+                    return _public_task(task)
+            except Exception:
+                if reservation:
+                    canvas_task_limiter.release(reservation)
+                raise
         if self.task_queue is not None and not self.run_inline:
             self._enqueue(key)
         else:
@@ -372,6 +487,50 @@ class VideoGenerationTaskService:
             "next_cursor": encode_cursor(raw_items[page_limit - 1]) if has_more else None,
         }
 
+    def register_result_for_analysis(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        *,
+        conversation_id: str = "",
+        base_url: str = "",
+    ) -> dict[str, object]:
+        """Expose a completed result to the existing FFmpeg/vision pipeline."""
+        owner = _owner_id(identity)
+        normalized_task_id = _clean(task_id, limit=191)
+        if not normalized_task_id:
+            raise ValueError("task_id is required")
+        task = self.task_store.get_task(_task_key(owner, normalized_task_id))
+        if task is None:
+            raise ValueError("video task not found")
+        if task.get("status") != TASK_STATUS_SUCCESS:
+            raise ValueError("video task is not completed")
+
+        source_url = _clean(task.get("video_url"), limit=2000)
+        if task.get("storage") in {"local", "oss"}:
+            source_url = video_generation_storage_service.resolve_result_url(task, base_url=base_url)
+        if not source_url:
+            raise ValueError("video task has no result URL")
+
+        from services.ecommerce.professional_video_service import professional_video_asset_service
+
+        asset = professional_video_asset_service.register_generated_video(
+            owner_id=owner,
+            conversation_id=_clean(conversation_id or task.get("conversation_id"), limit=191),
+            source_task_id=normalized_task_id,
+            url=source_url,
+        )
+        try:
+            queued = professional_video_asset_service.request_analysis(
+                str(asset.get("videoId") or ""),
+                owner_id=owner,
+            )
+        except Exception:
+            # The asset remains persisted as failed/pending and can be retried
+            # through the same endpoint used by uploaded videos.
+            raise
+        return queued or asset
+
     def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
         owner = _owner_id(identity)
         normalized_task_id = _clean(task_id, limit=191)
@@ -381,6 +540,7 @@ class VideoGenerationTaskService:
         updated = self.task_store.request_cancel(key)
         if updated is None:
             raise ValueError("task not found")
+        self._release_canvas_reservation(updated)
         if self.task_queue is not None:
             try:
                 self.task_queue.notify_task_update(key)
@@ -394,6 +554,7 @@ class VideoGenerationTaskService:
         if not normalized_task_id:
             raise ValueError("task_id is required")
         key = _task_key(owner, normalized_task_id)
+        reservation: CanvasTaskReservation | None = None
         with self._lock:
             task = self.task_store.get_task(key)
             if task is None:
@@ -402,25 +563,40 @@ class VideoGenerationTaskService:
                 return _public_task(task)
             if not _clean(task.get("upstream_task_id"), limit=191):
                 raise ValueError("upstream task id is unknown; automatic reconciliation is unavailable")
-            updated = self.task_store.update_task(
-                key,
-                {
-                    "status": TASK_STATUS_QUEUED,
-                    "execution_token": "",
-                    "progress": "reconciliation_queued",
-                    "reconciliation_required": False,
-                    "cancellation_pending": bool(task.get("cancel_requested")),
-                    "poll_started_ts": time.time(),
-                    "next_attempt_ts": time.time(),
-                    "attempts": 0,
-                    "error": "",
-                    "updated_at": _now_iso(),
-                    "updated_ts": time.time(),
-                },
-            )
+            if _clean(task.get("source")).lower() == "canvas":
+                reservation = canvas_task_limiter.reserve(owner, units=max(1, int(task.get("canvas_units") or 1)))
+            try:
+                updated = self.task_store.update_task(
+                    key,
+                    {
+                        "status": TASK_STATUS_QUEUED,
+                        "execution_token": "",
+                        "progress": "reconciliation_queued",
+                        "reconciliation_required": False,
+                        "cancellation_pending": bool(task.get("cancel_requested")),
+                        "poll_started_ts": time.time(),
+                        "next_attempt_ts": time.time(),
+                        "attempts": 0,
+                        "error": "",
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                        "canvas_reservation_token": reservation.token if reservation else "",
+                    },
+                )
+            except Exception:
+                if reservation:
+                    canvas_task_limiter.release(reservation)
+                raise
             if updated is None:
+                if reservation:
+                    canvas_task_limiter.release(reservation)
                 raise ValueError("task could not be queued for reconciliation")
-        self._enqueue(key)
+        try:
+            self._enqueue(key)
+        except Exception:
+            if reservation:
+                canvas_task_limiter.release(reservation)
+            raise
         return _public_task(updated)
 
     def delete_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
@@ -709,6 +885,8 @@ class VideoGenerationTaskService:
             "model": task.get("model"),
             "mode": task.get("mode"),
             "image_urls": task.get("image_urls") if isinstance(task.get("image_urls"), list) else [],
+            "reference_video_urls": task.get("reference_video_urls") if isinstance(task.get("reference_video_urls"), list) else [],
+            "reference_audio_urls": task.get("reference_audio_urls") if isinstance(task.get("reference_audio_urls"), list) else [],
             "params": task.get("params") if isinstance(task.get("params"), dict) else {},
             "progress_callback": progress_callback,
             "submission_callback": submission_callback,
@@ -850,6 +1028,18 @@ class VideoGenerationTaskService:
                     release_slot(slot_token)
                 except Exception:
                     LOGGER.exception("Video capacity release failed; lease will expire")
+            self._release_canvas_reservation(self.task_store.get_task(key))
+
+    @staticmethod
+    def _release_canvas_reservation(task: dict[str, Any] | None) -> None:
+        if not isinstance(task, dict) or task.get("status") not in TERMINAL_STATUSES:
+            return
+        token = _clean(task.get("canvas_reservation_token"))
+        if token:
+            canvas_task_limiter.release(
+                owner_id=_clean(task.get("owner_id"), "anonymous", 191),
+                token=token,
+            )
 
     def _update_unless_canceled(self, key: str, **updates: Any) -> bool:
         updates["updated_at"] = _now_iso()

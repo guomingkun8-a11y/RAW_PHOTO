@@ -102,6 +102,28 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
             finally:
                 service.engine.dispose()
 
+    def test_reference_limit_reports_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = GenerationMonitoringService(f"sqlite:///{Path(tmp_dir) / 'monitoring.db'}")
+            try:
+                result = service.report_frontend_failure(
+                    identity={"id": "user-1"},
+                    task_id="task-reference-limit-1",
+                    error="generation supports at most 14 reference images",
+                    image_count=1,
+                    mode="edit",
+                    model="gpt-image-2.5-sunburst",
+                )
+                self.assertEqual(result, {"ok": True, "ignored": True, "reason": "validation"})
+                with service.engine.begin() as connection:
+                    count = connection.execute(
+                        text("SELECT COUNT(*) FROM generation_task_events WHERE task_id = :task_id"),
+                        {"task_id": "task-reference-limit-1"},
+                    ).scalar_one()
+                self.assertEqual(count, 0)
+            finally:
+                service.engine.dispose()
+
     def test_late_cancellation_report_clears_previous_failure(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = GenerationMonitoringService(f"sqlite:///{Path(tmp_dir) / 'monitoring.db'}")
@@ -327,6 +349,14 @@ class GenerationMonitoringServiceTests(unittest.TestCase):
                     image_count=2,
                     mode="generate",
                     model="gpt-image-2",
+                )
+                service.report_frontend_failure(
+                    identity={"id": "user-1"},
+                    task_id="task-reference-limit-1",
+                    error="generation supports at most 14 reference images",
+                    image_count=3,
+                    mode="edit",
+                    model="gpt-image-2.5-sunburst",
                 )
 
                 summary = service.summary(

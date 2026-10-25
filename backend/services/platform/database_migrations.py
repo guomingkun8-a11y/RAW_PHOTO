@@ -14,6 +14,9 @@ from sqlalchemy.exc import OperationalError
 from services.billing.upstream_usage_models import BillingBase
 from services.platform.enterprise_schema import EnterpriseBase
 from services.image.image_task_store import Base as ImageTaskBase
+from services.alerts.incident_store import AlertBase
+from services.feedback.store import FeedbackBase
+from services.platform.navigation_settings import NavigationBase
 
 MIGRATION_TABLE = "schema_migrations"
 MIGRATION_LOCK_NAME = "gmkraw_schema_migrations"
@@ -1379,6 +1382,19 @@ def _apply_professional_agent_operational_indexes(engine: Engine) -> None:
                     pass
 
 
+def _apply_feedback_alerts_navigation(engine: Engine) -> None:
+    AlertBase.metadata.create_all(engine)
+    FeedbackBase.metadata.create_all(engine)
+    NavigationBase.metadata.create_all(engine)
+    with engine.begin() as connection:
+        columns = _column_names(connection, "operational_alert_webhooks")
+        if "receive_alerts" not in columns:
+            connection.execute(text("ALTER TABLE operational_alert_webhooks ADD COLUMN receive_alerts INTEGER NOT NULL DEFAULT 0"))
+            connection.execute(text("UPDATE operational_alert_webhooks SET receive_alerts = 1"))
+        if "receive_feedback" not in columns:
+            connection.execute(text("ALTER TABLE operational_alert_webhooks ADD COLUMN receive_feedback INTEGER NOT NULL DEFAULT 0"))
+
+
 MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("001_base_schema", _apply_base_schema),
     ("002_image_task_batch_columns", _apply_image_task_columns),
@@ -1421,6 +1437,7 @@ MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("041_upstream_usage_chat_attribution", _apply_upstream_usage_chat_attribution),
     ("042_audio_generation_tasks", _apply_audio_generation_schema),
     ("043_canvas_workflows_production", _apply_canvas_workflow_schema),
+    ("044_feedback_alerts_navigation", _apply_feedback_alerts_navigation),
 )
 
 

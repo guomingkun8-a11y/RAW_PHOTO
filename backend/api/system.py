@@ -404,7 +404,8 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"创建公告：{item.get('title')}",
         )
-        realtime_event_service.publish("announcement", item)
+        if item["enabled"]:
+            realtime_event_service.publish("announcement", item)
         return item
 
     @router.patch("/api/system/announcements/{announcement_id}")
@@ -424,7 +425,7 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"更新公告：{item.get('title')}",
         )
-        realtime_event_service.publish("announcement", item)
+        realtime_event_service.publish("announcement", item if item["enabled"] else {"id": item["id"], "enabled": False})
         return item
 
     @router.delete("/api/system/announcements/{announcement_id}")
@@ -440,7 +441,7 @@ def create_router(app_version: str) -> APIRouter:
             item.get("id"),
             f"停用公告：{item.get('title')}",
         )
-        realtime_event_service.publish("announcement", item)
+        realtime_event_service.publish("announcement", {"id": item["id"], "enabled": False})
         return item
 
     @router.get("/images/{image_path:path}", include_in_schema=False)

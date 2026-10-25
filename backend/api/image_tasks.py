@@ -390,10 +390,18 @@ def create_router() -> APIRouter:
     async def cancel_image_task(
         task_id: str,
         authorization: str | None = Header(default=None),
+        dry_run: bool = Query(default=False),
+        confirm_upstream: bool = Query(default=False),
     ):
         identity = require_identity(authorization)
         try:
-            return await run_in_threadpool(image_task_service.cancel_task, identity, task_id)
+            return await run_in_threadpool(
+                image_task_service.cancel_task,
+                identity,
+                task_id,
+                dry_run=dry_run,
+                confirm_upstream=confirm_upstream,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 

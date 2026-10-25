@@ -212,6 +212,8 @@ def create_router() -> APIRouter:
                 max_tokens=1600,
                 temperature=0.4,
                 operation="canvas_assistant",
+                billing_owner_id=identity.get("id"),
+                billing_local_source="canvas_assistant",
             )
         except Exception as exc:
             failed = True
@@ -264,6 +266,8 @@ def create_router() -> APIRouter:
                 max_tokens=3200,
                 temperature=0.5,
                 operation="canvas_storyboard",
+                billing_owner_id=identity.get("id"),
+                billing_local_source="canvas_storyboard",
             )
             result = details.get("result") if isinstance(details.get("result"), dict) else {}
             scenes = _normalize_scenes(result.get("scenes") or result.get("scripts"), body.sceneCount)

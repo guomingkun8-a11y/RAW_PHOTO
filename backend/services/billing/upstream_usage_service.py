@@ -10,7 +10,8 @@ from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Callable
 
 from curl_cffi import requests
-from sqlalchemy import and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import and_, case, create_engine, func, inspect, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from services.accounts.user_service import user_service
@@ -23,6 +24,7 @@ from utils.log import logger
 
 PROVIDER = "lk888"
 DEFAULT_USAGE_URL = "https://api.lk888.ai/v1/skills/usage"
+DEFAULT_TASK_STATUS_URL = "https://api.lk888.ai/v1/skills/task-status"
 MONEY_QUANTUM = Decimal("0.000000000001")
 MODEL_TYPES = {"image", "video", "chat", "audio"}
 SUCCESS_STATES = {"success", "succeeded", "completed", "complete"}
@@ -256,6 +258,148 @@ class UpstreamUsageService:
             result = _public_sync_state(None, settings, configured)
             result.update({"status": "unavailable", "last_error": f"费用账本不可用: {str(exc)[:200]}"})
             return result
+
+    def capture_chat_call(
+        self,
+        *,
+        task_id: str,
+        model: str,
+        owner_id: str,
+        source: str,
+        local_task_id: str = "",
+        api_key: str,
+    ) -> None:
+        upstream_id = _clean(task_id, limit=255)
+        owner = _clean(owner_id)
+        if not upstream_id or not owner or not api_key:
+            return
+        now = datetime.now()
+
+        def store() -> None:
+            with self.Session.begin() as session:
+                row = session.scalars(select(UpstreamUsageRecord).where(
+                    UpstreamUsageRecord.provider == PROVIDER,
+                    UpstreamUsageRecord.upstream_task_id == upstream_id,
+                ).with_for_update()).one_or_none()
+                if row is None:
+                    row = UpstreamUsageRecord(
+                        provider=PROVIDER,
+                        upstream_task_id=upstream_id,
+                        model=_clean(model, "unknown"),
+                        model_type="chat",
+                        state="pending",
+                        event_at=now,
+                        first_seen_at=now,
+                    )
+                    session.add(row)
+                if row.owner_id and row.owner_id != owner:
+                    logger.error({"event": "chat_usage_owner_conflict", "task_id": upstream_id})
+                    return
+                row.owner_id = owner
+                row.local_source = _clean(source, "chat", 32)
+                row.local_task_id = _clean(local_task_id)
+                row.requested_model = _clean(model)
+                row.sync_key_fingerprint = _fingerprint(api_key)
+                row.updated_at = now
+
+        try:
+            store()
+        except IntegrityError:
+            store()
+
+    def reconcile_chat_usage(self, *, limit: int = 30) -> int:
+        credentials = {_fingerprint(key): key for key in self._credential_loader()}
+        if not credentials:
+            return 0
+        now = datetime.now()
+        with self.Session.begin() as session:
+            session.execute(update(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.provider == PROVIDER,
+                UpstreamUsageRecord.model_type == "chat",
+                UpstreamUsageRecord.state.in_(("pending", "settling")),
+                UpstreamUsageRecord.first_seen_at < now - timedelta(days=1),
+            ).values(state="unresolved", updated_at=now))
+            candidates = session.execute(select(
+                UpstreamUsageRecord.upstream_task_id,
+                UpstreamUsageRecord.sync_key_fingerprint,
+            ).where(
+                UpstreamUsageRecord.provider == PROVIDER,
+                UpstreamUsageRecord.model_type == "chat",
+                or_(
+                    and_(UpstreamUsageRecord.state == "pending", UpstreamUsageRecord.updated_at <= now - timedelta(seconds=2)),
+                    and_(UpstreamUsageRecord.state == "settling", UpstreamUsageRecord.updated_at <= now - timedelta(minutes=2)),
+                ),
+            ).order_by(UpstreamUsageRecord.first_seen_at).limit(max(1, min(100, limit)))).all()
+        settled = 0
+        for task_id, fingerprint in candidates:
+            api_key = credentials.get(fingerprint)
+            if not api_key:
+                continue
+            claimed_at = datetime.now()
+            with self.Session.begin() as session:
+                claimed = session.execute(update(UpstreamUsageRecord).where(
+                    UpstreamUsageRecord.provider == PROVIDER,
+                    UpstreamUsageRecord.upstream_task_id == task_id,
+                    or_(
+                        and_(UpstreamUsageRecord.state == "pending", UpstreamUsageRecord.updated_at <= claimed_at - timedelta(seconds=2)),
+                        and_(UpstreamUsageRecord.state == "settling", UpstreamUsageRecord.updated_at <= claimed_at - timedelta(minutes=2)),
+                    ),
+                ).values(state="settling", updated_at=claimed_at)).rowcount
+            if claimed != 1:
+                continue
+            try:
+                response = self._http_get(
+                    DEFAULT_TASK_STATUS_URL,
+                    params={"task_id": task_id},
+                    headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+                    timeout=self._settings_factory().timeout_secs,
+                    **proxy_settings.build_session_kwargs(),
+                )
+                if not 200 <= int(response.status_code) < 300:
+                    raise UpstreamUsageError(f"task-status returned HTTP {response.status_code}")
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise UpstreamUsageError("task-status returned invalid JSON")
+                if not _bool(payload.get("is_final")):
+                    with self.Session.begin() as session:
+                        session.execute(update(UpstreamUsageRecord).where(
+                            UpstreamUsageRecord.provider == PROVIDER,
+                            UpstreamUsageRecord.upstream_task_id == task_id,
+                            UpstreamUsageRecord.state == "settling",
+                        ).values(state="pending", updated_at=datetime.now()))
+                    continue
+                if "cost" not in payload:
+                    raise UpstreamUsageError("final task-status has no cost")
+                try:
+                    cost_value = Decimal(str(payload["cost"]))
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise UpstreamUsageError("final task-status has invalid cost") from exc
+                if not cost_value.is_finite() or cost_value < 0 or isinstance(payload["cost"], bool):
+                    raise UpstreamUsageError("final task-status has invalid cost")
+                with self.Session.begin() as session:
+                    row = session.scalars(select(UpstreamUsageRecord).where(
+                        UpstreamUsageRecord.provider == PROVIDER,
+                        UpstreamUsageRecord.upstream_task_id == task_id,
+                        UpstreamUsageRecord.state == "settling",
+                    ).with_for_update()).one_or_none()
+                    if row is not None:
+                        row.model = _clean(payload.get("model"), row.model)
+                        row.state = _clean(payload.get("state") or payload.get("status"), "unknown", 32).lower()
+                        row.cost = _money(cost_value)
+                        row.unit = _clean(payload.get("unit"), limit=32) or row.unit or "算力"
+                        row.channel_group = _clean(payload.get("channel_group"), row.channel_group)
+                        if "refunded" in payload:
+                            row.refunded = _bool(payload["refunded"])
+                        if "refunded_amount" in payload:
+                            row.refunded_amount = _money(payload["refunded_amount"])
+                        row.upstream_created_at = _parse_datetime(payload.get("created_at")) or row.upstream_created_at
+                        row.upstream_completed_at = _parse_datetime(payload.get("completed_at")) or datetime.now()
+                        row.event_at = row.upstream_completed_at
+                        row.updated_at = datetime.now()
+                        settled += 1
+            except Exception as exc:
+                logger.warning({"event": "chat_usage_settlement_failed", "task_id": task_id, "error": str(exc)[:200]})
+        return settled
 
     def _acquire_lease(self, lease_owner: str, settings: UpstreamUsageSettings) -> bool:
         now = datetime.now()
@@ -543,12 +687,15 @@ class UpstreamUsageService:
                 association = associations.get((model_type, upstream_id))
                 if association:
                     owner_id, local_task_id, requested_model, local_model_version = association
-                    row.owner_id = owner_id or row.owner_id
-                    row.local_task_id = local_task_id
+                    if row.owner_id and owner_id and row.owner_id != owner_id:
+                        logger.error({"event": "chat_usage_owner_conflict", "task_id": upstream_id})
+                    else:
+                        row.owner_id = owner_id or row.owner_id
+                    row.local_task_id = row.local_task_id or local_task_id
                     if requested_model:
                         row.requested_model = requested_model
                     row.model_version = local_model_version or row.model_version
-                    row.local_source = model_type
+                    row.local_source = row.local_source or model_type
                 row.updated_at = now
         return len(normalized)
 
@@ -652,6 +799,7 @@ class UpstreamUsageService:
         record = UpstreamUsageRecord
         success_case = case((record.state.in_(SUCCESS_STATES), 1), else_=0)
         failed_case = case((record.state.in_(FAILED_STATES), 1), else_=0)
+        unsettled_case = case((record.state.in_(("pending", "settling", "unresolved")), 1), else_=0)
         refunded_case = case((record.refunded.is_(True), 1), else_=0)
         with self.Session() as session:
             totals = session.execute(
@@ -663,6 +811,7 @@ class UpstreamUsageService:
                     func.coalesce(func.sum(refunded_case), 0),
                     func.coalesce(func.sum(record.refunded_amount), 0),
                     func.coalesce(func.sum(case((record.owner_id.is_(None), 1), else_=0)), 0),
+                    func.coalesce(func.sum(unsettled_case), 0),
                 ).where(*filters)
             ).one()
             model_rows = session.execute(
@@ -748,6 +897,7 @@ class UpstreamUsageService:
             "refunded_amount": _number(totals[5]),
             "assigned_count": record_count - unassigned_count,
             "unassigned_count": unassigned_count,
+            "unsettled_count": int(totals[7] or 0),
             "models": model_items,
             "users": user_items,
             "range": {
@@ -865,25 +1015,26 @@ upstream_usage_service = UpstreamUsageService()
 
 
 def _scheduler_worker(stop_event: threading.Event, service: UpstreamUsageService) -> None:
-    settings = service._settings_factory()
-    if not settings.enabled:
-        return
+    next_sync_at = datetime.min
     while not stop_event.is_set():
         try:
-            status = service.status()
-            last_full_sync = _parse_datetime(status.get("last_full_sync_at"))
-            full_sync = last_full_sync is None or datetime.now() - last_full_sync >= timedelta(hours=24)
-            days = settings.full_lookback_days if full_sync else settings.lookback_days
-            service.sync_usage(days=days, full_sync=full_sync)
+            service.reconcile_chat_usage()
+        except Exception as exc:
+            logger.warning({"event": "chat_usage_reconcile_failed", "error": _clean(exc, limit=300)})
+        settings = service._settings_factory()
+        try:
+            if settings.enabled and datetime.now() >= next_sync_at:
+                next_sync_at = datetime.now() + timedelta(seconds=settings.interval_secs)
+                status = service.status()
+                last_full_sync = _parse_datetime(status.get("last_full_sync_at"))
+                full_sync = last_full_sync is None or datetime.now() - last_full_sync >= timedelta(hours=24)
+                days = settings.full_lookback_days if full_sync else settings.lookback_days
+                service.sync_usage(days=days, full_sync=full_sync)
         except UpstreamUsageSyncInProgress:
             pass
         except Exception as exc:
             logger.info({"event": "upstream_usage_sync_failed", "error": _clean(exc, limit=500)})
-        if stop_event.wait(settings.interval_secs):
-            break
-        settings = service._settings_factory()
-        if not settings.enabled:
-            break
+        stop_event.wait(10)
 
 
 def start_upstream_usage_scheduler(

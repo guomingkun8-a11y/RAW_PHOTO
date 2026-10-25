@@ -548,6 +548,44 @@ test("sidebar generation history opens the history panel", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "生成历史记录" })).toBeVisible();
 });
 
+test("image timeout uses a clear pending message without retry", async ({ page }) => {
+  await mockAppApi(page, {
+    imageConversations: [{
+      id: "timeout-conversation",
+      title: "超时任务",
+      createdAt: "2026-10-16T00:00:00Z",
+      updatedAt: "2026-10-16T00:00:00Z",
+      turns: [{
+        id: "timeout-turn",
+        prompt: "生成商品图",
+        model: "banana-2",
+        mode: "generate",
+        count: 2,
+        size: "1024x1024",
+        status: "error",
+        error: "其中 2 张未成功生成",
+        images: [
+          { id: "timeout-image", taskId: "timeout-task", status: "error", error: "504: {'error': 'media generation timed out: 处理中'}" },
+          { id: "failed-image", taskId: "failed-task", status: "error", error: "上游拒绝请求" },
+        ],
+      }],
+    }],
+  });
+
+  await loginThroughUi(page);
+  await page.getByRole("link", { name: /生成记录/ }).click();
+  await page.getByRole("button", { name: /超时任务/ }).click();
+  await expect(page.getByText("有失败和待确认")).toBeVisible();
+  await expect(page.getByText("1 张生成失败，1 张结果待确认")).toBeVisible();
+  const cards = page.getByTestId("generated-image-card");
+  await expect(cards.first().getByText("等待超时，可能仍在生成。请联系管理员核查，暂勿重试。")).toBeVisible();
+  await expect(cards.first().getByRole("button", { name: "重试" })).toHaveCount(0);
+  await expect(cards.nth(1).getByText("上游拒绝请求")).toBeVisible();
+  await expect(cards.nth(1).getByRole("button", { name: "重试" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "重新生成" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "忽略失败" })).toHaveCount(0);
+});
+
 test("registration creates a user session and enters the workspace", async ({ page }) => {
   await mockAppApi(page);
 
@@ -600,6 +638,43 @@ test("image generation and folder batch generation render completed results", as
   expect(state.imageConversations).toHaveLength(1);
   expect((state.imageConversations[0] as { turns?: unknown[] }).turns).toHaveLength(2);
 });
+
+for (const mode of ["standard", "agent"]) {
+  test(`${mode} blocks more than 14 references before submitting`, async ({ page }, testInfo) => {
+    const state = await mockAppApi(page);
+    await loginThroughUi(page);
+    if (mode === "agent") await page.getByRole("button", { name: "智能体", exact: true }).click();
+
+    await page.getByTestId("reference-file-input").setInputFiles(Array.from({ length: 15 }, (_, index) => ({
+      name: `reference-${index}.png`,
+      mimeType: "image/png",
+      buffer: Buffer.from(fakePngBase64, "base64"),
+    })));
+    await expect(page.locator("[data-reference-thumb]")).toHaveCount(15);
+    const prompt = page.getByTestId("image-prompt-input");
+    await prompt.fill("Product photo");
+    await page.getByTestId("generate-submit-button").click();
+    await expect(page.getByText("单次生图最多支持 14 张参考图，请移除多余图片后再提交", { exact: true })).toBeVisible();
+    expect(state.editTaskRequests).toHaveLength(0);
+    expect(state.generationTaskRequests).toHaveLength(0);
+    expect(state.imageAgentRequests).toHaveLength(0);
+    expect(state.imageConversations).toHaveLength(0);
+    await expect(prompt).toHaveValue("Product photo");
+    await expect(page.locator("[data-reference-thumb]")).toHaveCount(15);
+    await page.screenshot({ path: testInfo.outputPath("reference-limit.png"), fullPage: true });
+
+    await page.getByRole("button", { name: "移除参考图", exact: true }).last().click();
+    await expect(page.locator("[data-reference-thumb]")).toHaveCount(14);
+    await prompt.press("Enter");
+    if (mode === "agent") {
+      await expect.poll(() => state.imageAgentRequests.length).toBe(1);
+      expect(state.imageAgentRequests[0].images).toHaveLength(14);
+    } else {
+      await expect.poll(() => state.editTaskRequests.length).toBe(1);
+      expect(state.editTaskRequests[0].match(/filename="reference-\d+\.png"/g)).toHaveLength(14);
+    }
+  });
+}
 
 async function expectWorkspaceWithinViewport(page: Page) {
   await expect.poll(() => page.locator(

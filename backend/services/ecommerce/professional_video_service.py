@@ -405,11 +405,13 @@ class ProfessionalVideoAssetService:
         owner_id: str,
         conversation_id: str,
         videos: list[tuple[bytes, str, str]],
+        max_items: int = VIDEO_MAX_ITEMS,
     ) -> list[ProfessionalVideoUploadResult]:
         if not videos:
             return []
-        if len(videos) > VIDEO_MAX_ITEMS:
-            raise ProfessionalVideoUploadError(f"video count must be between 1 and {VIDEO_MAX_ITEMS}")
+        allowed_items = max(1, int(max_items or VIDEO_MAX_ITEMS))
+        if len(videos) > allowed_items:
+            raise ProfessionalVideoUploadError(f"video count must be between 1 and {allowed_items}")
         total = sum(len(payload) for payload, _filename, _mime_type in videos)
         if total > VIDEO_MAX_TOTAL_BYTES:
             raise ProfessionalVideoUploadError("video batch exceeds the 600MB total size limit")
@@ -423,6 +425,63 @@ class ProfessionalVideoAssetService:
             )
             for payload, filename, mime_type in videos
         ]
+
+    def register_generated_video(
+        self,
+        *,
+        owner_id: str,
+        conversation_id: str,
+        source_task_id: str,
+        url: str,
+    ) -> dict[str, object]:
+        """Register a generated result so it can use the normal analysis queue.
+
+        The task id is used as a stable synthetic digest. This makes retries
+        idempotent without adding another table or migration for a one-to-one
+        relationship that already exists in the video task record.
+        """
+        owner = _owner_id(owner_id)
+        task_id = _clean(source_task_id, limit=191)
+        source_url = _clean(url, limit=2000)
+        parsed = urlparse(source_url)
+        if not task_id:
+            raise ProfessionalVideoUploadError("generated video task id is required")
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ProfessionalVideoUploadError("generated video URL is invalid")
+
+        digest = hashlib.sha256(f"generated:{owner}:{task_id}".encode("utf-8")).hexdigest()
+        existing = self._existing_by_digest(owner_id=owner, digest=digest)
+        if existing is not None:
+            return existing.to_public()
+
+        session = self._session()
+        try:
+            row = ProfessionalVideoAssetModel(
+                video_id=f"video-generated-{uuid4().hex}",
+                owner_id=owner,
+                conversation_id=_clean(conversation_id, limit=191),
+                filename=_safe_filename(f"generated-{task_id}.mp4"),
+                mime_type="video/mp4",
+                size=0,
+                sha256=digest,
+                storage_provider="remote",
+                bucket="",
+                object_key="",
+                url=source_url,
+                status="uploaded",
+                analysis_status="pending",
+            )
+            session.add(row)
+            session.commit()
+            return self._row_to_public(row)
+        except Exception:
+            session.rollback()
+            existing_after_race = self._existing_by_digest(owner_id=owner, digest=digest)
+            if existing_after_race is not None:
+                return existing_after_race.to_public()
+            raise
+        finally:
+            session.close()
 
     def get_video(self, video_id: str, *, owner_id: str, include_internal: bool = False) -> dict[str, Any] | None:
         owner = _owner_id(owner_id)

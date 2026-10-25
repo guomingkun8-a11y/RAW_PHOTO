@@ -38,10 +38,12 @@ from services.ecommerce.professional_knowledge_service import (
     knowledge_context_for_model,
 )
 from services.ecommerce.prompt_analysis_service import (
+    analyze_image_prompt,
     is_reasoning_chat_model,
     prompt_analysis_model,
     upstream_chat_model,
 )
+from services.billing.chat_usage import capture_chat_response, chat_usage_scope
 from services.billing.chat_usage_attribution import record_chat_attribution
 from services.image.image_task_service import image_task_service
 from services.image.image_storage_service import image_storage_service
@@ -52,6 +54,7 @@ from services.platform.proxy_service import proxy_settings
 from services.platform.runtime_requirements import enterprise_mode_enabled
 from services.providers.openai_relay_pool import current_relay_account, run_with_relay_pool
 from services.image.image_size import normalize_image_size
+from services.image.reference_limits import MAX_GENERATION_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -59,6 +62,9 @@ VENDOR_ROOT = PROJECT_ROOT / "backend" / "vendor" / "cowagent"
 DATA_ROOT = PROJECT_ROOT / "data" / "cow_agent_users"
 COW_RUNTIME_ROOT = PROJECT_ROOT / "data" / "cowagent_runtime"
 COW_AGENT_NAME = "cowagent-professional"
+PROMPT_ANALYSIS_AGENT_NAME = "image-prompt-analysis"
+PROMPT_ANALYSIS_WORKFLOW = "image_prompt_analysis"
+PERSISTENT_AGENT_WORKFLOWS = {"cowagent_professional", PROMPT_ANALYSIS_WORKFLOW}
 MAX_AGENT_STEPS = 8
 WEB_RESEARCH_AGENT_STEPS = 16
 DEFAULT_AGENT_CONTEXT_TOKENS = 24000
@@ -1129,6 +1135,7 @@ def _open_sse_chunks(payload: dict[str, Any], base_url: str, api_key: str):
         stream=True,
         **proxy_settings.build_session_kwargs(),
     )
+    capture_chat_response(response, model=payload.get("model"), api_key=api_key)
     if response.status_code < 200 or response.status_code >= 300:
         raise _response_error(response)
 
@@ -1369,7 +1376,8 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
             base_url, api_key = _active_relay()
             return _open_sse_chunks(payload, base_url, api_key)
 
-        chunks = run_with_relay_pool(_relay_settings(), "cowagent_dialogue", request_once)
+        with chat_usage_scope(self._billing_owner_id, "cowagent_dialogue"):
+            chunks = run_with_relay_pool(_relay_settings(), "cowagent_dialogue", request_once)
         attribution: dict[str, object] = {}
         try:
             for chunk in chunks:
@@ -1426,6 +1434,7 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
                 timeout=180,
                 **proxy_settings.build_session_kwargs(),
             )
+            capture_chat_response(response, model=payload.get("model"), api_key=api_key)
             if response.status_code < 200 or response.status_code >= 300:
                 raise _response_error(response)
             body = response.json()
@@ -1456,7 +1465,8 @@ class RawCowLLMModel(LLMModel, OpenAICompatibleBot):
             )
             return clean_content
 
-        return run_with_relay_pool(_relay_settings(), "cowagent_vision", request_once)
+        with chat_usage_scope(self._billing_owner_id, "cowagent_vision"):
+            return run_with_relay_pool(_relay_settings(), "cowagent_vision", request_once)
 
 
 class ScopedTool(BaseTool):
@@ -1957,7 +1967,7 @@ class CowAgentRunRuntime:
 
     def _reference_context(self) -> list[dict[str, str]]:
         items: list[dict[str, str]] = []
-        for index, path in enumerate(self.attachments[:4], start=1):
+        for index, path in enumerate(self.attachments[:MAX_REFERENCE_IMAGES], start=1):
             role = self._reference_role(
                 self.attachment_roles[index - 1] if index - 1 < len(self.attachment_roles) else "",
                 path.name,
@@ -1970,7 +1980,8 @@ class CowAgentRunRuntime:
                 "path": _workspace_relative(path, self.workspace),
             })
         offset = len(items)
-        for index, url in enumerate(self.attachment_urls[:4], start=1):
+        remaining = max(0, MAX_REFERENCE_IMAGES - len(items))
+        for index, url in enumerate(self.attachment_urls[:remaining], start=1):
             name = self.attachment_url_names[index - 1] if index - 1 < len(self.attachment_url_names) else ""
             role = self._reference_role(
                 self.attachment_url_roles[index - 1] if index - 1 < len(self.attachment_url_roles) else "",
@@ -1983,7 +1994,7 @@ class CowAgentRunRuntime:
                 "name": name,
                 "url": url,
             })
-        return items[:4]
+        return items[:MAX_REFERENCE_IMAGES]
 
     def _reference_context_lines(self) -> list[str]:
         lines: list[str] = []
@@ -2213,13 +2224,13 @@ class CowAgentRunRuntime:
             })
 
     def _apply_prompt_reference_role_hints(self) -> None:
-        total = min(4, len(self.attachments) + len(self.attachment_urls))
+        total = min(MAX_REFERENCE_IMAGES, len(self.attachments) + len(self.attachment_urls))
         hints = _reference_role_hints_from_prompt(self.user_message, total)
         if not any(hints):
             return
         applied: list[dict[str, str]] = []
         cursor = 0
-        for index, path in enumerate(self.attachments[:4]):
+        for index, path in enumerate(self.attachments[:MAX_REFERENCE_IMAGES]):
             hinted_role = hints[cursor] if cursor < len(hints) else None
             current_role = self._reference_role(
                 self.attachment_roles[index] if index < len(self.attachment_roles) else "",
@@ -2229,7 +2240,7 @@ class CowAgentRunRuntime:
                 self.attachment_roles[index] = hinted_role
                 applied.append({"index": str(cursor + 1), "role": hinted_role, "name": path.name})
             cursor += 1
-        for index, url in enumerate(self.attachment_urls[: max(0, 4 - len(self.attachments))]):
+        for index, url in enumerate(self.attachment_urls[: max(0, MAX_REFERENCE_IMAGES - len(self.attachments))]):
             hinted_role = hints[cursor] if cursor < len(hints) else None
             name = self.attachment_url_names[index] if index < len(self.attachment_url_names) else url
             current_role = self._reference_role(
@@ -2344,15 +2355,15 @@ class CowAgentRunRuntime:
             working = [item for item in entries if item["role"] == "working_canvas"]
             anchors = [item for item in entries if item["role"] in PRODUCT_IDENTITY_REFERENCE_ROLES]
             new_references = [item for item in entries if item["role"] in DESIGN_REFERENCE_ROLES]
-            selected = (working[-1:] + anchors[:2] + new_references)[:4]
+            selected = (working[-1:] + anchors[:2] + new_references)[:MAX_GENERATION_REFERENCE_IMAGES]
         elif policy == "original_upload":
             anchors = [item for item in entries if item["role"] in PRODUCT_IDENTITY_REFERENCE_ROLES]
             new_references = [item for item in entries if item["role"] in DESIGN_REFERENCE_ROLES]
-            selected = (anchors + new_references)[:4]
+            selected = (anchors + new_references)[:MAX_GENERATION_REFERENCE_IMAGES]
             if not selected:
-                selected = [item for item in entries if item["role"] in CURRENT_UPLOAD_REFERENCE_ROLES][:4]
+                selected = [item for item in entries if item["role"] in CURRENT_UPLOAD_REFERENCE_ROLES][:MAX_GENERATION_REFERENCE_IMAGES]
         elif policy == "new_upload":
-            selected = [item for item in entries if item["role"] in NEW_UPLOAD_REFERENCE_ROLES][-4:]
+            selected = [item for item in entries if item["role"] in NEW_UPLOAD_REFERENCE_ROLES][-MAX_GENERATION_REFERENCE_IMAGES:]
 
         def submission_priority(item: Mapping[str, Any]) -> tuple[int, int]:
             role = _clean(item.get("role"), "reference", 80)
@@ -2655,13 +2666,13 @@ class CowAgentRunRuntime:
     def _save_reference_snapshot(self, *, source_turn_id: str) -> None:
         paths = [
             path.relative_to(self.workspace).as_posix()
-            for path in self.attachments[:4]
+            for path in self.attachments[:MAX_REFERENCE_IMAGES]
             if path.is_file()
         ]
-        urls = list(dict.fromkeys(self.attachment_urls))[:4]
+        urls = list(dict.fromkeys(self.attachment_urls))[:max(0, MAX_REFERENCE_IMAGES - len(paths))]
         path_roles = [
             self._reference_role(self.attachment_roles[index] if index < len(self.attachment_roles) else "", path.name)
-            for index, path in enumerate(self.attachments[:4])
+            for index, path in enumerate(self.attachments[:MAX_REFERENCE_IMAGES])
             if path.is_file()
         ]
         url_roles = [
@@ -2697,7 +2708,7 @@ class CowAgentRunRuntime:
             snapshot_path_roles = snapshot.get("pathRoles") if isinstance(snapshot.get("pathRoles"), list) else []
             snapshot_url_roles = snapshot.get("urlRoles") if isinstance(snapshot.get("urlRoles"), list) else []
             snapshot_url_names = snapshot.get("urlNames") if isinstance(snapshot.get("urlNames"), list) else []
-            for index, value in enumerate(snapshot_paths[:4]):
+            for index, value in enumerate(snapshot_paths[:MAX_REFERENCE_IMAGES]):
                 raw_path = _clean(value, limit=1000)
                 if not raw_path:
                     continue
@@ -2709,15 +2720,15 @@ class CowAgentRunRuntime:
                 if candidate.is_file():
                     self.attachments.append(candidate)
                     self.attachment_roles.append(self._reference_role(snapshot_path_roles[index] if index < len(snapshot_path_roles) else "", candidate.name))
-            if not self.attachments:
-                for index, value in enumerate(snapshot_urls[:4]):
-                    url = _clean(value, limit=2000)
-                    if not url:
-                        continue
-                    self.attachment_urls.append(url)
-                    name = _clean(snapshot_url_names[index] if index < len(snapshot_url_names) else "", limit=240)
-                    self.attachment_url_names.append(name)
-                    self.attachment_url_roles.append(self._reference_role(snapshot_url_roles[index] if index < len(snapshot_url_roles) else "", name or url))
+            remaining = max(0, MAX_REFERENCE_IMAGES - len(self.attachments))
+            for index, value in enumerate(snapshot_urls[:remaining]):
+                url = _clean(value, limit=2000)
+                if not url:
+                    continue
+                self.attachment_urls.append(url)
+                name = _clean(snapshot_url_names[index] if index < len(snapshot_url_names) else "", limit=240)
+                self.attachment_url_names.append(name)
+                self.attachment_url_roles.append(self._reference_role(snapshot_url_roles[index] if index < len(snapshot_url_roles) else "", name or url))
 
         if not self.attachments and not self.attachment_urls:
             conversation_root = self.workspace / "attachments" / _safe_segment(self.conversation_id, "conversation")
@@ -2731,7 +2742,7 @@ class CowAgentRunRuntime:
                     reverse=True,
                 )
                 for turn_path in previous_turns:
-                    files = sorted(path for path in turn_path.iterdir() if path.is_file())[:4]
+                    files = sorted(path for path in turn_path.iterdir() if path.is_file())[:MAX_REFERENCE_IMAGES]
                     if files:
                         self.attachments.extend(files)
                         self.attachment_roles.extend(["product_anchor" for _ in files])
@@ -2746,7 +2757,7 @@ class CowAgentRunRuntime:
         target = self.workspace / "attachments" / _safe_segment(self.conversation_id, "conversation") / _safe_segment(self.turn_id, "turn")
         target.mkdir(parents=True, exist_ok=True)
         total = 0
-        for index, item in enumerate(list(self.run.request.get("images") or [])[:4], start=1):
+        for index, item in enumerate(list(self.run.request.get("images") or [])[:MAX_REFERENCE_IMAGES], start=1):
             if not isinstance(item, Mapping):
                 continue
             role = self._reference_role(item.get("role"), item.get("name"))
@@ -2755,6 +2766,7 @@ class CowAgentRunRuntime:
                 self.attachment_urls.append(url)
                 self.attachment_url_names.append(_clean(item.get("name"), f"url-reference-{index}", 240))
                 self.attachment_url_roles.append(role)
+                continue
             data_url = _clean(item.get("data_url") or item.get("dataUrl"), limit=MAX_ATTACHMENT_BYTES * 2)
             if not data_url.startswith("data:image/") or ";base64," not in data_url:
                 continue
@@ -4587,8 +4599,8 @@ class CowAgentRunRuntime:
     def _reference_files(self, requested: object) -> list[Path]:
         values = requested if isinstance(requested, list) else []
         if not values:
-            return list(self.attachments)
-        return [self.resolve_attachment(_clean(value)) for value in values[:4]]
+            return list(self.attachments[:MAX_GENERATION_REFERENCE_IMAGES])
+        return [self.resolve_attachment(_clean(value)) for value in values[:MAX_GENERATION_REFERENCE_IMAGES]]
 
     def generate_images(self, params: dict[str, Any], *, progress, cancelled) -> dict[str, Any]:
         params = dict(params or {})
@@ -4672,7 +4684,7 @@ class CowAgentRunRuntime:
             ]
         pages = pages[:NORMAL_AGENT_IMAGE_COUNT_MAX]
         references = self._reference_files(params.get("reference_images"))
-        urls = list(self.attachment_urls)
+        urls = list(dict.fromkeys(self.attachment_urls))[:max(0, MAX_GENERATION_REFERENCE_IMAGES - len(references))]
         mode = _clean(params.get("mode"), _clean(self.run.request.get("mode"), "generate", 20), 20)
         if references or urls:
             mode = "edit"
@@ -4684,11 +4696,6 @@ class CowAgentRunRuntime:
             (path.read_bytes(), path.name, mimetypes.guess_type(path.name)[0] or "image/png")
             for path in references
         ]
-        if urls:
-            files.extend(
-                _download_attachment_url(url, index)
-                for index, url in enumerate(urls[: max(0, 4 - len(files))], start=1)
-            )
         tasks: list[tuple[dict[str, Any], dict[str, Any], int]] = []
         for index, page in enumerate(pages):
             if cancelled():
@@ -5221,6 +5228,13 @@ def _persist_run_state(run: AgentRun, *, status: str) -> None:
     )
 
 
+def _persist_queued_run_state(run: AgentRun, *, status: str) -> None:
+    if _clean(run.metadata.get("workflow")) == PROMPT_ANALYSIS_WORKFLOW:
+        ecommerce_agent_memory_service.save_run_state(_run_state_payload(run))
+        return
+    _persist_run_state(run, status=status)
+
+
 def _run_from_persistent_state(state: Mapping[str, Any]) -> AgentRun:
     status_text = _clean(state.get("status"), "failed", 40)
     status = {
@@ -5236,7 +5250,8 @@ def _run_from_persistent_state(state: Mapping[str, Any]) -> AgentRun:
     metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
     result = state.get("result") if isinstance(state.get("result"), Mapping) else {}
     request = dict(state.get("request") or {})
-    request["size"] = _safe_requested_size(request.get("size"))
+    if "size" in request:
+        request["size"] = _safe_requested_size(request.get("size"))
     event_rows = ecommerce_agent_memory_service.load_run_events(_clean(state.get("runId"), limit=191))
     events = [
         AgentEvent(
@@ -5271,6 +5286,9 @@ def execute_queued_cow_agent_run(run_id: str, owner_id: str) -> AgentRun | None:
     state = ecommerce_agent_memory_service.load_run_state(run_id, owner_id=owner_id)
     if state is None:
         return None
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
+    if _clean(metadata.get("workflow")) == PROMPT_ANALYSIS_WORKFLOW:
+        return _execute_queued_prompt_analysis_run(state, owner_id)
     run = _run_from_persistent_state(state)
     if run.status in TERMINAL_RUN_STATUSES:
         agent_run_store.save(run)
@@ -5315,6 +5333,73 @@ def execute_queued_cow_agent_run(run_id: str, owner_id: str) -> AgentRun | None:
     return run
 
 
+def _retryable_prompt_analysis_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPException):
+        return int(exc.status_code or 500) in {408, 425, 429, 500, 502, 503, 504, 529}
+    text = _clean(exc, limit=2000).lower()
+    return any(marker in text for marker in (
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "tls",
+        "ssl",
+        "curl: (28)",
+        "curl: (35)",
+        "curl: (56)",
+        "curl (28)",
+        "curl (35)",
+        "curl (56)",
+    ))
+
+
+def _execute_queued_prompt_analysis_run(state: Mapping[str, Any], owner_id: str) -> AgentRun:
+    run = _run_from_persistent_state(state)
+    if run.status in TERMINAL_RUN_STATUSES:
+        agent_run_store.save(run)
+        return run
+    if _is_cancel_requested(run):
+        _persist_queued_run_state(run, status="canceled")
+        return run
+
+    started = time.perf_counter()
+    run.status = AgentRunStatus.RUNNING
+    run.finished_at = None
+    run.error = ""
+    run.metadata["ownerId"] = owner_id
+    agent_run_store.save(run)
+    _persist_queued_run_state(run, status="running")
+    _append_run_event(run, "run.started", {"engine": "prompt_analysis"})
+    _append_run_event(run, "agent.update", {"phase": "analysis", "summary": "正在分析参考图。"})
+    try:
+        result = analyze_image_prompt(dict(run.request))
+    except Exception as exc:
+        if _retryable_prompt_analysis_error(exc):
+            run.status = AgentRunStatus.PENDING
+            run.error = ""
+            _append_run_event(run, "run.retrying", {"message": "上游连接波动，任务将自动重试。"})
+            _persist_queued_run_state(run, status="pending")
+            raise
+        run.status = AgentRunStatus.FAILED
+        run.error = _clean(exc, "reference image analysis failed", 1000)
+        run.finished_at = _utc_now()
+        run.duration_ms = int((time.perf_counter() - started) * 1000)
+        _append_run_event(run, "run.failed", {"error": run.error})
+        _persist_queued_run_state(run, status="failed")
+        return run
+
+    run.status = AgentRunStatus.COMPLETED
+    run.raw_result = result
+    run.result = sanitize_public_data(result)
+    run.finished_at = _utc_now()
+    run.duration_ms = int((time.perf_counter() - started) * 1000)
+    run.tool_calls = 1
+    _append_run_event(run, "run.completed", {"summary": "参考图分析已完成。"})
+    _persist_queued_run_state(run, status="completed")
+    return run
+
+
 def fail_queued_cow_agent_run(run_id: str, owner_id: str, error: str) -> AgentRun | None:
     """Persist a worker-level terminal failure before the queue item enters the DLQ."""
 
@@ -5330,8 +5415,55 @@ def fail_queued_cow_agent_run(run_id: str, owner_id: str, error: str) -> AgentRu
     run.finished_at = _utc_now()
     agent_run_store.save(run)
     _append_run_event(run, "run.failed", {"error": run.error, "source": "agent_worker"})
-    _persist_run_state(run, status="failed")
+    _persist_queued_run_state(run, status="failed")
     return run
+
+
+def start_prompt_analysis_run(
+    body: Mapping[str, Any],
+    *,
+    identity: Mapping[str, object] | None,
+) -> dict[str, Any]:
+    owner_id = _owner_id(identity)
+    run_id = f"analysis-{uuid4().hex}"
+    request = dict(body)
+    request.setdefault("billing_owner_id", owner_id)
+    request.setdefault("billing_local_source", "image_prompt")
+    request.setdefault("billing_local_task_id", run_id)
+    run = AgentRun(
+        run_id=run_id,
+        agent_name=PROMPT_ANALYSIS_AGENT_NAME,
+        status=AgentRunStatus.PENDING,
+        request=request,
+        metadata={
+            "ownerId": owner_id,
+            "workflow": PROMPT_ANALYSIS_WORKFLOW,
+            "conversationId": "",
+            "turnId": run_id,
+            "engine": "prompt_analysis",
+        },
+        max_steps=1,
+    )
+    agent_run_store.save(run)
+    ecommerce_agent_memory_service.ensure_ready()
+    agent_queue_service.ensure_ready()
+    agent_queue_service.reserve_pending(run_id=run_id, owner_id=owner_id)
+    state_created = False
+    try:
+        ecommerce_agent_memory_service.save_run_state(_run_state_payload(run))
+        state_created = True
+        _append_run_event(run, "run.queued", {"engine": "prompt_analysis"})
+        agent_queue_service.enqueue(run_id=run_id, owner_id=owner_id)
+    except Exception as exc:
+        if state_created:
+            run.status = AgentRunStatus.FAILED
+            run.error = _clean(exc, "failed to enqueue reference image analysis", 1000)
+            run.finished_at = _utc_now()
+            _append_run_event(run, "run.failed", {"error": run.error})
+            _persist_queued_run_state(run, status="failed")
+        agent_queue_service.release_pending(run_id=run_id, owner_id=owner_id)
+        raise
+    return {"agentRun": run.to_public_dict(include_events=True)}
 
 
 def start_cow_agent_run(
@@ -5346,7 +5478,7 @@ def start_cow_agent_run(
     if turn_id == conversation_id:
         turn_id = f"turn-{uuid4().hex}"
     prompt = _clean(body.get("prompt"), limit=8000)
-    images = list(body.get("images") or [])[:4]
+    images = list(body.get("images") or [])[:MAX_REFERENCE_IMAGES]
     videos = list(body.get("videos") or [])[:4]
     folder_id = _clean(body.get("folder_id") or body.get("folderId"), limit=191)
     if not prompt and not images and not videos and not folder_id:
@@ -5443,7 +5575,7 @@ def resume_cow_agent_run(
     if _clean(state.get("status")) != "waiting_for_input":
         raise ValueError("agent run is not waiting for input")
 
-    clean_images = [dict(item) for item in list(images or []) if isinstance(item, Mapping)][:4]
+    clean_images = [dict(item) for item in list(images or []) if isinstance(item, Mapping)][:MAX_REFERENCE_IMAGES]
     clean_videos = [dict(item) for item in list(videos or []) if isinstance(item, Mapping)][:4]
     next_folder_id = _clean(folder_id, limit=191) or _clean(
         (state.get("request") or {}).get("folder_id") if isinstance(state.get("request"), Mapping) else "",
@@ -5474,7 +5606,7 @@ def restore_cow_agent_run(run_id: str, identity: Mapping[str, object] | None) ->
     state = ecommerce_agent_memory_service.load_run_state(run_id, owner_id=owner_id)
     if state is not None:
         metadata = state.get("metadata") if isinstance(state.get("metadata"), Mapping) else {}
-        if _clean(metadata.get("workflow")) != "cowagent_professional":
+        if _clean(metadata.get("workflow")) not in PERSISTENT_AGENT_WORKFLOWS:
             return None
         run = _run_from_persistent_state(state)
         agent_run_store.save(run)
@@ -5530,7 +5662,7 @@ def get_cow_agent_result(run_id: str, identity: Mapping[str, object] | None) -> 
     owner_id = _clean(run.metadata.get("ownerId"), "anonymous")
     if owner_id != _owner_id(identity):
         raise PermissionError("agent run does not belong to this user")
-    if _clean(run.metadata.get("workflow")) != "cowagent_professional":
+    if _clean(run.metadata.get("workflow")) not in PERSISTENT_AGENT_WORKFLOWS:
         return None
     if run.status not in {AgentRunStatus.WAITING, AgentRunStatus.COMPLETED} or not isinstance(run.raw_result, Mapping):
         return None
@@ -5538,12 +5670,12 @@ def get_cow_agent_result(run_id: str, identity: Mapping[str, object] | None) -> 
 
 
 def persist_cow_agent_cancellation(run: AgentRun) -> None:
-    if _clean(run.metadata.get("workflow")) == "cowagent_professional":
+    if _clean(run.metadata.get("workflow")) in PERSISTENT_AGENT_WORKFLOWS:
         try:
             agent_queue_service.request_cancel(run.run_id)
         except Exception:
             pass
-        _persist_run_state(run, status="canceled")
+        _persist_queued_run_state(run, status="canceled")
 
 
 def cancel_cow_agent_run(run_id: str, identity: Mapping[str, object] | None) -> AgentRun | None:
@@ -5552,13 +5684,14 @@ def cancel_cow_agent_run(run_id: str, identity: Mapping[str, object] | None) -> 
     if current is None:
         return None
     metadata = current.get("metadata") if isinstance(current.get("metadata"), Mapping) else {}
-    if _clean(metadata.get("workflow")) != "cowagent_professional":
+    workflow = _clean(metadata.get("workflow"))
+    if workflow not in PERSISTENT_AGENT_WORKFLOWS:
         return None
     if _clean(current.get("status")) in {"completed", "failed", "canceled"}:
         run = _run_from_persistent_state(current)
         agent_run_store.save(run)
         return run
-    waiting_for_images = _clean(current.get("status")) == "waiting_for_images"
+    waiting_for_images = workflow == "cowagent_professional" and _clean(current.get("status")) == "waiting_for_images"
     pending_context = metadata.get("pendingImageGeneration")
     if not isinstance(pending_context, Mapping):
         pending_context = metadata.get("pendingFolderBatch")
@@ -5587,7 +5720,7 @@ def cancel_cow_agent_run(run_id: str, identity: Mapping[str, object] | None) -> 
     run.finished_at = run.finished_at or _utc_now()
     if not any(event.event_type == "run.canceled" for event in run.events):
         _append_run_event(run, "run.canceled", {"message": run.error})
-    _persist_run_state(run, status="canceled")
+    _persist_queued_run_state(run, status="canceled")
     if waiting_for_images:
         try:
             agent_queue_service.enqueue_image_continuation(

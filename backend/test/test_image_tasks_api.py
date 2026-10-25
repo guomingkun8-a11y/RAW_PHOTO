@@ -62,8 +62,9 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
-    def cancel_task(self, identity, task_id):
+    def cancel_task(self, identity, task_id, **options):
         self.cancel_calls.append((identity, task_id))
+        self.cancel_options = options
         return {
             "id": task_id,
             "status": "canceled",
@@ -325,6 +326,15 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["id"], "task-1")
         self.assertEqual(payload["status"], "canceled")
         self.assertEqual(len(self.fake_service.cancel_calls), 1)
+
+    def test_cancel_image_task_passes_confirmation_options(self):
+        response = self.client.post(
+            "/api/image-tasks/task-1/cancel?dry_run=true&confirm_upstream=true",
+            headers=AUTH_HEADERS,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.cancel_options, {"dry_run": True, "confirm_upstream": True})
 
 
 if __name__ == "__main__":

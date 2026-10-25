@@ -7,7 +7,7 @@ const MINIMAP_COLLAPSED_STORAGE_KEY = 'gmkraw-canvas-minimap-collapsed';
 
 export interface CanvasMinimapNode {
   id: string;
-  type: 'text' | 'image' | 'video';
+  type: 'text' | 'image' | 'video' | 'audio';
   x: number;
   y: number;
   width: number;
@@ -96,6 +96,7 @@ function draw() {
   const styles = getComputedStyle(element);
   const imageColor = styles.getPropertyValue('--minimap-image').trim() || '#5b7ff5';
   const videoColor = styles.getPropertyValue('--minimap-video').trim() || '#299b7e';
+  const audioColor = styles.getPropertyValue('--minimap-audio').trim() || '#c58a35';
   const textColor = styles.getPropertyValue('--minimap-text').trim() || '#8791a2';
   const nodeStrokeColor = styles.getPropertyValue('--minimap-node-stroke').trim() || 'rgba(30, 41, 59, 0.16)';
   const accentColor = styles.getPropertyValue('--accent').trim() || '#4f7cff';
@@ -122,7 +123,9 @@ function draw() {
       ? imageColor
       : node.type === 'video'
         ? videoColor
-        : textColor;
+        : node.type === 'audio'
+          ? audioColor
+          : textColor;
     context.globalAlpha = selectedNode ? 1 : 0.78;
     roundedRect(x, y, nodeWidth, nodeHeight, 2.5);
     context.fill();

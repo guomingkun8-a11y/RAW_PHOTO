@@ -57,6 +57,7 @@ class RelaySubmittedHTTPException(HTTPException):
         upstream_task_ids: list[str] | None = None,
         submission_uncertain: bool = True,
         upstream_finished: bool = False,
+        refunded: bool = False,
         reconciliation: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(status_code=status_code, detail=detail, headers=headers)
@@ -67,6 +68,7 @@ class RelaySubmittedHTTPException(HTTPException):
         ]
         self.submission_uncertain = bool(submission_uncertain)
         self.upstream_finished = bool(upstream_finished)
+        self.refunded = bool(refunded)
         self.reconciliation = dict(reconciliation or {})
 
 
@@ -342,6 +344,11 @@ def _relay_cooldown_secs(relay_settings: Mapping[str, object], exc: Exception | 
     if status in {429, 503, 529}:
         return default
     detail_text = _relay_error_text(exc)
+    if status in {408, 504} and any(
+        marker in detail_text
+        for marker in ("timeout", "timed out", "curl (28)", "upstream_timeout")
+    ):
+        return max(5, min(default, 30))
     if status in {408, 409, 425, 500, 502, 504} and any(
         marker in detail_text
         for marker in ("rate limit", "rate-limited", "too many requests", "queue", "busy", "limit", "overloaded", "排队", "限流", "繁忙")
@@ -364,7 +371,17 @@ def _should_retry_with_next_key(exc: HTTPException) -> bool:
     status = int(getattr(exc, "status_code", 500) or 500)
     if status in {401, 403, 429, 503, 529}:
         return True
-    if status in {408, 409, 425, 500, 502, 504}:
+    if status in {408, 504}:
+        detail_text = _relay_error_text(exc)
+        return any(
+            marker in detail_text
+            for marker in (
+                "timeout", "timed out", "curl (28)", "upstream_timeout",
+                "rate limit", "rate-limited", "too many requests", "queue", "busy", "limit",
+                "overloaded", "排队", "限流", "繁忙",
+            )
+        )
+    if status in {409, 425, 500, 502}:
         detail_text = _relay_error_text(exc)
         return any(
             marker in detail_text
@@ -441,6 +458,7 @@ def run_with_relay_pool(relay_settings: Mapping[str, object], operation: str, ac
             _CURRENT_RELAY_ACCOUNT.reset(token)
             if _should_retry_with_next_key(exc):
                 excluded_account_ids.add(lease.account.id)
+                time.sleep(min(2 ** min(_attempt, 3), 8) + (0.05 * (_attempt + 1)))
                 continue
             raise
         except Exception:

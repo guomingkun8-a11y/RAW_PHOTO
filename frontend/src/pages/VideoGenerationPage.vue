@@ -16,6 +16,7 @@ import {
   Link2,
   LoaderCircle,
   MessageSquarePlus,
+  Music2,
   RefreshCw,
   Sparkles,
   Trash2,
@@ -36,7 +37,7 @@ import {
   createVideoAgentPlan,
   createVideoGenerationTask,
   fetchAgentVideoStatuses,
-  fetchSettingsConfig,
+  fetchVideoGenerationModels,
   fetchVideoAgentPlans,
   fetchVideoGenerationTasks,
   preuploadImageReferences,
@@ -45,13 +46,16 @@ import {
   retryAgentVideoAnalysis,
   streamVideoAgentPlan,
   uploadAgentVideos,
+  uploadVideoReferenceAudios,
+  uploadVideoReferenceVideos,
   type AgentVideoAsset,
   type ReferenceUploadItem,
-  type SettingsConfig,
+  type VideoGenerationPublicConfig,
   type VideoAgentAttachment,
   type VideoAgentPlan,
   type VideoGenerationDuration,
   type VideoGenerationTask,
+  type VideoReferenceAudioAsset,
 } from "@/lib/api";
 import { storageKey } from "@/lib/storage-namespace";
 import {
@@ -62,11 +66,12 @@ import {
   normalizeVideoModelSpecs,
   videoFrameRole,
   videoModelOptionLabel,
+  videoModelOptionsForSecondary,
   videoModelUsesFirstLastFrames,
 } from "@/lib/video-models";
 import { sessionState } from "@/stores/session";
 
-type VideoComposerMode = "text_to_video" | "image_to_video" | "agent";
+type VideoComposerMode = "text_to_video" | "image_to_video" | "video_to_video" | "agent";
 type VideoWorkspace = "generation" | "agent";
 type AgentFeedbackStatusId = "starting" | "thinking" | "completed" | "failed" | "canceled";
 type AgentFeedbackStatus = {
@@ -76,7 +81,7 @@ type AgentFeedbackStatus = {
 };
 type ReferencePreviewItem = {
   id: string;
-  kind: "upload";
+  kind: "image" | "video" | "audio";
   url: string;
   label: string;
   meta: string;
@@ -115,12 +120,16 @@ const aspectRatio = ref("16:9");
 const durationSecs = ref<VideoGenerationDuration>(5);
 const quality = ref("");
 const uploadedReferences = ref<ReferenceUploadItem[]>([]);
+const uploadedReferenceVideos = ref<AgentVideoAsset[]>([]);
+const uploadedReferenceAudios = ref<VideoReferenceAudioAsset[]>([]);
 const agentVideos = ref<AgentVideoAsset[]>([]);
 const referenceInput = ref<HTMLInputElement | null>(null);
 const videoInput = ref<HTMLInputElement | null>(null);
+const referenceVideoInput = ref<HTMLInputElement | null>(null);
+const referenceAudioInput = ref<HTMLInputElement | null>(null);
 const textarea = ref<HTMLTextAreaElement | null>(null);
 const resultsViewport = ref<HTMLDivElement | null>(null);
-const settingsConfig = ref<SettingsConfig | null>(null);
+const settingsConfig = ref<{ video_generation?: VideoGenerationPublicConfig } | null>(null);
 const tasks = ref<VideoGenerationTask[]>([]);
 const agentPlans = ref<VideoAgentPlan[]>([]);
 const optimisticAgentPlans = ref<VideoAgentPlan[]>([]);
@@ -131,6 +140,11 @@ const refreshing = ref(false);
 const submitting = ref(false);
 const uploadingReferences = ref(false);
 const uploadingVideos = ref(false);
+const uploadingReferenceVideos = ref(false);
+const uploadingReferenceAudios = ref(false);
+const requestMode = ref("");
+const referenceMode = ref("");
+const videoVersion = ref("");
 const retryingVideoIds = ref<Set<string>>(new Set());
 const cancelingIds = ref<Set<string>>(new Set());
 const reconcilingIds = ref<Set<string>>(new Set());
@@ -187,6 +201,13 @@ const modeTitlePool: Record<VideoComposerMode, string[]> = {
     "把参考图做成投放短片。",
     "补充背景、动作和镜头轨迹。",
   ],
+  video_to_video: [
+    "上传参考视频，描述要保留或改变的动作。",
+    "用参考视频控制节奏、运镜和动作。",
+    "描述视频参考素材要如何被重新演绎。",
+    "让商品跟随参考视频的动作完成新镜头。",
+    "指定参考视频中的动作和镜头变化。",
+  ],
   agent: [
     "你好，有什么可以帮你？",
     "今天想聊些什么？",
@@ -196,6 +217,7 @@ const modeTitlePool: Record<VideoComposerMode, string[]> = {
 const modeTitleCursor: Record<VideoComposerMode, number> = {
   text_to_video: Math.floor(Math.random() * modeTitlePool.text_to_video.length),
   image_to_video: Math.floor(Math.random() * modeTitlePool.image_to_video.length),
+  video_to_video: Math.floor(Math.random() * modeTitlePool.video_to_video.length),
   agent: Math.floor(Math.random() * modeTitlePool.agent.length),
 };
 
@@ -208,6 +230,7 @@ let idleTitleTimers: number[] = [];
 const baseVideoModeOptions = [
   { value: "text_to_video", label: "文生", icon: Video },
   { value: "image_to_video", label: "图生", icon: ImagePlus },
+  { value: "video_to_video", label: "视频参考", icon: Film },
 ];
 
 const currentUserName = computed(() => sessionState.session?.name || sessionState.session?.username || "用户");
@@ -219,44 +242,72 @@ const configProblem = computed(() => {
   const settings = videoSettings.value;
   if (!settings) return "";
   if (!settings.enabled) return "视频生成未启用";
-  if (!String(settings.base_url || "").trim()) return "未配置视频生成接口";
-  if (!settings.has_api_key && !Number(settings.api_key_count || 0)) return "未配置视频生成密钥";
+  const configured = settings.configured ?? Boolean(
+    String(settings.base_url || "").trim()
+    && (settings.has_api_key || Number(settings.api_key_count || 0) > 0),
+  );
+  if (!configured) return "视频生成接口或密钥未配置";
   return "";
 });
 const uploadedReferenceUrls = computed(() => uploadedReferences.value.map((item) => item.url).filter(Boolean));
-const canUseReferenceImages = computed(() => mode.value === "image_to_video");
+const uploadedReferenceVideoUrls = computed(() => uploadedReferenceVideos.value.map((item) => item.url).filter(Boolean));
+const uploadedReferenceAudioUrls = computed(() => uploadedReferenceAudios.value.map((item) => item.url).filter(Boolean));
+const canUseReferenceImages = computed(() => mode.value === "image_to_video" || mode.value === "video_to_video");
 const canUploadAgentImages = computed(() => mode.value === "agent");
 const canUploadImages = computed(() => canUseReferenceImages.value || canUploadAgentImages.value);
 const canUploadAgentVideos = computed(() => mode.value === "agent");
-const canDropMedia = computed(() => canUploadImages.value || canUploadAgentVideos.value);
+const canUploadReferenceVideos = computed(() => mode.value === "video_to_video"
+  && Number(selectedVideoModelSpec.value?.max_videos || 0) > 0);
+const canUploadReferenceAudios = computed(() => mode.value === "video_to_video"
+  && Number(selectedVideoModelSpec.value?.max_audios || 0) > 0);
+const canDropMedia = computed(() => canUploadImages.value || canUploadAgentVideos.value || canUploadReferenceVideos.value || canUploadReferenceAudios.value);
 const imageUrls = computed(() => canUseReferenceImages.value ? Array.from(new Set(uploadedReferenceUrls.value)) : []);
 const agentImageUrls = computed(() => canUploadAgentImages.value ? Array.from(new Set(uploadedReferenceUrls.value)) : []);
 const composerImageUrls = computed(() => canUploadAgentImages.value ? agentImageUrls.value : imageUrls.value);
 const referenceItems = computed<ReferencePreviewItem[]>(() => {
-  if (!canUploadImages.value) return [];
-  const spec = mode.value === "image_to_video" ? selectedVideoModelSpec.value : null;
-  return uploadedReferences.value
+  if (!canUploadImages.value && !canUploadReferenceVideos.value && !canUploadReferenceAudios.value) return [];
+  const spec = mode.value === "image_to_video" || mode.value === "video_to_video" ? selectedVideoModelSpec.value : null;
+  const images = uploadedReferences.value
     .filter((item) => item.url)
     .map((item, index) => {
       const role = videoFrameRole(spec, index);
       const filename = item.filename || "参考图";
       return {
         id: `upload-${item.sha256 || item.url}`,
-        kind: "upload" as const,
+        kind: "image" as const,
         url: item.url,
         label: role ? `${role} · ${filename}` : filename,
         meta: fileSize(item.file_size) || "已上传",
         role,
       };
     });
+  if (mode.value === "agent") return images;
+  const videos = uploadedReferenceVideos.value.map((item) => ({
+    id: `reference-video-${item.videoId || item.url}`,
+    kind: "video" as const,
+    url: item.url,
+    label: item.name || item.filename || "参考视频",
+    meta: fileSize(item.size || item.fileSize) || "已上传",
+    role: "",
+  }));
+  const audios = uploadedReferenceAudios.value.map((item) => ({
+    id: `reference-audio-${item.id || item.url}`,
+    kind: "audio" as const,
+    url: item.url,
+    label: item.title || "参考音频",
+    meta: item.duration ? `${item.duration.toFixed(1)}s` : fileSize(item.size) || "已上传",
+    role: "",
+  }));
+  return [...images, ...videos, ...audios];
 });
 const agentVideoItems = computed<AgentVideoPreviewItem[]>(() => agentVideos.value.map((asset) => ({
   id: asset.videoId,
   asset,
 })));
-const modelCapabilityMode = computed<"text_to_video" | "image_to_video">(() => {
+const modelCapabilityMode = computed<"text_to_video" | "image_to_video" | "video_to_video">(() => {
   if (mode.value === "image_to_video") return "image_to_video";
-  if (mode.value === "agent" && imageUrls.value.length) return "image_to_video";
+  if (mode.value === "video_to_video") return "video_to_video";
+  if (mode.value === "agent" && agentImageUrls.value.length) return "image_to_video";
   return "text_to_video";
 });
 const activeVideoModelSpecs = computed(() =>
@@ -283,7 +334,7 @@ const durationSelectOptions = computed(() => durationOptions.value.map((value) =
 })));
 const qualityOptions = computed(() =>
   selectedVideoModelSpec.value
-    ? selectedVideoModelSpec.value.options.map((value) => ({
+    ? videoModelOptionsForSecondary(selectedVideoModelSpec.value, effectiveVideoVersion.value).map((value) => ({
       value,
       label: formatVideoModelOption(value, selectedVideoModelSpec.value!),
     }))
@@ -291,14 +342,38 @@ const qualityOptions = computed(() =>
 );
 const modelOptionLabel = computed(() => selectedVideoModelSpec.value ? videoModelOptionLabel(selectedVideoModelSpec.value) : "参数");
 const showModelControls = computed(() => mode.value !== "agent" && Boolean(selectedVideoModelSpec.value));
-const isFirstLastFrameModel = computed(() => mode.value === "image_to_video"
-  && videoModelUsesFirstLastFrames(selectedVideoModelSpec.value));
-const referenceImageMinimum = computed(() => mode.value === "image_to_video"
-  ? Math.max(1, Number(selectedVideoModelSpec.value?.min_images || 1))
-  : 0);
+const requestModeOptions = computed(() => selectedVideoModelSpec.value?.request_mode_options || []);
+const requestModeSelectOptions = computed(() => requestModeOptions.value.map((value) => ({
+  value,
+  label: selectedVideoModelSpec.value?.request_mode_labels?.[value] || value,
+})));
+const effectiveRequestMode = computed(() => requestModeOptions.value.includes(requestMode.value)
+  ? requestMode.value
+  : selectedVideoModelSpec.value?.request_mode_default || "");
+const referenceModeOptions = computed(() => selectedVideoModelSpec.value?.reference_mode_options || []);
+const referenceModeSelectOptions = computed(() => referenceModeOptions.value.map((value) => ({
+  value,
+  label: selectedVideoModelSpec.value?.reference_mode_labels?.[value] || value,
+})));
+const effectiveReferenceMode = computed(() => referenceModeOptions.value.includes(referenceMode.value)
+  ? referenceMode.value
+  : selectedVideoModelSpec.value?.reference_mode_default || "");
+const versionOptions = computed(() => selectedVideoModelSpec.value?.secondary_options || []);
+const versionSelectOptions = computed(() => versionOptions.value.map((value) => ({ value, label: value })));
+const effectiveVideoVersion = computed(() => versionOptions.value.includes(videoVersion.value)
+  ? videoVersion.value
+  : selectedVideoModelSpec.value?.secondary_default_option || "");
+const isFirstLastFrameModel = computed(() => mode.value !== "agent"
+  && (videoModelUsesFirstLastFrames(selectedVideoModelSpec.value) || effectiveRequestMode.value === "shouweizhen"));
+const referenceImageMinimum = computed(() => {
+  if (mode.value === "image_to_video") return Math.max(1, Number(selectedVideoModelSpec.value?.min_images || 1));
+  if (mode.value === "video_to_video") return Math.max(0, Number(selectedVideoModelSpec.value?.min_images || 0));
+  return 0;
+});
 const referenceImageMaximum = computed(() => {
-  if (mode.value === "image_to_video") {
-    return Math.max(referenceImageMinimum.value, Number(selectedVideoModelSpec.value?.max_images || 1));
+  if (mode.value === "image_to_video" || mode.value === "video_to_video") {
+    if (isFirstLastFrameModel.value) return 2;
+    return Math.max(referenceImageMinimum.value, Number(selectedVideoModelSpec.value?.max_images || 0));
   }
   return mode.value === "agent" ? 8 : 0;
 });
@@ -312,14 +387,41 @@ const referenceImageError = computed(() => {
   const spec = selectedVideoModelSpec.value;
   if (!spec) return "";
   if (isFirstLastFrameModel.value) {
-    if (count < 1) return `${spec.label} 请先上传首帧`;
+    if (mode.value === "image_to_video" && count < 1) return `${spec.label} 请先上传首帧`;
     if (count > 2) return `${spec.label} 最多上传首帧和尾帧，共 2 张`;
     return "";
   }
   const minimum = referenceImageMinimum.value;
-  if (minimum === maximum && count !== minimum) return `${spec.label} 仅支持 ${minimum} 张参考图`;
-  if (count < minimum) return `${spec.label} 至少需要 ${minimum} 张参考图`;
+  if (mode.value === "image_to_video" && minimum === maximum && count !== minimum) return `${spec.label} 仅支持 ${minimum} 张参考图`;
+  if (mode.value === "image_to_video" && count < minimum) return `${spec.label} 至少需要 ${minimum} 张参考图`;
   if (count > maximum) return `${spec.label} 最多支持 ${maximum} 张参考图`;
+  return "";
+});
+const referenceVideoMaximum = computed(() => canUploadReferenceVideos.value
+  ? Number(selectedVideoModelSpec.value?.max_videos || 0)
+  : 0);
+const referenceAudioMaximum = computed(() => canUploadReferenceAudios.value
+  ? Number(selectedVideoModelSpec.value?.max_audios || 0)
+  : 0);
+const referenceMediaError = computed(() => {
+  const spec = selectedVideoModelSpec.value;
+  if (!spec || mode.value === "agent") return "";
+  if (uploadedReferenceVideos.value.length > referenceVideoMaximum.value) {
+    return `${spec.label} 最多支持 ${referenceVideoMaximum.value} 个参考视频`;
+  }
+  if (uploadedReferenceAudios.value.length > referenceAudioMaximum.value) {
+    return `${spec.label} 最多支持 ${referenceAudioMaximum.value} 段参考音频`;
+  }
+  if (effectiveRequestMode.value === "shouweizhen" && (uploadedReferenceVideos.value.length || uploadedReferenceAudios.value.length)) {
+    return "首尾帧模式不支持参考视频或参考音频";
+  }
+  if (uploadedReferenceAudios.value.length && !uploadedReferences.value.length && !uploadedReferenceVideos.value.length && spec.allow_audio_only === false) {
+    return `${spec.label} 不能只使用音频参考，请再上传图片或视频`;
+  }
+  if (effectiveReferenceMode.value === "edit" && !uploadedReferenceVideos.value.length) return "编辑视频模式需要至少一个参考视频";
+  if (effectiveReferenceMode.value === "extend" && (!uploadedReferenceVideos.value.length || uploadedReferenceVideos.value.length > 3 || uploadedReferences.value.length || uploadedReferenceAudios.value.length)) {
+    return "延长视频模式只支持 1 到 3 个参考视频";
+  }
   return "";
 });
 const referenceUploadLabel = computed(() => {
@@ -371,7 +473,12 @@ const activeModelSummary = computed(() => {
 const composerSummary = computed(() => {
   if (mode.value === "agent") return "视频智能体";
   if (!showModelControls.value) return `${modeLabel(mode.value)} · ${activeModelSummary.value}`;
-  return `${modeLabel(mode.value)} · ${activeModelSummary.value} · ${formatVideoAspectRatio(aspectRatio.value)} · ${formatVideoDuration(durationSecs.value)} · ${selectedQualityLabel.value}`;
+  const references = [
+    uploadedReferences.value.length ? `${uploadedReferences.value.length} 图` : "",
+    uploadedReferenceVideos.value.length ? `${uploadedReferenceVideos.value.length} 视频` : "",
+    uploadedReferenceAudios.value.length ? `${uploadedReferenceAudios.value.length} 音频` : "",
+  ].filter(Boolean).join(" + ");
+  return `${modeLabel(mode.value)} · ${activeModelSummary.value} · ${formatVideoAspectRatio(aspectRatio.value)} · ${formatVideoDuration(durationSecs.value)} · ${selectedQualityLabel.value}${references ? ` · ${references}` : ""}`;
 });
 function videoAnalysisStatus(asset: AgentVideoAsset) {
   return String(asset.analysisStatus || asset.status || "pending").toLowerCase();
@@ -381,7 +488,7 @@ const failedAgentVideos = computed(() => agentVideos.value.filter((asset) => vid
 const hasAgentMedia = computed(() => uploadedReferences.value.some((item) => Boolean(item.url)) || agentVideos.value.some((asset) => Boolean(asset.videoId && asset.url)));
 const hasAgentInput = computed(() => Boolean(prompt.value.trim()) || hasAgentMedia.value);
 const canSubmit = computed(() => {
-  if (uploadingReferences.value || uploadingVideos.value) return false;
+  if (uploadingReferences.value || uploadingVideos.value || uploadingReferenceVideos.value || uploadingReferenceAudios.value) return false;
   if (mode.value === "agent") return hasAgentInput.value && !failedAgentVideos.value.length && !referenceImageError.value;
   if (submitting.value) return false;
   return (
@@ -390,27 +497,32 @@ const canSubmit = computed(() => {
     && Boolean(prompt.value.trim())
     && Boolean(selectedModelId.value)
     && !referenceImageError.value
+    && !referenceMediaError.value
   );
 });
 const submitDisabledReason = computed(() => {
   if (submitting.value) return "正在提交";
   if (uploadingReferences.value) return "参考图上传中";
   if (uploadingVideos.value) return "视频上传中";
+  if (uploadingReferenceVideos.value) return "参考视频上传中";
+  if (uploadingReferenceAudios.value) return "参考音频上传中";
   if (mode.value === "agent") {
     if (!hasAgentInput.value) return "请输入消息";
     if (failedAgentVideos.value.length) return "有视频解析失败，请重试";
     return "";
   }
   if (configProblem.value) return configProblem.value;
-  if (!selectedVideoModelSpec.value) return mode.value === "image_to_video" ? "图生模型暂未配置" : "文生模型暂未配置";
+  if (!selectedVideoModelSpec.value) return mode.value === "image_to_video" ? "图生模型暂未配置" : mode.value === "video_to_video" ? "视频参考模型暂未配置" : "文生模型暂未配置";
   if (!selectedModelId.value) return "当前模式没有可用模型";
   if (referenceImageError.value) return referenceImageError.value;
+  if (referenceMediaError.value) return referenceMediaError.value;
   if (!prompt.value.trim()) return "请输入视频描述";
   return "";
 });
 const composerPlaceholder = computed(() => {
   if (mode.value === "agent") return "输入消息...";
   if (isFirstLastFrameModel.value) return "描述首帧到尾帧之间的动作、镜头运动和节奏...";
+  if (mode.value === "video_to_video") return "描述参考视频中的动作、节奏和镜头要如何被重新演绎...";
   if (mode.value === "image_to_video") return "描述参考图要如何运动，补充镜头、节奏和风格...";
   return "描述画面、主体动作、镜头运动和风格...";
 });
@@ -606,6 +718,7 @@ function mediaUrl(value?: string) {
 
 function modeLabel(value: string) {
   if (value === "agent") return "智能体";
+  if (value === "video_to_video") return "视频参考";
   return value === "image_to_video" ? "图生视频" : "文生视频";
 }
 
@@ -743,7 +856,7 @@ function replaceAgentPlans(items: VideoAgentPlan[], conversationId = activeConve
 
 async function loadSettings() {
   try {
-    settingsConfig.value = (await fetchSettingsConfig()).config;
+    settingsConfig.value = { video_generation: await fetchVideoGenerationModels() };
   } catch (error) {
     settingsConfig.value = null;
   }
@@ -937,6 +1050,14 @@ function pickAgentVideos() {
   videoInput.value?.click();
 }
 
+function pickReferenceVideos() {
+  if (canUploadReferenceVideos.value) referenceVideoInput.value?.click();
+}
+
+function pickReferenceAudios() {
+  if (canUploadReferenceAudios.value) referenceAudioInput.value?.click();
+}
+
 function isImageFile(file: File) {
   return file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|bmp)$/i.test(file.name);
 }
@@ -979,11 +1100,85 @@ async function uploadReferenceFiles(files: File[]) {
   }
 }
 
+async function uploadReferenceVideoFiles(files: File[]) {
+  if (!canUploadReferenceVideos.value) return;
+  const selected = files.filter(isVideoFile);
+  if (!selected.length) {
+    toast.error("请选择 MP4 或 MOV 参考视频");
+    return;
+  }
+  const maximum = referenceVideoMaximum.value;
+  if (uploadedReferenceVideos.value.length + selected.length > maximum) {
+    toast.error(`最多上传 ${maximum} 个参考视频`);
+    return;
+  }
+  uploadingReferenceVideos.value = true;
+  try {
+    const response = await uploadVideoReferenceVideos(selected, ensureWritableConversation());
+    const existing = new Set(uploadedReferenceVideos.value.map((item) => item.url));
+    uploadedReferenceVideos.value = [
+      ...uploadedReferenceVideos.value,
+      ...response.items.filter((item) => item.url && !existing.has(item.url)),
+    ];
+    toast.success(`已上传 ${response.items.length} 个参考视频`);
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : "上传参考视频失败");
+  } finally {
+    uploadingReferenceVideos.value = false;
+  }
+}
+
+function isAudioFile(file: File) {
+  return file.type.startsWith("audio/") || /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(file.name);
+}
+
+async function uploadReferenceAudioFiles(files: File[]) {
+  if (!canUploadReferenceAudios.value) return;
+  const selected = files.filter(isAudioFile);
+  if (!selected.length) {
+    toast.error("请选择 MP3 或 WAV 参考音频");
+    return;
+  }
+  const maximum = referenceAudioMaximum.value;
+  if (uploadedReferenceAudios.value.length + selected.length > maximum) {
+    toast.error(`最多上传 ${maximum} 段参考音频`);
+    return;
+  }
+  uploadingReferenceAudios.value = true;
+  try {
+    const response = await uploadVideoReferenceAudios(selected);
+    const existing = new Set(uploadedReferenceAudios.value.map((item) => item.url));
+    uploadedReferenceAudios.value = [
+      ...uploadedReferenceAudios.value,
+      ...response.items.filter((item) => item.url && !existing.has(item.url)),
+    ];
+    toast.success(`已上传 ${response.items.length} 段参考音频`);
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : "上传参考音频失败");
+  } finally {
+    uploadingReferenceAudios.value = false;
+  }
+}
+
 function onReferenceInput(event: Event) {
   const input = event.target as HTMLInputElement;
   const files = Array.from(input.files || []);
   input.value = "";
   if (files.length) void uploadReferenceFiles(files);
+}
+
+function onReferenceVideoInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = "";
+  if (files.length) void uploadReferenceVideoFiles(files);
+}
+
+function onReferenceAudioInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = "";
+  if (files.length) void uploadReferenceAudioFiles(files);
 }
 
 function onPaste(event: ClipboardEvent) {
@@ -1000,13 +1195,18 @@ function onDrop(event: DragEvent) {
   if (!files.length || !canDropMedia.value) return;
   const images = files.filter(isImageFile);
   const videos = files.filter(isVideoFile);
+  const audios = files.filter(isAudioFile);
   if (images.length) void uploadReferenceFiles(images);
-  if (videos.length) void uploadAgentVideoFiles(videos);
-  if (!images.length && !videos.length) toast.error("请选择图片或视频文件");
+  if (mode.value === "agent" && videos.length) void uploadAgentVideoFiles(videos);
+  if (mode.value === "video_to_video" && videos.length) void uploadReferenceVideoFiles(videos);
+  if (mode.value === "video_to_video" && audios.length) void uploadReferenceAudioFiles(audios);
+  if (!images.length && !videos.length && !audios.length) toast.error("请选择图片、视频或音频文件");
 }
 
 function removeReferenceItem(item: ReferencePreviewItem) {
-  uploadedReferences.value = uploadedReferences.value.filter((reference) => reference.url !== item.url);
+  if (item.kind === "image") uploadedReferences.value = uploadedReferences.value.filter((reference) => reference.url !== item.url);
+  if (item.kind === "video") uploadedReferenceVideos.value = uploadedReferenceVideos.value.filter((reference) => reference.url !== item.url);
+  if (item.kind === "audio") uploadedReferenceAudios.value = uploadedReferenceAudios.value.filter((reference) => reference.url !== item.url);
 }
 
 function isVideoFile(file: File) {
@@ -1341,6 +1541,8 @@ async function retryVideo(asset: AgentVideoAsset) {
 function clearComposer() {
   prompt.value = "";
   uploadedReferences.value = [];
+  uploadedReferenceVideos.value = [];
+  uploadedReferenceAudios.value = [];
   agentVideos.value = [];
   scheduleAgentVideoPolling();
   void nextTick(() => {
@@ -1368,7 +1570,7 @@ function selectVideoMode(value: string) {
     void openAgentWorkspace();
     return;
   }
-  if (!isAgentWorkspace.value && (value === "text_to_video" || value === "image_to_video")) {
+  if (!isAgentWorkspace.value && (value === "text_to_video" || value === "image_to_video" || value === "video_to_video")) {
     mode.value = value;
   }
 }
@@ -1393,13 +1595,38 @@ function syncModelOptions() {
   if (!spec.durations.includes(durationSecs.value)) {
     durationSecs.value = spec.default_duration ?? spec.durations[0] ?? 5;
   }
-  if (!spec.options.includes(quality.value)) {
-    quality.value = spec.default_option || spec.options[0] || "";
+  const allowedQualityOptions = videoModelOptionsForSecondary(spec, effectiveVideoVersion.value);
+  if (!allowedQualityOptions.includes(quality.value)) {
+    quality.value = allowedQualityOptions[0] || spec.default_option || spec.options[0] || "";
+  }
+  if (!requestModeOptions.value.includes(requestMode.value)) {
+    requestMode.value = spec.request_mode_default || requestModeOptions.value[0] || "";
+  }
+  if (!referenceModeOptions.value.includes(referenceMode.value)) {
+    referenceMode.value = spec.reference_mode_default || referenceModeOptions.value[0] || "";
+  }
+  if (!versionOptions.value.includes(videoVersion.value)) {
+    videoVersion.value = spec.secondary_default_option || versionOptions.value[0] || "";
   }
 }
 
 function selectDuration(value: string) {
   durationSecs.value = value === "auto" ? "auto" : Number(value);
+}
+
+function selectQuality(value: string) {
+  quality.value = value;
+  if (["1080p", "4K"].includes(value) && ["Mini", "快速"].includes(effectiveVideoVersion.value)) {
+    videoVersion.value = "标准";
+  }
+}
+
+function selectVideoVersion(value: string) {
+  videoVersion.value = value;
+  const allowedQualityOptions = videoModelOptionsForSecondary(selectedVideoModelSpec.value, value);
+  if (allowedQualityOptions.length && !allowedQualityOptions.includes(quality.value)) {
+    quality.value = allowedQualityOptions[0];
+  }
 }
 
 async function submitAgentTurn(options: {
@@ -1522,6 +1749,16 @@ async function submitTask() {
   submitting.value = true;
   try {
     const generationMode = mode.value;
+    const params: Record<string, unknown> = {};
+    if (selectedVideoModelSpec.value?.request_mode_param && effectiveRequestMode.value) {
+      params[selectedVideoModelSpec.value.request_mode_param] = effectiveRequestMode.value;
+    }
+    if (selectedVideoModelSpec.value?.secondary_option_key && effectiveVideoVersion.value) {
+      params[selectedVideoModelSpec.value.secondary_option_key] = effectiveVideoVersion.value;
+    }
+    if (selectedVideoModelSpec.value?.reference_mode_param && effectiveReferenceMode.value && uploadedReferenceVideos.value.length) {
+      params[selectedVideoModelSpec.value.reference_mode_param] = effectiveReferenceMode.value;
+    }
     const body = {
       prompt: prompt.value.trim(),
       model: selectedModelId.value,
@@ -1529,7 +1766,11 @@ async function submitTask() {
       aspectRatio: aspectRatio.value,
       durationSecs: durationSecs.value,
       quality: quality.value,
-      imageUrls: generationMode === "image_to_video" ? imageUrls.value : [],
+      resolution: quality.value,
+      imageUrls: generationMode === "image_to_video" || generationMode === "video_to_video" ? imageUrls.value : [],
+      referenceVideoUrls: generationMode === "video_to_video" ? uploadedReferenceVideoUrls.value : [],
+      referenceAudioUrls: generationMode === "video_to_video" ? uploadedReferenceAudioUrls.value : [],
+      params,
       conversationId,
     };
     const fingerprint = JSON.stringify(body);
@@ -1590,10 +1831,14 @@ async function reconcileTask(task: VideoGenerationTask) {
 function reuseTask(task: VideoGenerationTask) {
   prompt.value = task.prompt || "";
   model.value = task.model || model.value;
-  mode.value = task.mode === "image_to_video" ? "image_to_video" : "text_to_video";
+  mode.value = task.mode === "video_to_video" ? "video_to_video" : task.mode === "image_to_video" ? "image_to_video" : "text_to_video";
   aspectRatio.value = task.aspect_ratio || "16:9";
   durationSecs.value = task.duration_secs ?? 5;
   quality.value = task.quality || selectedVideoModelSpec.value?.default_option || "";
+  const params = task.params || {};
+  requestMode.value = String(params["mode"] || "");
+  referenceMode.value = String(params["_quan_neng_mode"] || "");
+  videoVersion.value = String(params["version"] || "");
   syncModelOptions();
   uploadedReferences.value = (task.image_urls || []).filter(Boolean).map((url, index) => ({
     url,
@@ -1603,6 +1848,23 @@ function reuseTask(task: VideoGenerationTask) {
     file_size: 0,
     cached: true,
     upload_ms: 0,
+  }));
+  uploadedReferenceVideos.value = (task.reference_video_urls || []).filter(Boolean).map((url, index) => ({
+    videoId: `history-video-${index}-${url}`,
+    name: `参考视频 ${index + 1}`,
+    filename: `参考视频 ${index + 1}`,
+    type: "video/mp4",
+    mimeType: "video/mp4",
+    size: 0,
+    url,
+  }));
+  uploadedReferenceAudios.value = (task.reference_audio_urls || []).filter(Boolean).map((url, index) => ({
+    id: `history-audio-${index}-${url}`,
+    title: `参考音频 ${index + 1}`,
+    url,
+    storageRel: "",
+    duration: 0,
+    size: 0,
   }));
   void nextTick(() => {
     resizeTextarea();
@@ -1653,12 +1915,20 @@ watch([() => route.query.task, () => route.query.conversation], async () => {
   void loadTasks(false);
 });
 watch(prompt, () => nextTick(resizeTextarea));
-watch([model, videoModelSpecs, mode, imageUrls], syncModelOptions, { immediate: true });
+watch([model, videoModelSpecs, mode, imageUrls, uploadedReferenceVideoUrls, uploadedReferenceAudios], syncModelOptions, { immediate: true });
 watch(mode, (value) => {
   updateIdleTitle(value);
-  if (value !== "text_to_video") return;
-  uploadedReferences.value = [];
-  agentVideos.value = [];
+  if (value === "agent") {
+    uploadedReferenceVideos.value = [];
+    uploadedReferenceAudios.value = [];
+  } else {
+    agentVideos.value = [];
+  }
+  if (value === "text_to_video") {
+    uploadedReferences.value = [];
+    uploadedReferenceVideos.value = [];
+    uploadedReferenceAudios.value = [];
+  }
   scheduleAgentVideoPolling();
 });
 
@@ -1749,6 +2019,12 @@ onBeforeUnmount(() => {
                       <p>{{ task.prompt }}</p>
                       <div v-if="task.image_urls?.length" class="mt-3 flex gap-2 overflow-x-auto pb-1">
                         <img v-for="url in task.image_urls" :key="url" :src="mediaUrl(url)" alt="参考图" class="size-12 shrink-0 rounded-xl object-cover" />
+                      </div>
+                      <div v-if="task.reference_video_urls?.length" class="mt-3 flex gap-2 overflow-x-auto pb-1">
+                        <video v-for="url in task.reference_video_urls" :key="url" :src="mediaUrl(url)" class="size-16 shrink-0 rounded-xl bg-slate-950 object-cover" muted playsinline preload="metadata" />
+                      </div>
+                      <div v-if="task.reference_audio_urls?.length" class="mt-3 flex gap-2 overflow-x-auto pb-1">
+                        <span v-for="url in task.reference_audio_urls" :key="url" class="inline-flex h-10 items-center gap-1.5 rounded-xl bg-white/70 px-3 text-xs font-semibold text-slate-600 dark:bg-white/[0.08] dark:text-stone-300"><Music2 class="size-4" />参考音频</span>
                       </div>
                     </div>
                   </div>
@@ -2033,10 +2309,32 @@ onBeforeUnmount(() => {
             data-testid="video-agent-video-input"
             @change="onVideoInput"
           />
+          <input
+            v-if="canUploadReferenceVideos"
+            ref="referenceVideoInput"
+            type="file"
+            accept="video/mp4,video/quicktime"
+            multiple
+            class="hidden"
+            data-testid="video-reference-video-input"
+            @change="onReferenceVideoInput"
+          />
+          <input
+            v-if="canUploadReferenceAudios"
+            ref="referenceAudioInput"
+            type="file"
+            accept="audio/mpeg,audio/wav,.mp3,.wav"
+            multiple
+            class="hidden"
+            data-testid="video-reference-audio-input"
+            @change="onReferenceAudioInput"
+          />
 
           <div v-if="referenceItems.length || agentVideoItems.length" class="video-reference-strip">
             <div v-for="item in referenceItems" :key="item.id" class="group video-reference-thumb">
-              <img :src="mediaUrl(item.url)" :alt="item.role || '参考图'" class="h-full w-full rounded-xl object-cover" />
+              <img v-if="item.kind === 'image'" :src="mediaUrl(item.url)" :alt="item.role || '参考图'" class="h-full w-full rounded-xl object-cover" />
+              <video v-else-if="item.kind === 'video'" :src="mediaUrl(item.url)" class="h-full w-full rounded-xl bg-slate-950 object-cover" muted playsinline preload="metadata" />
+              <div v-else class="grid h-full w-full place-items-center rounded-xl bg-[#4F7CFF]/10 text-[#315be8] dark:bg-[#4F7CFF]/15 dark:text-[#9db3ff]"><Music2 class="size-6" /></div>
               <button type="button" class="absolute right-1 top-1 inline-flex size-6 items-center justify-center rounded-lg bg-slate-950/75 text-white opacity-100 sm:opacity-0 sm:group-hover:opacity-100" :aria-label="`移除${item.role || '参考图'}`" @click="removeReferenceItem(item)">
                 <X class="size-3" />
               </button>
@@ -2114,6 +2412,31 @@ onBeforeUnmount(() => {
 
             <div v-if="showModelControls" class="video-chip-group">
               <ComposerSelect
+                v-if="requestModeSelectOptions.length"
+                v-model="requestMode"
+                class="video-select-control"
+                label="生成方式"
+                aria-label="选择生成方式"
+                :options="requestModeSelectOptions"
+              />
+              <ComposerSelect
+                v-if="referenceModeSelectOptions.length && effectiveRequestMode === 'cankaosheng' && uploadedReferenceVideos.length"
+                v-model="referenceMode"
+                class="video-select-control"
+                label="视频用法"
+                aria-label="选择参考视频用法"
+                :options="referenceModeSelectOptions"
+              />
+              <ComposerSelect
+                v-if="versionSelectOptions.length"
+                :model-value="effectiveVideoVersion"
+                class="video-select-control"
+                label="版本"
+                aria-label="选择速度版本"
+                :options="versionSelectOptions"
+                @update:model-value="selectVideoVersion"
+              />
+              <ComposerSelect
                 v-model="aspectRatio"
                 class="video-select-control"
                 label="画幅"
@@ -2129,11 +2452,12 @@ onBeforeUnmount(() => {
                 @update:model-value="selectDuration"
               />
               <ComposerSelect
-                v-model="quality"
+                :model-value="quality"
                 class="video-select-control"
                 :label="modelOptionLabel"
                 :aria-label="`选择${modelOptionLabel}`"
                 :options="qualityOptions"
+                @update:model-value="selectQuality"
               />
             </div>
             <div v-else-if="mode === 'image_to_video'" class="video-mode-notice">
@@ -2214,6 +2538,34 @@ onBeforeUnmount(() => {
                 <UploadCloud v-else class="size-4" />
                 视频
                 <span class="rounded-md bg-[#4F7CFF]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#315be8] dark:text-[#9db3ff]">{{ agentVideos.length }}/{{ AGENT_VIDEO_MAX_ITEMS }}</span>
+              </button>
+              <button
+                v-if="canUploadReferenceVideos"
+                type="button"
+                class="video-tool-button"
+                :disabled="uploadingReferenceVideos || uploadedReferenceVideos.length >= referenceVideoMaximum"
+                :title="`最多 ${referenceVideoMaximum} 个参考视频，仅支持 MP4、MOV`"
+                data-testid="video-reference-video-upload"
+                @click="pickReferenceVideos"
+              >
+                <LoaderCircle v-if="uploadingReferenceVideos" class="size-4 animate-spin" />
+                <UploadCloud v-else class="size-4" />
+                参考视频
+                <span class="rounded-md bg-[#4F7CFF]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#315be8] dark:text-[#9db3ff]">{{ uploadedReferenceVideos.length }}/{{ referenceVideoMaximum }}</span>
+              </button>
+              <button
+                v-if="canUploadReferenceAudios"
+                type="button"
+                class="video-tool-button"
+                :disabled="uploadingReferenceAudios || uploadedReferenceAudios.length >= referenceAudioMaximum"
+                :title="`最多 ${referenceAudioMaximum} 段参考音频，仅支持 MP3、WAV`"
+                data-testid="video-reference-audio-upload"
+                @click="pickReferenceAudios"
+              >
+                <LoaderCircle v-if="uploadingReferenceAudios" class="size-4 animate-spin" />
+                <UploadCloud v-else class="size-4" />
+                参考音频
+                <span class="rounded-md bg-[#4F7CFF]/10 px-1.5 py-0.5 text-[10px] font-semibold text-[#315be8] dark:text-[#9db3ff]">{{ uploadedReferenceAudios.length }}/{{ referenceAudioMaximum }}</span>
               </button>
             </div>
             <div class="video-composer-meta">

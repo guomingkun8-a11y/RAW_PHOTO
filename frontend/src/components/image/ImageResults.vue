@@ -192,6 +192,12 @@ function elapsed(image: StoredImage) {
   if (image.startTime) return "generation";
   return "等待中";
 }
+function isResultTimeout(image: StoredImage) {
+  return image.status === "error" && /media generation timed out/i.test(image.error || "");
+}
+function resultTimeoutCount(turn: ImageTurn) {
+  return turn.images.filter(isResultTimeout).length;
+}
 function statusLabel(turn: ImageTurn) {
   if (turn.status === "planning") return "规划中";
   if (turn.status === "waiting_for_input") return hasAgentProposal(turn) ? "等待确认" : isProfessionalConsultation(turn) ? "专业咨询" : "等待补充";
@@ -199,9 +205,15 @@ function statusLabel(turn: ImageTurn) {
   if (turn.status === "generating") return "生成中";
   if (turn.status === "success") return isAgentTurn(turn) && !hasImageActivity(turn) ? "回答完成" : "已完成";
   if (turn.status === "canceled") return "已中止";
+  if (resultTimeoutCount(turn)) return turn.images.some((image) => image.status === "error" && !isResultTimeout(image)) ? "有失败和待确认" : "结果待确认";
   return "有失败";
 }
 function statusDetail(turn: ImageTurn) {
+  const pending = resultTimeoutCount(turn);
+  if (pending && turn.status === "error") {
+    const failed = turn.images.filter((image) => image.status === "error" && !isResultTimeout(image)).length;
+    return [failed ? `${failed} 张生成失败` : "", `${pending} 张结果待确认`].filter(Boolean).join("，");
+  }
   if (turn.error) return turn.error;
   if (turn.status === "success") {
     const imageCount = successImages(turn).length;
@@ -251,6 +263,7 @@ function deleteActionLabel(turn: ImageTurn) {
 }
 function statusClass(turn: ImageTurn) {
   if (turn.status === "success") return "bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300";
+  if (turn.status === "error" && resultTimeoutCount(turn) && !turn.images.some((image) => image.status === "error" && !isResultTimeout(image))) return "bg-amber-50 text-amber-700 dark:bg-amber-400/10 dark:text-amber-300";
   if (turn.status === "error") return "bg-rose-50 text-rose-700 dark:bg-rose-400/10 dark:text-rose-300";
   if (turn.status === "canceled") return "bg-slate-100 text-slate-600 dark:bg-white/[0.08] dark:text-stone-300";
   if (turn.status === "waiting_for_input") return "bg-amber-50 text-amber-700 dark:bg-amber-400/10 dark:text-amber-300";
@@ -628,6 +641,11 @@ function copyPrompt(prompt: string) {
                   @close="emit('cancelTurn', turn.id)"
                 />
               </div>
+              <div v-else-if="isResultTimeout(image)" class="flex h-full flex-col items-center justify-center gap-1.5 p-3 text-center text-amber-800 dark:text-amber-200">
+                <CircleHelp class="size-6 shrink-0" />
+                <span class="text-xs font-semibold">结果待确认</span>
+                <span class="text-[11px] leading-relaxed">等待超时，可能仍在生成。请联系管理员核查，暂勿重试。</span>
+              </div>
               <div v-else-if="image.status === 'error'" class="flex h-full flex-col items-center justify-center gap-2 p-4 text-center">
                 <XCircle class="size-7 text-rose-500" />
                 <span class="line-clamp-2 text-xs text-rose-600 dark:text-rose-300">{{ image.error || '生成失败' }}</span>
@@ -668,11 +686,11 @@ function copyPrompt(prompt: string) {
               <Archive v-else class="size-3.5" />
               {{ downloadingTurnId === turn.id ? '正在打包' : '下载 ZIP' }}
             </button>
-            <button type="button" class="studio-button chat-action-button inline-flex items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:border-white/10 dark:text-stone-300 dark:hover:bg-white/[0.08]" @click="emit('regenerateTurn', turn.id)">
+            <button v-if="!resultTimeoutCount(turn)" type="button" class="studio-button chat-action-button inline-flex items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:border-white/10 dark:text-stone-300 dark:hover:bg-white/[0.08]" @click="emit('regenerateTurn', turn.id)">
               <RefreshCw class="size-3.5" />
               {{ repeatActionLabel(turn) }}
             </button>
-            <button v-if="turn.images.some((image) => image.status === 'error')" type="button" class="studio-button inline-flex items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:border-white/10 dark:text-stone-300 dark:hover:bg-white/[0.08]" @click="emit('dismissErrors', turn.id)">
+            <button v-if="!resultTimeoutCount(turn) && turn.images.some((image) => image.status === 'error')" type="button" class="studio-button inline-flex items-center gap-1.5 rounded-xl border border-black/[0.06] px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:border-white/10 dark:text-stone-300 dark:hover:bg-white/[0.08]" @click="emit('dismissErrors', turn.id)">
               <Check class="size-3.5" />
               忽略失败
             </button>

@@ -124,7 +124,8 @@
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), border-color 150ms ease, box-shadow 180ms ease;
 }
 .canvas-node.node-type-image,
-.canvas-node.node-type-video {
+.canvas-node.node-type-video,
+.canvas-node.node-type-audio {
   display: block;
   border: 0;
   border-radius: 0;
@@ -142,11 +143,14 @@
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease;
 }
 .canvas-node.node-type-image .canvas-node-visual,
-.canvas-node.node-type-video .canvas-node-visual { display: flex; flex-direction: column; }
+.canvas-node.node-type-video .canvas-node-visual,
+.canvas-node.node-type-audio .canvas-node-visual { display: flex; flex-direction: column; }
 .canvas-node.node-type-image { width: 440px; height: 710px; }
 .canvas-node.node-type-video { width: 620px; height: 600px; }
+.canvas-node.node-type-audio { width: 440px; height: 188px; }
 .canvas-node.node-type-image:not(.is-active) { height: 478px; }
 .canvas-node.node-type-video:not(.is-active) { height: 368px; }
+.canvas-node.node-type-audio:not(.is-active) { height: 188px; }
 .canvas-node.node-type-image:not(.is-active) .media-prompt-editor,
 .canvas-node.node-type-video:not(.is-active) .media-prompt-editor {
   display: none;
@@ -243,6 +247,9 @@
 }
 .media-node-stage > img,
 .media-node-stage > video { width: 100%; height: 100%; display: block; object-fit: contain; background: var(--node-preview); }
+.audio-node-body { width: 100%; height: 100%; display: flex; flex-direction: column; }
+.audio-node-stage { flex: 1 1 auto; min-height: 150px; place-items: center; padding: 18px; }
+.audio-node-player { width: min(100%, 390px); accent-color: var(--accent); }
 .media-node-stage.is-file-dragover { border-color: var(--accent); box-shadow: inset 0 0 0 2px color-mix(in oklch, var(--accent) 64%, transparent); }
 .media-drop-overlay { position: absolute; z-index: 8; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; background: color-mix(in oklch, var(--node-preview) 84%, transparent); color: var(--ink); pointer-events: none; }
 .media-drop-overlay svg { color: var(--accent); }
@@ -432,6 +439,7 @@
 .media-prompt-input { min-width: 0; min-height: 0; display: flex; align-content: flex-start; align-items: flex-start; flex-wrap: wrap; gap: 6px; padding: 9px 13px; overflow-y: auto; cursor: text; }
 .media-prompt-reference-chip { max-width: 180px; height: 26px; display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; padding: 0 5px; border: 1px solid var(--accent-border-soft); border-radius: 5px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 680; white-space: nowrap; }
 .media-prompt-reference-chip.is-video { border-color: var(--line); background: var(--surface-raised); color: var(--muted-strong); }
+.media-prompt-reference-chip.is-audio { border-color: color-mix(in oklch, var(--warning) 42%, var(--line)); background: color-mix(in oklch, var(--warning) 10%, var(--surface)); color: color-mix(in oklch, var(--warning) 74%, var(--ink)); }
 .media-prompt-reference-chip.is-indirect { border-style: dashed; }
 .media-prompt-reference-chip > span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .media-prompt-reference-preview { width: 18px; height: 18px; display: grid; place-items: center; flex: 0 0 auto; overflow: hidden; border-radius: 3px; background: var(--surface); }
@@ -450,6 +458,7 @@
 .media-toolbar-model { --canvas-select-value-max-width: 112px; }
 .media-toolbar-thinking { --canvas-select-value-max-width: 82px; }
 .media-toolbar-duration { --canvas-select-value-max-width: 50px; }
+.media-toolbar-mode { --canvas-select-value-max-width: 76px; }
 .media-generate-button { width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; padding: 0; border: 0; border-radius: 50%; background: var(--accent-strong); color: var(--accent-ink); }
 .media-generate-button:hover:not(:disabled) { background: var(--accent); }
 .media-node-error,
@@ -503,7 +512,8 @@
   transition: opacity 150ms ease, border-color 150ms ease, background-color 150ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease;
 }
 .canvas-node.node-type-image .node-port,
-.canvas-node.node-type-video .node-port { top: 196.5px; }
+.canvas-node.node-type-video .node-port,
+.canvas-node.node-type-audio .node-port { top: 196.5px; }
 .node-port span { position: relative; width: 8px; height: 8px; border-radius: 50%; background: transparent; }
 .node-port span::before,
 .node-port span::after {

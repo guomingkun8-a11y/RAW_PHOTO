@@ -27,6 +27,7 @@ from services.ecommerce.prompt_analysis_service import (
     request_text_completion,
     upstream_chat_model,
 )
+from services.billing.chat_usage import capture_chat_response, chat_usage_scope
 from services.billing.chat_usage_attribution import record_chat_attribution
 from services.ecommerce.professional_video_service import professional_video_asset_service
 from services.platform.config import DATA_DIR, config
@@ -1917,14 +1918,16 @@ def _reasoning_events(
 
 def _open_reasoning_chat_stream_once(payload: dict[str, object], *, model: str, started_at: float) -> Iterator[dict[str, object]]:
     timeout = max(30, int(os.getenv("VIDEO_AGENT_REASONING_TIMEOUT_SECS", str(DEFAULT_REASONING_TIMEOUT_SECONDS))))
+    headers = _relay_responses_headers()
     response = requests.post(
         _relay_responses_url(),
-        headers=_relay_responses_headers(),
+        headers=headers,
         json=payload,
         stream=True,
         timeout=timeout,
         **proxy_settings.build_session_kwargs(),
     )
+    capture_chat_response(response, model=model, api_key=headers["Authorization"].removeprefix("Bearer "))
     if response.status_code < 200 or response.status_code >= 300:
         error = _upstream_error(response)
         response.close()
@@ -1992,11 +1995,12 @@ def open_reasoning_chat_stream(
     if billing_user:
         payload["metadata"] = {"gmkraw_owner_id": billing_user}
     started_at = time.perf_counter()
-    upstream_events = run_with_relay_pool(
-        config.get_openai_relay_settings(),
-        "video_agent_reasoning",
-        lambda: _open_reasoning_chat_stream_once(payload, model=model, started_at=started_at),
-    )
+    with chat_usage_scope(billing_user, "video_agent_reasoning", str(billing_local_task_id or "")):
+        upstream_events = run_with_relay_pool(
+            config.get_openai_relay_settings(),
+            "video_agent_reasoning",
+            lambda: _open_reasoning_chat_stream_once(payload, model=model, started_at=started_at),
+        )
 
     def attributed_stream() -> Iterator[dict[str, object]]:
         response: object = None

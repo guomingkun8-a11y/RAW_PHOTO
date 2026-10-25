@@ -61,7 +61,7 @@ class VideoGenerationMonitoringService:
         self.engine = None
         self.Session = None
         self._init_error = ""
-        self._summary_cache = TTLCache[str, dict[str, Any]](ttl_seconds=3.0, max_items=16)
+        self._summary_cache = TTLCache[str, dict[str, Any]](ttl_seconds=10.0, max_items=16)
         self._init_engine()
 
     @staticmethod
@@ -167,15 +167,56 @@ class VideoGenerationMonitoringService:
             "owner_activity": normalized_activity,
         }
 
+    def _merge_live_snapshot(
+        self,
+        historical: dict[str, Any],
+        queue_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        result = deepcopy(historical)
+        record_activity = result.pop("_record_activity", [])
+        queue = self._queue_summary(record_activity, queue_snapshot)
+        activity_by_owner = {
+            _clean(item.get("owner_id")): item
+            for item in queue.get("owner_activity") or []
+            if isinstance(item, dict) and _clean(item.get("owner_id"))
+        }
+        users = [dict(item) for item in result.get("users") or [] if isinstance(item, dict)]
+        users_by_id = {_clean(item.get("user_id")): item for item in users if _clean(item.get("user_id"))}
+        for owner_id, activity in activity_by_owner.items():
+            user = users_by_id.get(owner_id)
+            if user is None:
+                user = {
+                    "user_id": owner_id, "username": owner_id, "name": owner_id,
+                    "role": "unknown", "enabled": True, "online": False, "active_sessions": 0,
+                    "success_count": 0, "failed_count": 0, "canceled_count": 0,
+                    "reconciliation_required_count": 0, "total_count": 0,
+                    **_cost_summary(0, None), "last_login_at": "", "last_seen_at": "",
+                }
+                users.append(user)
+                users_by_id[owner_id] = user
+            user.update({
+                "queued_tasks": _positive_int(activity.get("queued_tasks")),
+                "running_tasks": _positive_int(activity.get("running_tasks")),
+                "active_tasks": _positive_int(activity.get("active_tasks")),
+            })
+        for owner_id, user in users_by_id.items():
+            if owner_id not in activity_by_owner:
+                user.update({"queued_tasks": 0, "running_tasks": 0, "active_tasks": 0})
+        users.sort(key=lambda item: (not item.get("online"), -int(item.get("total_count") or 0), _clean(item.get("username"))))
+        result["users"] = users
+        result["task_queue"] = queue
+        result["video_generation_queue"] = deepcopy(queue_snapshot or {})
+        return result
+
     def summary(self, queue_snapshot: dict[str, Any] | None = None, *, start_at=None, end_at=None) -> dict[str, Any]:
-        cache_key = f"{start_at!s}|{end_at!s}|{queue_snapshot!s}"
+        cache_key = f"{start_at!s}|{end_at!s}"
         cached = self._summary_cache.get(cache_key)
         if cached is not None:
-            return deepcopy(cached)
+            return self._merge_live_snapshot(cached, queue_snapshot)
         with self._session() as session:
             aggregated = aggregate_records(session, start_at=start_at, end_at=end_at)
-            activity = active_record_counts(session)
-        queue = self._queue_summary(activity, queue_snapshot)
+            record_activity = active_record_counts(session)
+        queue = self._queue_summary(record_activity, None)
         users, online = self._users_and_online()
         owner_totals = {row["owner_id"]: row for row in aggregated["owners"]}
         model_items = [{"model": row["model"], **_cost_summary(row["cost_count"], row["cost_total"])} for row in aggregated["models"]]
@@ -187,7 +228,7 @@ class VideoGenerationMonitoringService:
         for owner_id in owner_ids:
             totals = owner_totals.get(owner_id) or {}
             user = user_map.get(owner_id) or totals
-            activity = queue_activity.get(owner_id) or {}
+            user_activity = queue_activity.get(owner_id) or {}
             success, failed, canceled = (int(totals.get(key) or 0) for key in ("success_count", "failed_count", "canceled_count"))
             user_items.append({
                 "user_id": owner_id, "username": _clean(user.get("username"), owner_id),
@@ -198,8 +239,8 @@ class VideoGenerationMonitoringService:
                 "reconciliation_required_count": int(totals.get("reconciliation_required_count") or 0),
                 "total_count": success + failed + canceled,
                 **_cost_summary(int(totals.get("cost_count") or 0), totals.get("cost_total")),
-                "queued_tasks": _positive_int(activity.get("queued_tasks")),
-                "running_tasks": _positive_int(activity.get("running_tasks")), "active_tasks": _positive_int(activity.get("active_tasks")),
+                "queued_tasks": _positive_int(user_activity.get("queued_tasks")),
+                "running_tasks": _positive_int(user_activity.get("running_tasks")), "active_tasks": _positive_int(user_activity.get("active_tasks")),
                 "last_login_at": _format_datetime(user.get("last_login_at")),
                 "last_seen_at": _format_datetime((online.get(owner_id) or {}).get("last_seen_at")),
             })
@@ -218,13 +259,14 @@ class VideoGenerationMonitoringService:
             ),
             "total_cost": _money(total_cost), "cost_count": sum(row["cost_count"] for row in aggregated["owners"]),
             "models": model_items, "total_users": len(users), "online_window_minutes": ONLINE_WINDOW_MINUTES,
-            "range": _range(start_at, end_at), "task_queue": queue, "video_generation_queue": deepcopy(queue_snapshot or {}),
+            "range": _range(start_at, end_at), "task_queue": queue, "video_generation_queue": {},
             "task_latency": latency,
             "stage_latency": {"upload": dict(empty_latency), "queue": dict(empty_latency), "generation": dict(latency), "save": dict(empty_latency)},
             "users": user_items,
+            "_record_activity": deepcopy(record_activity),
         }
         self._summary_cache.set(cache_key, deepcopy(result))
-        return result
+        return self._merge_live_snapshot(result, queue_snapshot)
 
     def task_details(
         self, *, start_at=None, end_at=None, owner_id: str = "", status: str = "all",

@@ -1,14 +1,17 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { ArrowUp, Clock3, Image as ImageIcon, Link2, LoaderCircle, Upload, Video, X } from '@lucide/vue';
+import { ArrowUp, Clock3, Image as ImageIcon, Link2, LoaderCircle, Music2, Upload, Video, X } from '@lucide/vue';
 import type { VideoGenerationModelSpec } from '@/lib/api';
 import { BUILTIN_IMAGE_MODELS, formatImageModel } from '@/lib/image-models';
 import {
   formatVideoDuration,
   formatVideoModelOption,
   videoFrameRole,
+  videoModelMediaSpec,
+  videoModelOptionsForSecondary,
   videoModelOptionLabel,
-  videoModelUsesFirstLastFrames,
+  selectVideoModelForMode,
+  videoModelUsesFirstLastFramesForMode,
 } from '@/lib/video-models';
 import CanvasSelect from '@/features/infinite-canvas/components/CanvasSelect.vue';
 import {
@@ -31,7 +34,7 @@ const props = defineProps<{
   uploadEnabled: boolean;
   imageModels: string[];
   videoModels: VideoGenerationModelSpec[];
-  videoMode: 'text_to_video' | 'image_to_video';
+  videoMode: 'text_to_video' | 'image_to_video' | 'video_to_video';
   promptReferences: CanvasMediaReference[];
   referenceCandidates: CanvasMediaReference[];
   videoAnalysisFailed: boolean;
@@ -58,9 +61,22 @@ const selectedImageModel = computed(() => availableImageModels.value.includes(pr
 const compatibleVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes(props.videoMode)));
 const textVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes('text_to_video')));
 const imageVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes('image_to_video')));
-const selectedVideoModel = computed(() => compatibleVideoModels.value.find((model) => model.id === props.node.model)
-  || compatibleVideoModels.value[0]
-  || props.videoModels[0]);
+const videoReferenceModels = computed(() => props.videoModels.filter((model) => model.modes.includes('video_to_video')));
+const selectedVideoModel = computed(() => selectVideoModelForMode(props.videoModels, props.videoMode, props.node.model));
+const videoRequestModeOptions = computed(() => selectedVideoModel.value?.request_mode_options || []);
+const selectedVideoRequestMode = computed(() => videoRequestModeOptions.value.includes(props.node.videoRequestMode || '')
+  ? props.node.videoRequestMode || ''
+  : selectedVideoModel.value?.request_mode_default || videoRequestModeOptions.value[0] || '');
+const videoReferenceModeOptions = computed(() => selectedVideoModel.value?.reference_mode_options || []);
+const selectedVideoReferenceMode = computed(() => videoReferenceModeOptions.value.includes(props.node.videoReferenceMode || '')
+  ? props.node.videoReferenceMode || ''
+  : selectedVideoModel.value?.reference_mode_default || videoReferenceModeOptions.value[0] || '');
+const videoVersionOptions = computed(() => selectedVideoModel.value?.secondary_options || []);
+const selectedVideoVersion = computed(() => videoVersionOptions.value.includes(props.node.videoVersion || '')
+  ? props.node.videoVersion || ''
+  : selectedVideoModel.value?.secondary_default_option || videoVersionOptions.value[0] || '');
+const availableVideoOptions = computed(() => videoModelOptionsForSecondary(selectedVideoModel.value, selectedVideoVersion.value));
+const selectedVideoMediaSpec = computed(() => videoModelMediaSpec(selectedVideoModel.value, selectedVideoRequestMode.value));
 const referenceSelectOptions = computed(() => [
   ...props.referenceCandidates.filter((item) => item.type === 'image').map((reference) => ({
     value: reference.nodeId,
@@ -72,12 +88,20 @@ const referenceSelectOptions = computed(() => [
     label: reference.label,
     group: '视频',
   })),
+  ...props.referenceCandidates.filter((item) => item.type === 'audio').map((reference) => ({
+    value: reference.nodeId,
+    label: reference.label,
+    group: '音频',
+  })),
 ]);
 const imageModelSelectOptions = computed(() => availableImageModels.value.map((model) => ({
   value: model,
   label: formatImageModel(model),
 })));
 const videoModelSelectOptions = computed(() => {
+  if (props.videoMode === 'video_to_video') {
+    return videoReferenceModels.value.map((model) => ({ value: model.id, label: model.label, group: '视频参考' }));
+  }
   const seen = new Set<string>();
   return [
     ...textVideoModels.value.map((model) => ({ value: model.id, label: model.label, group: '文生视频' })),
@@ -92,7 +116,11 @@ const displayedPromptReferences = computed(() => {
   let imageIndex = 0;
   return props.promptReferences.map((reference) => {
     if (props.node.type !== 'video' || reference.type !== 'image') return reference;
-    const role = videoFrameRole(selectedVideoModel.value, imageIndex);
+    const role = videoFrameRole(
+      selectedVideoMediaSpec.value,
+      imageIndex,
+      selectedVideoRequestMode.value,
+    );
     imageIndex += 1;
     return role ? { ...reference, label: `${role} · ${reference.label}`, title: `${role}：${reference.title}` } : reference;
   });
@@ -107,7 +135,9 @@ const selectedVideoDuration = computed(() => {
 });
 const selectedVideoOption = computed(() => {
   const spec = selectedVideoModel.value;
-  return spec && spec.options.includes(props.node.quality) ? props.node.quality : spec?.default_option || props.node.quality;
+  return spec && availableVideoOptions.value.includes(props.node.quality)
+    ? props.node.quality
+    : availableVideoOptions.value[0] || spec?.default_option || props.node.quality;
 });
 const aspectRatioSelectOptions = computed(() => (
   props.node.type === 'video' ? selectedVideoModel.value?.aspect_ratios || [] : CANVAS_IMAGE_ASPECT_RATIOS
@@ -118,12 +148,22 @@ const imageQualitySelectOptions = CANVAS_IMAGE_QUALITIES.map((value) => ({ value
 const imageThinkingSelectOptions = CANVAS_IMAGE_THINKING_LEVELS.map((value) => ({ value, label: value }));
 const videoDurationSelectOptions = computed(() => (selectedVideoModel.value?.durations || [])
   .map((value) => ({ value: String(value), label: formatVideoDuration(value) })));
-const videoOptionSelectOptions = computed(() => (selectedVideoModel.value?.options || [])
+const videoOptionSelectOptions = computed(() => availableVideoOptions.value
   .map((value) => ({ value, label: selectedVideoModel.value ? formatVideoModelOption(value, selectedVideoModel.value) : value })));
 const videoOptionLabel = computed(() => selectedVideoModel.value ? videoModelOptionLabel(selectedVideoModel.value) : '参数');
+const videoRequestModeSelectOptions = computed(() => videoRequestModeOptions.value.map((value) => ({
+  value,
+  label: selectedVideoModel.value?.request_mode_labels?.[value] || value,
+})));
+const videoReferenceModeSelectOptions = computed(() => videoReferenceModeOptions.value.map((value) => ({
+  value,
+  label: selectedVideoModel.value?.reference_mode_labels?.[value] || value,
+})));
+const videoVersionSelectOptions = computed(() => videoVersionOptions.value.map((value) => ({ value, label: value })));
 const promptPlaceholder = computed(() => {
   if (props.node.type === 'image') return '描述主体、环境、光线和画面细节...';
-  return videoModelUsesFirstLastFrames(selectedVideoModel.value)
+  if (props.videoMode === 'video_to_video') return '描述保留主体并参考视频动作、节奏和镜头的生成要求...';
+  return videoModelUsesFirstLastFramesForMode(selectedVideoModel.value, selectedVideoRequestMode.value)
     ? '描述首帧到尾帧之间的动作、镜头运动和节奏...'
     : '描述动作、镜头运动、节奏和氛围...';
 });
@@ -143,7 +183,17 @@ function selectVideoModel(modelId: string) {
   updateField('model', spec.id);
   updateField('aspectRatio', spec.aspect_ratios[0] || '16:9');
   updateField('duration', spec.default_duration ?? spec.durations[0] ?? 5);
-  updateField('quality', spec.default_option || spec.options[0] || '');
+  const defaultVersion = spec.secondary_default_option || spec.secondary_options?.[0] || '';
+  updateField('quality', videoModelOptionsForSecondary(spec, defaultVersion)[0] || spec.default_option || spec.options[0] || '');
+  updateField('videoRequestMode', spec.request_mode_default || spec.request_mode_options?.[0] || '');
+  updateField('videoReferenceMode', spec.reference_mode_default || spec.reference_mode_options?.[0] || '');
+  updateField('videoVersion', defaultVersion);
+}
+
+function selectVideoVersion(value: string) {
+  updateField('videoVersion', value);
+  const options = videoModelOptionsForSecondary(selectedVideoModel.value, value);
+  if (options.length && !options.includes(props.node.quality)) updateField('quality', options[0]);
 }
 
 function focusPrompt() {
@@ -166,7 +216,7 @@ function focusPrompt() {
         label="引用"
         :aria-label="`${node.title}引用素材`"
         :disabled="!referenceCandidates.length"
-        :title="referenceCandidates.length ? '引用画布中的图片或视频' : '暂无可引用的图片或视频节点'"
+        :title="referenceCandidates.length ? '引用画布中的图片、视频或音频' : '暂无可引用的图片、视频或音频节点'"
         @update:model-value="$event && emit('addPromptReference', $event)"
       >
         <template #prefix><Link2 :size="13" aria-hidden="true" /></template>
@@ -184,7 +234,8 @@ function focusPrompt() {
         <span class="media-prompt-reference-preview" aria-hidden="true">
           <img v-if="reference.type === 'image' && reference.previewUrl" :src="reference.previewUrl" alt="" draggable="false" />
           <ImageIcon v-else-if="reference.type === 'image'" :size="12" />
-          <Video v-else :size="12" />
+          <Video v-else-if="reference.type === 'video'" :size="12" />
+          <Music2 v-else :size="12" />
         </span>
         <span>{{ reference.label }}</span>
         <button v-if="reference.direct" type="button" :title="`移除引用 ${reference.label}`" :aria-label="`移除引用 ${reference.label}`" @pointerdown.stop @click.stop="emit('removePromptReference', reference.nodeId)"><X :size="11" aria-hidden="true" /></button>
@@ -208,6 +259,9 @@ function focusPrompt() {
       <div class="media-toolbar-group">
         <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select media-toolbar-model" :model-value="selectedImageModel || ''" :options="imageModelSelectOptions" label="模型" :aria-label="`${node.title}模型`" title="gpt-image-2 会按服务端规则请求 tt-image-2" @update:model-value="updateField('model', $event)" />
         <CanvasSelect v-else class="media-toolbar-select media-toolbar-model" :model-value="selectedVideoModel?.id || ''" :options="videoModelSelectOptions" label="模型" :aria-label="`${node.title}模型`" @update:model-value="selectVideoModel" />
+        <CanvasSelect v-if="node.type === 'video' && videoRequestModeSelectOptions.length" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoRequestMode" :options="videoRequestModeSelectOptions" label="生成方式" :aria-label="`${node.title}生成方式`" @update:model-value="updateField('videoRequestMode', $event)" />
+        <CanvasSelect v-if="node.type === 'video' && videoReferenceModeSelectOptions.length && selectedVideoRequestMode === 'cankaosheng' && videoMode === 'video_to_video'" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoReferenceMode" :options="videoReferenceModeSelectOptions" label="视频用法" :aria-label="`${node.title}视频用法`" @update:model-value="updateField('videoReferenceMode', $event)" />
+        <CanvasSelect v-if="node.type === 'video' && videoVersionSelectOptions.length" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoVersion" :options="videoVersionSelectOptions" label="版本" :aria-label="`${node.title}速度版本`" @update:model-value="selectVideoVersion" />
         <CanvasSelect class="media-toolbar-select" :model-value="node.type === 'video' ? selectedVideoAspectRatio : node.aspectRatio" :options="aspectRatioSelectOptions" label="画幅" :aria-label="`${node.title}画幅`" @update:model-value="updateField('aspectRatio', $event)" />
         <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select" :model-value="String(node.imageCount)" :options="imageCountSelectOptions" label="数量" :aria-label="`${node.title}生成数量`" @update:model-value="updateField('imageCount', Number($event))" />
         <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select" :model-value="node.imageSize" :options="imageSizeSelectOptions" label="分辨率" :aria-label="`${node.title}分辨率`" @update:model-value="updateField('imageSize', $event)" />

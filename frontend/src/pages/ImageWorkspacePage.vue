@@ -570,6 +570,7 @@ onBeforeUnmount(() => { videoHistoryDisposed = true; });
           @pick-batch-product="workspace.pickBatchProduct"
           @pick-batch-folder="workspace.pickBatchFolder"
           @clear-batch="workspace.clearBatch"
+          @ratio-selected="workspace.markImageRatioExplicit"
           @open-lightbox="workspace.openLightbox"
           @open-memory="memoryOpen = true"
         />

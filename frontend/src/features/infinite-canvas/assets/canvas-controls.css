@@ -45,6 +45,7 @@
     height: 116px;
     --minimap-image: #5b7ff5;
     --minimap-video: #299b7e;
+    --minimap-audio: #c58a35;
     --minimap-text: #8791a2;
     --minimap-node-stroke: rgb(30 41 59 / 0.2);
     --minimap-viewport-fill: rgb(79 124 255 / 0.12);
@@ -145,6 +146,7 @@
 .dark .infinite-canvas-root .canvas-minimap {
   --minimap-image: #7895ff;
   --minimap-video: #43b996;
+  --minimap-audio: #e0a84f;
   --minimap-text: #919cab;
   --minimap-node-stroke: rgb(255 255 255 / 0.2);
   --minimap-viewport-fill: rgb(107 141 255 / 0.16);
