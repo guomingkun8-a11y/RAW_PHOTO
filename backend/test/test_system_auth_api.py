@@ -144,6 +144,7 @@ class SystemAuthApiTests(unittest.TestCase):
             mock.patch.object(system_module, "require_admin", return_value=ADMIN_IDENTITY),
             mock.patch.object(system_module.system_announcement_service, "create_announcement", return_value=created) as create_announcement,
             mock.patch.object(system_module, "_record_system_audit"),
+            mock.patch.object(system_module.realtime_event_service, "publish") as publish,
         ):
             response = self.client.post(
                 "/api/system/announcements",
@@ -154,6 +155,35 @@ class SystemAuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["id"], 7)
         self.assertEqual(create_announcement.call_args.kwargs["created_by"], "admin-1")
+        publish.assert_called_once_with("announcement", created)
+
+    def test_unpublished_announcement_is_not_broadcast(self) -> None:
+        created = {"id": 8, "title": "未发布", "content": "仅管理员可见", "type": "info", "enabled": False}
+        with (
+            mock.patch.object(system_module, "require_admin", return_value=ADMIN_IDENTITY),
+            mock.patch.object(system_module.system_announcement_service, "create_announcement", return_value=created),
+            mock.patch.object(system_module, "_record_system_audit"),
+            mock.patch.object(system_module.realtime_event_service, "publish") as publish,
+        ):
+            response = self.client.post("/api/system/announcements", headers=AUTH_HEADERS, json=created)
+        self.assertEqual(response.status_code, 200)
+        publish.assert_not_called()
+
+    def test_update_and_disable_emit_only_public_content(self) -> None:
+        for enabled, method in ((True, "PATCH"), (False, "PATCH"), (False, "DELETE")):
+            with self.subTest(enabled=enabled, method=method):
+                item = {"id": 9, "title": "公告", "content": "公告内容", "type": "info", "enabled": enabled}
+                with (
+                    mock.patch.object(system_module, "require_admin", return_value=ADMIN_IDENTITY),
+                    mock.patch.object(system_module.system_announcement_service, "update_announcement", return_value=item),
+                    mock.patch.object(system_module.system_announcement_service, "disable_announcement", return_value=item),
+                    mock.patch.object(system_module, "_record_system_audit"),
+                    mock.patch.object(system_module.realtime_event_service, "publish") as publish,
+                ):
+                    options = {"json": {"enabled": enabled}} if method == "PATCH" else {}
+                    response = self.client.request(method, "/api/system/announcements/9", headers=AUTH_HEADERS, **options)
+                self.assertEqual(response.status_code, 200)
+                publish.assert_called_once_with("announcement", item if enabled else {"id": 9, "enabled": False})
 
 
 if __name__ == "__main__":

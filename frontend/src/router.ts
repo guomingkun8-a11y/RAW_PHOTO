@@ -19,6 +19,8 @@ const routes: RouteRecordRaw[] = [
   { path: "/monitoring", name: "monitoring", component: () => import("@/pages/MonitoringPage.vue"), meta: { role: "admin" } },
   { path: "/costs", name: "costs", component: () => import("@/pages/CostsPage.vue"), meta: { role: "admin" } },
   { path: "/users", name: "users", component: () => import("@/pages/UsersPage.vue"), meta: { role: "admin" } },
+  { path: "/system-management", name: "system-management", component: () => import("@/pages/SystemManagementPage.vue"), meta: { superAdmin: true } },
+  { path: "/feedback", name: "feedback", component: () => import("@/features/feedback/pages/FeedbackAdminPage.vue"), meta: { role: "admin" } },
   { path: "/:pathMatch(.*)*", redirect: "/image" },
 ];
 
@@ -47,6 +49,7 @@ router.beforeEach(async (to) => {
     };
   }
   if (to.meta.role && to.meta.role !== session.role) return "/image";
+  if (to.meta.superAdmin && (session.role !== "admin" || session.subjectId !== "local-admin")) return "/image";
   return true;
 });
 

@@ -8,16 +8,18 @@ from pydantic import BaseModel, Field
 from api.ai import filter_or_log
 from api.support import require_identity
 from services.ecommerce.ecommerce_agent_service import cancel_agent_run, get_agent_run, run_professional_prompt_agent, stream_agent_run_events
-from services.ecommerce.cow_agent_runtime_service import get_cow_agent_result
+from services.ecommerce.cow_agent_runtime_service import get_cow_agent_result, start_prompt_analysis_run
+from services.ecommerce.agent_queue_service import AgentQueueFull, AgentQueueUnavailable
 from services.ecommerce.ecommerce_prompt_router import build_adaptive_image_prompt
 from services.ecommerce.ecommerce_scene_template_service import public_scene_templates
 from services.platform.log_service import LoggedCall
-from services.ecommerce.prompt_analysis_service import analyze_image_prompt
+from services.image.reference_limits import MAX_REFERENCE_IMAGES
 
 
 class PromptAnalysisImage(BaseModel):
     name: str = Field(default="", max_length=120)
     data_url: str = Field(default="", alias="dataUrl")
+    url: str = Field(default="", max_length=2000)
 
     class Config:
         populate_by_name = True
@@ -41,7 +43,7 @@ class PromptAnalysisRequest(BaseModel):
     prompt: str = ""
     model: str = ""
     product: PromptAnalysisProduct | None = None
-    images: list[PromptAnalysisImage] = Field(default_factory=list, min_length=1, max_length=4)
+    images: list[PromptAnalysisImage] = Field(default_factory=list, min_length=1, max_length=MAX_REFERENCE_IMAGES)
 
 
 class ProfessionalPromptRequest(BaseModel):
@@ -51,7 +53,7 @@ class ProfessionalPromptRequest(BaseModel):
     platform: str = Field(default="general", max_length=80)
     preserve_subject: bool = Field(default=True, alias="preserveSubject")
     product: PromptAnalysisProduct | None = None
-    images: list[PromptAnalysisImage] = Field(default_factory=list, max_length=4)
+    images: list[PromptAnalysisImage] = Field(default_factory=list, max_length=MAX_REFERENCE_IMAGES)
 
     class Config:
         populate_by_name = True
@@ -132,6 +134,8 @@ def create_router() -> APIRouter:
     @router.post("/api/image-prompt/analyze")
     async def analyze_prompt(body: PromptAnalysisRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
+        if any(not image.data_url.strip() and not image.url.strip() for image in body.images):
+            raise HTTPException(status_code=400, detail={"error": "each reference image must include a data URL or HTTP URL"})
         call = LoggedCall(
             identity,
             "/api/image-prompt/analyze",
@@ -145,7 +149,16 @@ def create_router() -> APIRouter:
             payload = body.model_dump(mode="python", by_alias=False)
             payload["billing_owner_id"] = identity.get("id") or identity.get("username")
             payload["billing_local_source"] = "image_prompt"
-            return await call.run(analyze_image_prompt, payload)
+
+            def enqueue(value: dict):
+                try:
+                    return start_prompt_analysis_run(value, identity=identity)
+                except AgentQueueFull as exc:
+                    raise HTTPException(status_code=429, detail={"error": str(exc)}) from exc
+                except AgentQueueUnavailable as exc:
+                    raise HTTPException(status_code=503, detail={"error": str(exc)}) from exc
+
+            return await call.run(enqueue, payload)
         except HTTPException:
             raise
         except Exception as exc:

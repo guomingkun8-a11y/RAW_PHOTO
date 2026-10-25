@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from curl_cffi import CurlMime, requests
 from fastapi import HTTPException
@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from services.platform.config import config
 from services.image.image_size import canvas_media_request_size, normalize_image_size
 from services.image.image_prompt_compliance import ensure_image_prompt_engineered
+from services.image.reference_limits import MAX_GENERATION_REFERENCE_IMAGES
 from services.providers.openai_relay_pool import (
     RelaySubmissionUnknownHTTPException,
     RelaySubmittedHTTPException,
@@ -26,6 +27,8 @@ from utils.log import logger
 
 STREAM_TIMEOUT_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 300
+MEDIA_RECONCILIATION_MAX_SECONDS = 1800
+MEDIA_RECONCILIATION_POLL_INTERVAL_SECONDS = 2
 TT_IMAGE_2_5_VERSIONS = {
     "gpt-image-2.5-flare": "flare",
     "gpt-image-2.5-sunburst": "sunburst",
@@ -110,7 +113,7 @@ MEDIA_IMAGE_ASPECT_RATIOS = {
 MEDIA_IMAGE_SIZE_OPTIONS = ("0.5K", "1K", "2K", "4K")
 MEDIA_IMAGE_QUALITY_OPTIONS = ("auto", "high", "medium", "low")
 MEDIA_IMAGE_THINKING_OPTIONS = ("minimal", "high")
-MAX_MEDIA_REFERENCE_IMAGES = 14
+MAX_MEDIA_REFERENCE_IMAGES = MAX_GENERATION_REFERENCE_IMAGES
 
 
 def settings() -> dict[str, object]:
@@ -279,6 +282,7 @@ def image_generations(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[st
                 "aspect_ratio",
                 "image_size",
                 "thinking_level",
+                "_defer_media_poll",
             } and value is not None
         }
         payload["prompt"] = ensure_image_prompt_engineered(
@@ -540,7 +544,7 @@ def _sanitize_reconciliation_value(value: object, *, depth: int = 0) -> object:
 
 
 def _submission_reconciliation_metadata(
-    response: requests.Response,
+    response: requests.Response | None,
     response_data: object,
     request_payload: dict[str, Any],
     *,
@@ -568,7 +572,7 @@ def _submission_reconciliation_metadata(
             break
     account = current_relay_account()
     return {
-        "http_status": int(response.status_code),
+        "http_status": int(getattr(response, "status_code", 0) or 0),
         "upstream_request_id": request_id,
         "request_digest": request_digest,
         "relay_account_id": str(getattr(account, "id", "") or ""),
@@ -790,6 +794,31 @@ def _get_media_status(task_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=502, detail={"error": "media status endpoint is unavailable"})
 
 
+def _get_media_status_from_pool(task_id: str) -> dict[str, Any]:
+    """Query one known upstream task without holding a relay lease between polls."""
+
+    return run_with_relay_pool(
+        settings(),
+        "media_status",
+        lambda: _get_media_status(task_id),
+    )
+
+
+def get_media_image_task_status(task_id: str) -> dict[str, Any]:
+    data = _get_media_status_from_pool(task_id)
+    if not _media_task_finished(data):
+        return {"state": "pending"}
+    if _media_task_failed(data):
+        return {"state": "failed", "error": _media_error_text(data)}
+    urls = _media_result_urls(_media_status_payload(data))
+    if not urls:
+        return {"state": "pending"}
+    cost = _media_cost(data)
+    if cost is None:
+        _log_missing_media_cost(task_id, data)
+    return {"state": "success", "url": urls[0], "cost": cost}
+
+
 def generate_media_task(
     body: dict[str, Any],
     *,
@@ -914,8 +943,150 @@ def _poll_media_image_task(task_id: str) -> dict[str, Any]:
             detail={"error": f"media generation failed: {_media_error_text(data)}"},
         )
         error.upstream_finished = True
+        payload = _media_status_payload(data)
+        refund_state = payload.get("refunded", data.get("refunded"))
+        error_text = _media_error_text(data)
+        error.refunded = refund_state is True or (
+            refund_state is None
+            and ("已退款" in error_text or "charge refunded" in error_text.lower())
+        )
         raise error
     raise HTTPException(status_code=504, detail={"error": f"media generation timed out: {_media_error_text(last_status)}"})
+
+
+def reconcile_media_image_tasks(
+    task_ids: list[str],
+    *,
+    timeout_seconds: int = MEDIA_RECONCILIATION_MAX_SECONDS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Poll already-submitted media tasks without submitting them again."""
+
+    normalized_ids = list(dict.fromkeys(str(task_id).strip() for task_id in task_ids if str(task_id).strip()))
+    if not normalized_ids:
+        raise HTTPException(status_code=400, detail={"error": "upstream task_id is required"})
+    timeout = max(30, min(MEDIA_RECONCILIATION_MAX_SECONDS, int(timeout_seconds or MEDIA_RECONCILIATION_MAX_SECONDS)))
+    deadline = time.monotonic() + timeout
+    pending = list(normalized_ids)
+    completed: dict[str, dict[str, Any]] = {}
+    last_errors: dict[str, str] = {}
+
+    def notify() -> None:
+        if not callable(progress_callback):
+            return
+        try:
+            progress_callback({
+                "completed": len(completed),
+                "pending": len(pending),
+                "total": len(normalized_ids),
+            })
+        except Exception:
+            pass
+
+    notify()
+    while pending and time.monotonic() <= deadline:
+        next_pending: list[str] = []
+        for task_id in pending:
+            if time.monotonic() > deadline:
+                next_pending.append(task_id)
+                continue
+            try:
+                data = _get_media_status_from_pool(task_id)
+            except HTTPException as exc:
+                status_code = int(getattr(exc, "status_code", 0) or 0)
+                if status_code not in {408, 429} and status_code < 500:
+                    raise RelaySubmittedHTTPException(
+                        status_code=status_code or 502,
+                        detail=exc.detail,
+                        upstream_task_ids=pending,
+                        submission_uncertain=True,
+                    ) from exc
+                last_errors[task_id] = str(exc.detail or exc)
+                next_pending.append(task_id)
+                continue
+            except Exception as exc:
+                last_errors[task_id] = str(exc)
+                next_pending.append(task_id)
+                continue
+
+            if not _media_task_finished(data):
+                next_pending.append(task_id)
+                continue
+            payload = _media_status_payload(data)
+            result_urls = _media_result_urls(payload)
+            if _media_task_failed(data):
+                error = HTTPException(
+                    status_code=422,
+                    detail={"error": f"media generation failed: {_media_error_text(data)}"},
+                )
+                error.upstream_finished = True
+                refund_state = payload.get("refunded", data.get("refunded"))
+                error.refunded = refund_state is True
+                raise RelaySubmittedHTTPException(
+                    status_code=422,
+                    detail=error.detail,
+                    upstream_task_ids=[task_id],
+                    submission_uncertain=False,
+                    upstream_finished=True,
+                    refunded=bool(getattr(error, "refunded", False)),
+                ) from error
+            if not result_urls:
+                raise RelaySubmittedHTTPException(
+                    status_code=502,
+                    detail={"error": "media generation completed without a result URL"},
+                    upstream_task_ids=[task_id],
+                    submission_uncertain=False,
+                    upstream_finished=True,
+                )
+            cost = _media_cost(data)
+            if cost is None:
+                _log_missing_media_cost(task_id, data)
+            completed[task_id] = {"result_urls": result_urls, "cost": cost}
+        pending = next_pending
+        notify()
+        if not pending:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(MEDIA_RECONCILIATION_POLL_INTERVAL_SECONDS, remaining))
+        notify()
+
+    if pending:
+        detail = {
+            "error": f"media generation timed out after {timeout} seconds while reconciling upstream tasks",
+            "pending_task_ids": pending,
+        }
+        if last_errors:
+            detail["last_status_errors"] = last_errors
+        raise RelaySubmittedHTTPException(
+            status_code=504,
+            detail=detail,
+            upstream_task_ids=pending,
+            submission_uncertain=True,
+        )
+
+    result_urls: list[str] = []
+    total_cost = 0.0
+    has_complete_cost = True
+    for task_id in normalized_ids:
+        result = completed[task_id]
+        urls = result.get("result_urls") or []
+        result_urls.extend(str(url).strip() for url in urls[:1] if str(url or "").strip())
+        cost = result.get("cost")
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            total_cost += float(cost)
+        else:
+            has_complete_cost = False
+    result = {
+        "created": int(time.time()),
+        "data": [{"url": url} for url in result_urls],
+        "_media_task_id": normalized_ids[0],
+        "_media_task_ids": normalized_ids,
+    }
+    if has_complete_cost:
+        result["cost"] = total_cost
+    return result
 
 
 def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
@@ -945,14 +1116,16 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
         requested_size=requested_size,
         reference_urls=reference_urls,
     )
+    progress_callback = body.get("progress_callback")
     task_ids: list[str] = []
     for image_index in range(requested_count):
+        request_payload = {
+            "model": upstream_model,
+            "prompt": _media_batch_prompt(prompt, image_index, requested_count),
+            "params": dict(params),
+        }
+        response: requests.Response | None = None
         try:
-            request_payload = {
-                "model": upstream_model,
-                "prompt": _media_batch_prompt(prompt, image_index, requested_count),
-                "params": dict(params),
-            }
             response = requests.post(
                 _url("/v1/media/generate"),
                 headers=_headers({"Content-Type": "application/json"}),
@@ -976,6 +1149,13 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
                 )
                 if task_ids:
                     reconciliation["accepted_task_ids"] = list(task_ids)
+                    raise RelaySubmittedHTTPException(
+                        status_code=502,
+                        detail={"error": "media generation was accepted but a later response did not include task_id"},
+                        upstream_task_ids=task_ids,
+                        submission_uncertain=True,
+                        reconciliation=reconciliation,
+                    ) from exc
                 raise RelaySubmissionUnknownHTTPException(
                     detail={"error": "media generation was accepted but the response did not include task_id"},
                     reconciliation=reconciliation,
@@ -983,7 +1163,44 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
             task_ids.append(task_id)
         except RelaySubmissionUnknownHTTPException:
             raise
+        except requests.RequestsError as exc:
+            reconciliation = _submission_reconciliation_metadata(
+                None, None, request_payload,
+                image_index=image_index, requested_count=requested_count,
+            )
+            reconciliation["accepted_task_ids"] = list(task_ids)
+            reconciliation["last_error"] = str(exc)[:500]
+            if task_ids:
+                raise RelaySubmittedHTTPException(
+                    status_code=502,
+                    detail={"error": "media submission response was interrupted; upstream acceptance is unknown"},
+                    upstream_task_ids=task_ids,
+                    submission_uncertain=True,
+                    reconciliation=reconciliation,
+                ) from exc
+            raise RelaySubmissionUnknownHTTPException(
+                detail={"error": "media submission response was interrupted; upstream acceptance is unknown"},
+                reconciliation=reconciliation,
+            ) from exc
         except HTTPException as exc:
+            if exc.status_code in {408, 429, 500, 502, 503, 504}:
+                reconciliation = _submission_reconciliation_metadata(
+                    response, _try_response_json(response) if response is not None else None, request_payload,
+                    image_index=image_index, requested_count=requested_count,
+                )
+                reconciliation["accepted_task_ids"] = list(task_ids)
+                if task_ids:
+                    raise RelaySubmittedHTTPException(
+                        status_code=exc.status_code,
+                        detail=exc.detail,
+                        upstream_task_ids=task_ids,
+                        submission_uncertain=True,
+                        reconciliation=reconciliation,
+                    ) from exc
+                raise RelaySubmissionUnknownHTTPException(
+                    detail={"error": "media submission result is uncertain; do not submit again automatically"},
+                    reconciliation=reconciliation,
+                ) from exc
             if task_ids:
                 raise RelaySubmittedHTTPException(
                     status_code=exc.status_code,
@@ -992,7 +1209,14 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
                     submission_uncertain=True,
                 ) from exc
             raise
-    progress_callback = body.get("progress_callback")
+    if body.get("_defer_media_poll"):
+        return {
+            "created": int(time.time()),
+            "data": [],
+            "_media_pending": True,
+            "_media_task_id": task_ids[0],
+            "_media_task_ids": task_ids,
+        }
     if callable(progress_callback):
         progress_callback("image_stream_resolve_start")
     result_urls: list[str] = []
@@ -1009,6 +1233,7 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
                 upstream_task_ids=task_ids,
                 submission_uncertain=not upstream_finished,
                 upstream_finished=upstream_finished,
+                refunded=bool(getattr(exc, "refunded", False)),
             ) from exc
         urls = media_result.get("result_urls") or [media_result.get("result_url")]
         result_urls.extend(str(url).strip() for url in urls[:1] if str(url or "").strip())
@@ -1048,6 +1273,7 @@ def _image_generations_with_reference_images(
             "aspect_ratio",
             "image_size",
             "thinking_level",
+            "_defer_media_poll",
         } and value is not None
     }
     payload["prompt"] = ensure_image_prompt_engineered(
@@ -1192,6 +1418,7 @@ def image_edits(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any
                 "aspect_ratio",
                 "image_size",
                 "thinking_level",
+                "_defer_media_poll",
             } and value is not None
         }
         if _relay_uses_generations_for_image_edits():

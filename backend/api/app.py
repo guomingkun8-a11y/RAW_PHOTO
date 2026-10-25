@@ -8,12 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from api import ai, audio_generation, billing, business, canvas, events, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system, video_agent, video_compositions, video_generation
+from api.feedback import routes as feedback
+from api.platform import alerts, navigation
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
 from services.platform.config import config
 from services.platform.database_maintenance import ensure_database_ready, start_database_maintenance_scheduler
 from services.billing.upstream_usage_service import start_upstream_usage_scheduler
-from services.image.image_storage_service import image_storage_service
 from services.image.image_service import start_image_cleanup_scheduler
 from utils.log import logger
 
@@ -32,10 +33,15 @@ def create_app() -> FastAPI:
         database_thread = start_database_maintenance_scheduler(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         upstream_usage_thread = start_upstream_usage_scheduler(stop_event)
-        image_storage_service.cleanup_old_images()
+        try:
+            await feedback.feedback_realtime.start()
+        except Exception as exc:
+            logger.info({"event": "feedback_start_failed", "error_type": type(exc).__name__})
         try:
             yield
         finally:
+            await feedback.feedback_realtime.stop()
+            feedback.feedback_service.store.close()
             stop_event.set()
             database_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
@@ -61,6 +67,7 @@ def create_app() -> FastAPI:
     app.include_router(business.create_router())
     app.include_router(image_tasks.create_router())
     app.include_router(events.create_router())
+    app.include_router(feedback.create_router())
     app.include_router(video_generation.create_router())
     app.include_router(video_compositions.create_router())
     app.include_router(video_agent.create_router())
@@ -71,6 +78,8 @@ def create_app() -> FastAPI:
     app.include_router(prompt_analysis.create_router())
     app.include_router(image_agent.create_router())
     app.include_router(monitoring.create_router())
+    app.include_router(alerts.create_router())
+    app.include_router(navigation.create_router())
     app.include_router(billing.create_router())
     app.include_router(system.create_router(app_version))
 

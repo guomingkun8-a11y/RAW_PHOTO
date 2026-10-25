@@ -421,6 +421,101 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         self.assertEqual(result["_media_task_id"], "cost-task")
         self.assertEqual(get.call_args.args[0], "https://relay.example/v1/media/status")
 
+    def test_media_image_model_can_defer_status_polling(self):
+        progress_steps: list[str] = []
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "post",
+                return_value=FakeResponse(payload={"code": 200, "data": {"task_id": "deferred-task"}}),
+            ) as post,
+            mock.patch.object(openai_relay_service.requests, "get") as get,
+        ):
+            result = openai_relay_service.image_generations({
+                "model": "gemini-3.1-flash-image-preview",
+                "prompt": "cat",
+                "_defer_media_poll": True,
+                "progress_callback": progress_steps.append,
+            })
+
+        self.assertTrue(result["_media_pending"])
+        self.assertEqual(result["_media_task_ids"], ["deferred-task"])
+        self.assertEqual(post.call_count, 1)
+        get.assert_not_called()
+        self.assertEqual(progress_steps, [])
+
+    def test_reconcile_media_image_tasks_polls_known_tasks_without_submitting(self):
+        with (
+            mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+            mock.patch.object(
+                openai_relay_service,
+                "run_with_relay_pool",
+                side_effect=lambda _settings, _operation, action: action(),
+            ),
+            mock.patch.object(
+                openai_relay_service.requests,
+                "get",
+                side_effect=[
+                    FakeResponse(payload={"data": {"status": "processing"}}),
+                    FakeResponse(payload={
+                        "data": {
+                            "is_final": True,
+                            "status": "success",
+                            "result_url": "https://cdn.example.test/reconciled.png",
+                            "cost": "1.5",
+                        }
+                    }),
+                ],
+            ) as get,
+            mock.patch.object(openai_relay_service.time, "sleep"),
+        ):
+            result = openai_relay_service.reconcile_media_image_tasks(["known-task"])
+
+        self.assertEqual(result["data"], [{"url": "https://cdn.example.test/reconciled.png"}])
+        self.assertEqual(result["cost"], 1.5)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs["params"], {"task_id": "known-task"})
+
+    def test_media_reference_read_failure_preserves_refund_confirmation(self):
+        failures = [
+            ("参考图处理失败: read tcp: connection reset by peer（已退款）", None, True),
+            ("参考图处理失败: unexpected EOF", True, True),
+            ("参考图处理失败: unexpected EOF（已退款）", False, False),
+        ]
+        for message, refunded, expected_refunded in failures:
+            with self.subTest(message=message):
+                with (
+                    mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+                    mock.patch.object(
+                        openai_relay_service.requests,
+                        "post",
+                        return_value=FakeResponse(payload={"data": {"task_id": "reference-task"}}),
+                    ),
+                    mock.patch.object(
+                        openai_relay_service.requests,
+                        "get",
+                        return_value=FakeResponse(payload={"data": {
+                            "is_final": True,
+                            "status": "failed",
+                            "error": message,
+                            **({"refunded": refunded} if refunded is not None else {}),
+                        }}),
+                    ),
+                ):
+                    with self.assertRaises(openai_relay_pool.RelaySubmittedHTTPException) as raised:
+                        openai_relay_service.image_generations({
+                            "model": "banana-2",
+                            "prompt": "product photo",
+                            "n": 1,
+                        })
+
+                self.assertEqual(raised.exception.status_code, 422)
+                self.assertTrue(raised.exception.upstream_finished)
+                self.assertFalse(raised.exception.submission_uncertain)
+                self.assertEqual(raised.exception.refunded, expected_refunded)
+                self.assertEqual(raised.exception.upstream_task_ids, ["reference-task"])
+
     def test_gpt_image_2_uses_tt_image_2_media_task_api_and_returns_cost(self):
         with (
             mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),

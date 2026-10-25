@@ -29,6 +29,9 @@ legacy/react-web/tsconfig.tsbuildinfo
 legacy/react-web-dist/
 
 data/
+logs/
+tmp/
+.tmp/
 
 # Local runtime databases and generated test reports
 *.sqlite
@@ -43,6 +46,7 @@ htmlcov/
 *.log
 *.out
 *.err
+*.jsonl
 qn-regions-cache.jsonl
 scripts/*load-result*.json
 backend/=

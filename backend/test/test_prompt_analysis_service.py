@@ -88,6 +88,28 @@ class PromptAnalysisServiceTests(unittest.TestCase):
         self.assertEqual("tt-5.6-sol", post.call_args.kwargs["json"]["model"])
         self.assertNotIn("temperature", post.call_args.kwargs["json"])
 
+    def test_reference_validation_accepts_twenty_http_urls(self):
+        images = [
+            {"name": f"reference-{index}.png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(20)
+        ]
+
+        result = prompt_analysis_service.validate_reference_images(images)
+
+        self.assertEqual(20, len(result))
+        self.assertEqual("https://cdn.example.test/0.png", result[0]["data_url"])
+
+    def test_reference_validation_rejects_twenty_one_images(self):
+        images = [
+            {"name": f"reference-{index}.png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(21)
+        ]
+
+        with self.assertRaises(Exception) as ctx:
+            prompt_analysis_service.validate_reference_images(images)
+
+        self.assertIn("supports up to 20", str(ctx.exception))
+
     def test_analyze_prompt_marks_multi_image_selling_point_request(self):
         response = mock.Mock(status_code=200)
         response.json.return_value = {

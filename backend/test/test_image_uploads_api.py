@@ -65,6 +65,43 @@ class ImageUploadsApiTests(unittest.TestCase):
         self.assertEqual(payload["uploaded"], 1)
         self.assertEqual(payload["cache_hits"], 1)
 
+    def test_preupload_accepts_twenty_images(self):
+        results = [
+            ReferenceUploadResult(
+                url=f"https://cdn.example.test/{index}.png",
+                sha256=f"{index:064x}",
+                filename=f"{index}.png",
+                mime_type="image/png",
+                file_size=3,
+                cached=False,
+                upload_ms=1,
+            )
+            for index in range(20)
+        ]
+        with (
+            mock.patch.object(image_uploads_module.reference_image_uploader, "upload_images_detailed", return_value=results),
+            mock.patch.object(image_uploads_module.reference_image_uploader, "metrics_snapshot", return_value={}),
+        ):
+            response = self.client.post(
+                "/api/image-references/preupload",
+                headers=AUTH_HEADERS,
+                files=[("images", (f"{index}.png", b"img", "image/png")) for index in range(20)],
+            )
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(20, response.json()["total"])
+
+    def test_preupload_rejects_twenty_one_images(self):
+        with mock.patch.object(image_uploads_module.reference_image_uploader, "upload_images_detailed") as upload:
+            response = self.client.post(
+                "/api/image-references/preupload",
+                headers=AUTH_HEADERS,
+                files=[("images", (f"{index}.png", b"img", "image/png")) for index in range(21)],
+            )
+
+        self.assertEqual(400, response.status_code, response.text)
+        upload.assert_not_called()
+
 
 class AgentVideoUploadsApiTests(unittest.TestCase):
     def setUp(self):

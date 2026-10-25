@@ -6,12 +6,16 @@ import math
 import threading
 import time
 from typing import Any, Callable, Iterator
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from curl_cffi import requests
 
 from services.platform.config import config
 from services.platform.proxy_service import proxy_settings
+from services.video.video_generation_models import (
+    video_generation_media_spec,
+    video_generation_provider_model,
+)
 
 
 REQUEST_TIMEOUT_SECONDS = 120
@@ -302,10 +306,120 @@ def _error_text(data: dict[str, Any]) -> str:
         if not isinstance(item, dict):
             continue
         for key in ("error", "message", "msg", "fail_reason", "failure_reason"):
-            value = _clean(item.get(key), limit=1000)
+            raw_value = item.get(key)
+            if isinstance(raw_value, dict):
+                value = _clean(raw_value.get("message") or raw_value.get("msg") or raw_value.get("code"), limit=1000)
+            else:
+                value = _clean(raw_value, limit=1000)
             if value:
                 return value
     return json.dumps(data, ensure_ascii=False)[:1000]
+
+
+_SEEDANCE_20_MODEL = "seedance-2.0-guanfang"
+_SEEDANCE_20_RESOLUTIONS = {"480p", "720p", "1080p", "4k"}
+_SEEDANCE_20_RATIOS = {"adaptive", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"}
+
+
+def _seedance_20_resolution(value: object) -> str:
+    normalized = _clean(value, "720p", 20).lower()
+    if normalized == "4k":
+        normalized = "4k"
+    if normalized not in _SEEDANCE_20_RESOLUTIONS:
+        raise VideoGenerationProviderError(
+            f"Seedance 2.0 does not support resolution: {value}",
+        )
+    return normalized
+
+
+def _seedance_20_duration(value: object) -> int:
+    normalized = _clean(value, "5", 20).lower()
+    if normalized == "auto":
+        return -1
+    try:
+        duration = int(normalized)
+    except (TypeError, ValueError):
+        raise VideoGenerationProviderError("Seedance 2.0 duration must be 4-15 or auto") from None
+    if duration < 4 or duration > 15:
+        raise VideoGenerationProviderError("Seedance 2.0 duration must be 4-15 or auto")
+    return duration
+
+
+def _seedance_20_content(
+    prompt: str,
+    params: dict[str, Any],
+    image_urls: list[str],
+    video_urls: list[str],
+    audio_urls: list[str],
+) -> list[dict[str, Any]]:
+    mode = _clean(params.get("mode"), "cankaosheng", 40)
+    content: list[dict[str, Any]] = []
+    if prompt:
+        content.append({"type": "text", "text": prompt})
+    if mode == "shouweizhen":
+        if video_urls or audio_urls:
+            raise VideoGenerationProviderError("Seedance 2.0 first/last-frame mode does not accept video or audio references")
+        if len(image_urls) > 2:
+            raise VideoGenerationProviderError("Seedance 2.0 first/last-frame mode supports at most 2 images")
+        roles = ("first_frame", "last_frame")
+        for index, url in enumerate(image_urls):
+            content.append({
+                "type": "image_url",
+                "role": roles[index],
+                "image_url": {"url": url},
+            })
+        return content
+
+    for url in image_urls:
+        content.append({
+            "type": "image_url",
+            "role": "reference_image",
+            "image_url": {"url": url},
+        })
+    for url in video_urls:
+        content.append({
+            "type": "video_url",
+            "role": "reference_video",
+            "video_url": {"url": url},
+        })
+    for url in audio_urls:
+        content.append({
+            "type": "audio_url",
+            "role": "reference_audio",
+            "audio_url": {"url": url},
+        })
+    return content
+
+
+def _seedance_20_payload(
+    model: str,
+    prompt: str,
+    params: dict[str, Any],
+    image_urls: list[str],
+    video_urls: list[str],
+    audio_urls: list[str],
+) -> dict[str, Any]:
+    version = _clean(params.get("version"), "标准", 40)
+    provider_model = video_generation_provider_model(model, params)
+    resolution = _seedance_20_resolution(params.get("resolution"))
+    if provider_model != "doubao-seedance-2-0-260128" and resolution in {"1080p", "4k"}:
+        raise VideoGenerationProviderError(
+            "Seedance 2.0 快速版和 Mini 版仅支持 480p / 720p，请切换为标准版",
+        )
+    ratio = _clean(params.get("aspect_ratio") or params.get("ratio"), "adaptive", 20)
+    if ratio not in _SEEDANCE_20_RATIOS:
+        raise VideoGenerationProviderError(f"Seedance 2.0 does not support aspect ratio: {ratio}")
+    payload: dict[str, Any] = {
+        "model": provider_model,
+        "content": _seedance_20_content(prompt, params, image_urls, video_urls, audio_urls),
+        "resolution": resolution,
+        "ratio": ratio,
+        "duration": _seedance_20_duration(params.get("duration")),
+    }
+    callback_url = _clean(params.get("callback_url"), limit=2000)
+    if callback_url.startswith(("http://", "https://")):
+        payload["callback_url"] = callback_url
+    return payload
 
 
 def submit_video_generation(body: dict[str, Any]) -> dict[str, Any]:
@@ -338,9 +452,31 @@ def submit_video_generation(body: dict[str, Any]) -> dict[str, Any]:
         for key, value in params_source.items()
         if value is not None and _clean(key)
     }
+    media_spec = video_generation_media_spec(model, params)
     image_urls = body.get("image_urls")
+    video_urls = body.get("reference_video_urls")
+    audio_urls = body.get("reference_audio_urls")
+    image_param = _clean(media_spec.get("image_input_param"), "images", 80)
+    video_param = _clean(media_spec.get("video_input_param"), "", 80)
+    video_shape = _clean(media_spec.get("video_input_shape"), "list", 20)
+    audio_param = _clean(media_spec.get("audio_input_param"), "", 80)
+    audio_shape = _clean(media_spec.get("audio_input_shape"), "list", 20)
     if isinstance(image_urls, list) and image_urls:
-        params["images"] = list(image_urls)
+        params[image_param] = list(image_urls)
+    if isinstance(video_urls, list) and video_urls:
+        if not video_param:
+            raise VideoGenerationProviderError(f"{model} does not support reference videos")
+        params[video_param] = video_urls[0] if video_shape == "scalar" else list(video_urls)
+    if isinstance(audio_urls, list) and audio_urls:
+        if not audio_param:
+            raise VideoGenerationProviderError(f"{model} does not support reference audio")
+        params[audio_param] = audio_urls[0] if audio_shape == "scalar" else list(audio_urls)
+    reference_mode_param = _clean(media_spec.get("reference_mode_param"), "", 80)
+    if reference_mode_param:
+        if video_urls:
+            params.setdefault(reference_mode_param, params.get(reference_mode_param) or "quan_neng")
+        else:
+            params.pop(reference_mode_param, None)
     url = _url(settings, settings.get("submit_path"))
     headers = _headers(api_key)
     session_kwargs = proxy_settings.build_session_kwargs()
@@ -356,11 +492,16 @@ def submit_video_generation(body: dict[str, Any]) -> dict[str, Any]:
                 credential_id=credential_id,
                 cost=previous_cost,
             ) from None
+    request_payload = (
+        _seedance_20_payload(model, prompt, params, list(image_urls or []), list(video_urls or []), list(audio_urls or []))
+        if model == _SEEDANCE_20_MODEL
+        else {"model": model, "prompt": prompt, "params": params}
+    )
     try:
         response = requests.post(
             url,
             headers=headers,
-            json={"model": model, "prompt": prompt, "params": params},
+            json=request_payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
             allow_redirects=False,
             **session_kwargs,
@@ -423,7 +564,11 @@ def get_video_generation_status(
         if not (settings.get("enabled") and _clean(settings.get("base_url")) and _api_keys(settings)):
             raise VideoGenerationProviderError("video generation provider is not configured")
         api_key = _resolve_api_key(settings, credential_id)
-        url = _url(settings, settings.get("status_path"))
+        status_path = _clean(settings.get("status_path"))
+        has_path_task_id = "{id}" in status_path
+        if has_path_task_id:
+            status_path = status_path.replace("{id}", quote(task_id, safe=""))
+        url = _url(settings, status_path)
     except VideoGenerationProviderError as exc:
         exc.upstream_task_id = task_id
         exc.credential_id = credential_id
@@ -434,7 +579,7 @@ def get_video_generation_status(
         response = requests.get(
             url,
             headers=_headers(api_key),
-            params={"task_id": task_id},
+            params=None if has_path_task_id else {"task_id": task_id},
             timeout=30,
             allow_redirects=False,
             **session_kwargs,

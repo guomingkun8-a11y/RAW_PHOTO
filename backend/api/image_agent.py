@@ -24,6 +24,7 @@ from services.ecommerce.professional_video_service import (
     ProfessionalVideoUploadError,
     professional_video_asset_service,
 )
+from services.image.reference_limits import MAX_REFERENCE_IMAGES
 from services.platform.config import config
 
 
@@ -108,7 +109,7 @@ class ImageAgentRequest(BaseModel):
     folder_id: str = Field(default="", alias="folderId", max_length=191)
     use_long_term_memory: bool = Field(default=True, alias="useLongTermMemory")
     product: PromptAnalysisProduct | None = None
-    images: list[ImageAgentReference] = Field(default_factory=list, max_length=4)
+    images: list[ImageAgentReference] = Field(default_factory=list, max_length=MAX_REFERENCE_IMAGES)
     videos: list[ImageAgentVideo] = Field(default_factory=list, max_length=VIDEO_MAX_ITEMS)
     conversation_context: list[ImageAgentConversationContext] = Field(default_factory=list, alias="conversationContext", max_length=6)
 
@@ -118,7 +119,7 @@ class ImageAgentRequest(BaseModel):
 
 class ImageAgentResumeRequest(BaseModel):
     message: str = Field(default="", max_length=4000)
-    images: list[ImageAgentReference] = Field(default_factory=list, max_length=4)
+    images: list[ImageAgentReference] = Field(default_factory=list, max_length=MAX_REFERENCE_IMAGES)
     videos: list[ImageAgentVideo] = Field(default_factory=list, max_length=VIDEO_MAX_ITEMS)
     folder_id: str = Field(default="", alias="folderId", max_length=191)
 

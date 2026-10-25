@@ -98,6 +98,7 @@ function formatCostNumber(value: unknown, explicitUnit = "") {
 
 function displayModel(model: string, requestedModel = "", modelVersion = "") {
   const source = requestedModel || model;
+  if (/^tt-5\.6-sol$/i.test(source)) return "gpt-5.6-sol";
   if (!requestedModel && modelVersion && /image-2\.5/i.test(source)) {
     return `gpt-image-2.5 · ${modelVersion}`;
   }
@@ -133,13 +134,22 @@ function typeClass(value: string) {
 function stateLabel(value: string) {
   if (["success", "succeeded", "completed", "complete"].includes(value)) return "成功";
   if (["failed", "error"].includes(value)) return "失败";
+  if (value === "pending") return "待结算";
+  if (value === "settling") return "结算中";
+  if (value === "unresolved") return "待对账";
   return value || "未知";
 }
 
 function stateClass(value: string) {
-  return ["success", "succeeded", "completed", "complete"].includes(value)
-    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300"
-    : "bg-rose-50 text-rose-700 dark:bg-rose-400/10 dark:text-rose-300";
+  if (["success", "succeeded", "completed", "complete"].includes(value))
+    return "bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-300";
+  if (["failed", "error"].includes(value))
+    return "bg-rose-50 text-rose-700 dark:bg-rose-400/10 dark:text-rose-300";
+  return "bg-amber-50 text-amber-700 dark:bg-amber-400/10 dark:text-amber-300";
+}
+
+function isUnsettled(value: string) {
+  return ["pending", "settling", "unresolved"].includes(value);
 }
 
 function modelCostShare(item: UpstreamBillingModelStat) {
@@ -356,7 +366,7 @@ defineExpose({ refresh });
             <AnimatedNumber :value="summary?.record_count || 0" :formatter="formatNumber" />
           </div>
           <div class="mt-1 text-[11px] text-slate-400">
-            成功 {{ formatNumber(summary?.success_count || 0) }} · 失败 {{ formatNumber(summary?.failed_count || 0) }}
+            成功 {{ formatNumber(summary?.success_count || 0) }} · 失败 {{ formatNumber(summary?.failed_count || 0) }} · 待结算 {{ formatNumber(summary?.unsettled_count || 0) }}
           </div>
         </div>
         <div class="studio-card bg-white px-4 py-4 dark:bg-[#171a21]">
@@ -373,7 +383,7 @@ defineExpose({ refresh });
           <div class="mt-2 text-[30px] font-semibold tabular-nums text-slate-950 dark:text-stone-50">
             <AnimatedNumber :value="summary?.unassigned_count || 0" :formatter="formatNumber" />
           </div>
-          <div class="mt-1 text-[11px] text-slate-400">对话和音频需请求标识才能精确关联员工</div>
+          <div class="mt-1 text-[11px] text-slate-400">旧对话账单缺少请求标识时无法回溯归属</div>
         </div>
       </div>
 
@@ -505,7 +515,7 @@ defineExpose({ refresh });
                   <div class="font-mono text-[11px] text-slate-400">{{ item.owner_id || "未匹配" }}</div>
                 </td>
                 <td class="max-w-[220px] truncate px-3 py-3 font-mono text-[13px] text-slate-700 dark:text-stone-200" :title="displayModel(item.model, item.requested_model, item.model_version)">{{ displayModel(item.model, item.requested_model, item.model_version) }}</td>
-                <td class="px-3 py-3 text-right font-semibold tabular-nums text-slate-950 dark:text-stone-50">{{ formatCost(item.cost, item.unit) }}</td>
+                <td class="px-3 py-3 text-right font-semibold tabular-nums text-slate-950 dark:text-stone-50">{{ isUnsettled(item.state) ? "--" : formatCost(item.cost, item.unit) }}</td>
                 <td class="px-3 py-3 text-right tabular-nums" :class="item.refunded ? 'font-semibold text-emerald-700 dark:text-emerald-300' : 'text-slate-400'">{{ item.refunded ? formatCost(item.refunded_amount, item.unit) : "--" }}</td>
                 <td class="max-w-[180px] truncate px-3 py-3 text-[12px] text-slate-500" :title="item.channel_group">{{ item.channel_group || "--" }}</td>
                 <td class="max-w-[220px] truncate px-3 py-3 font-mono text-[11px] text-slate-500" :title="item.upstream_task_id">{{ item.upstream_task_id }}</td>

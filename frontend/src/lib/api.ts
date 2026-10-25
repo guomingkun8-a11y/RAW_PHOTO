@@ -40,13 +40,56 @@ export type OpenAIRelaySettings = {
 
 export type VideoGenerationDuration = number | "auto";
 
+export type VideoGenerationMediaModeSpec = {
+  image_input_kind?: "none" | "reference" | "first_last_frame" | string;
+  image_input_param?: string;
+  max_images?: number;
+  video_input_kind?: "none" | "reference" | string;
+  video_input_param?: string;
+  video_input_shape?: "list" | "scalar" | string;
+  max_videos?: number;
+  audio_input_kind?: "none" | "reference" | string;
+  audio_input_param?: string;
+  audio_input_shape?: "list" | "scalar" | string;
+  max_audios?: number;
+};
+
 export type VideoGenerationModelSpec = {
   id: string;
   label: string;
-  modes: Array<"text_to_video" | "image_to_video" | string>;
+  modes: Array<"text_to_video" | "image_to_video" | "video_to_video" | string>;
   min_images: number;
   max_images: number;
   image_input_kind?: "none" | "reference" | "first_last_frame" | string;
+  image_input_param?: string;
+  video_input_kind?: "none" | "reference" | string;
+  video_input_param?: string;
+  video_input_shape?: "list" | "scalar" | string;
+  max_videos?: number;
+  audio_input_kind?: "none" | "reference" | string;
+  audio_input_param?: string;
+  audio_input_shape?: "list" | "scalar" | string;
+  max_audios?: number;
+  min_media_inputs?: number;
+  allow_audio_only?: boolean;
+  secondary_option_key?: string;
+  secondary_options?: string[];
+  secondary_default_option?: string;
+  options_by_secondary?: Record<string, string[]>;
+  request_mode_param?: string;
+  request_mode_options?: string[];
+  request_mode_default?: string;
+  request_mode_labels?: Record<string, string>;
+  media_by_request_mode?: Record<string, VideoGenerationMediaModeSpec>;
+  reference_mode_param?: string;
+  reference_mode_options?: string[];
+  reference_mode_default?: string;
+  reference_mode_labels?: Record<string, string>;
+  request_mode?: string;
+  reference_mode?: string;
+  aspect_ratio_param?: string;
+  mode_param?: string;
+  mode_value?: string;
   aspect_ratios: string[];
   durations: VideoGenerationDuration[];
   default_duration: VideoGenerationDuration;
@@ -110,6 +153,10 @@ export type SettingsConfig = {
   };
   video_generation?: {
     enabled?: boolean;
+    configured?: boolean;
+    chat_enabled?: boolean;
+    reference_image_upload_enabled?: boolean;
+    video_upload_enabled?: boolean;
     base_url?: string;
     queue_enabled?: boolean;
     has_api_key?: boolean;
@@ -126,6 +173,8 @@ export type SettingsConfig = {
   };
   [key: string]: unknown;
 };
+
+export type VideoGenerationPublicConfig = NonNullable<SettingsConfig["video_generation"]>;
 
 export type ImageTask = {
   id: string;
@@ -156,6 +205,10 @@ export type ImageTask = {
   duration_ms?: number;
   cost?: number;
   upstream_task_id?: string;
+  cancel_requested?: boolean;
+  cancellation_pending?: boolean;
+  requires_confirmation?: boolean;
+  cancellation_warning?: string;
   stage_timings_ms?: {
     upload?: number;
     queue?: number;
@@ -182,7 +235,7 @@ export type VideoGenerationTask = {
   owner_name?: string;
   owner_username?: string;
   status: "queued" | "running" | "success" | "error" | "canceled";
-  mode: "text_to_video" | "image_to_video" | string;
+  mode: "text_to_video" | "image_to_video" | "video_to_video" | string;
   model?: string;
   prompt?: string;
   aspect_ratio?: string;
@@ -190,6 +243,9 @@ export type VideoGenerationTask = {
   quality?: string;
   resolution?: string;
   image_urls?: string[];
+  reference_video_urls?: string[];
+  reference_audio_urls?: string[];
+  params?: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   data?: Array<{
@@ -471,7 +527,7 @@ export type ImageAgentResult = {
   batchItems?: AgentBatchPlanItem[];
 };
 
-export type AgentRun = {
+export type AgentRun<TResult = ImageAgentResult> = {
   runId: string;
   agent: string;
   status: AgentRunStatus;
@@ -485,7 +541,7 @@ export type AgentRun = {
   events?: AgentEvent[];
   error?: string;
   waitingForInput?: string;
-  result?: ImageAgentResult;
+  result?: TResult;
 };
 
 export type AgentFolderItem = {
@@ -698,7 +754,7 @@ export type SystemAnnouncement = {
   updated_at: string;
 };
 
-export type RealtimeAnnouncementEvent = SystemAnnouncement;
+export type RealtimeAnnouncementEvent = (SystemAnnouncement & { enabled: true }) | { id: number; enabled: false };
 
 export type RealtimeImageTaskProgressEvent = {
   task_id: string;
@@ -707,6 +763,7 @@ export type RealtimeImageTaskProgressEvent = {
   status_group?: string;
   is_final?: boolean;
   progress?: string;
+  cancellation_pending?: boolean;
   result_url?: string;
   result_type?: string;
   error?: string;
@@ -1054,6 +1111,7 @@ export type UpstreamBillingSummary = {
   refunded_amount: number;
   assigned_count: number;
   unassigned_count: number;
+  unsettled_count: number;
   models: UpstreamBillingModelStat[];
   users: UpstreamBillingUserStat[];
   range: MonitoringSummary["range"];
@@ -1363,7 +1421,7 @@ export async function analyzeImagePrompt(body: {
   action: ImagePromptAnalysisAction;
   mode: "single";
   prompt: string;
-  images: Array<{ name: string; dataUrl: string }>;
+  images: Array<{ name: string; dataUrl?: string; url?: string }>;
   product?: {
     name?: string;
     sku?: string;
@@ -1372,7 +1430,7 @@ export async function analyzeImagePrompt(body: {
     sellingPoints?: string;
   };
 }) {
-  return httpRequest<ImagePromptAnalysisResponse>("/api/image-prompt/analyze", {
+  return httpRequest<{ agentRun: AgentRun<ImagePromptAnalysisResponse> }>("/api/image-prompt/analyze", {
     method: "POST",
     body,
   });
@@ -1437,6 +1495,14 @@ export async function fetchAgentVideoStatuses(ids: string[]) {
 export async function retryAgentVideoAnalysis(videoId: string) {
   return httpRequest<{ item: AgentVideoAsset }>(`/api/image-agent/videos/${encodeURIComponent(videoId)}/retry-analysis`, {
     method: "POST",
+  });
+}
+
+export async function registerGeneratedVideoForAnalysis(taskId: string, conversationId = "") {
+  return httpRequest<AgentVideoAsset>(`/api/video-generation/tasks/${encodeURIComponent(taskId)}/analysis-asset`, {
+    method: "POST",
+    body: { conversation_id: conversationId },
+    timeout: 30_000,
   });
 }
 
@@ -1530,8 +1596,8 @@ export async function retryAgentBatchItem(planId: string, itemId: number, body: 
   });
 }
 
-export async function fetchAgentRun(runId: string, includeResult = false) {
-  return httpRequest<{ agentRun: AgentRun }>(`/api/agent/runs/${encodeURIComponent(runId)}${includeResult ? "?includeResult=true" : ""}`);
+export async function fetchAgentRun<TResult = ImageAgentResult>(runId: string, includeResult = false) {
+  return httpRequest<{ agentRun: AgentRun<TResult> }>(`/api/agent/runs/${encodeURIComponent(runId)}${includeResult ? "?includeResult=true" : ""}`);
 }
 
 export async function cancelAgentRun(runId: string) {
@@ -1902,8 +1968,12 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
   });
 }
 
-export async function cancelImageTask(taskId: string) {
-  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/cancel`, {
+export async function cancelImageTask(taskId: string, options: { dryRun?: boolean; confirmUpstream?: boolean } = {}) {
+  const params = new URLSearchParams();
+  if (options.dryRun) params.set("dry_run", "true");
+  if (options.confirmUpstream) params.set("confirm_upstream", "true");
+  const query = params.toString();
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/cancel${query ? `?${query}` : ""}`, {
     method: "POST",
   });
 }
@@ -1912,12 +1982,14 @@ export async function createVideoGenerationTask(body: {
   clientTaskId: string;
   prompt: string;
   model: string;
-  mode?: "text_to_video" | "image_to_video";
+  mode?: "text_to_video" | "image_to_video" | "video_to_video";
   aspectRatio?: string;
   durationSecs?: VideoGenerationDuration;
   quality?: string;
   resolution?: string;
   imageUrls?: string[];
+  referenceVideoUrls?: string[];
+  referenceAudioUrls?: string[];
   params?: Record<string, unknown>;
   conversationId?: string;
   turnId?: string;
@@ -1931,18 +2003,51 @@ export async function createVideoGenerationTask(body: {
       client_task_id: body.clientTaskId,
       prompt: body.prompt,
       model: body.model,
-      mode: body.mode || (body.imageUrls?.length ? "image_to_video" : "text_to_video"),
+      mode: body.mode || (body.referenceVideoUrls?.length ? "video_to_video" : body.imageUrls?.length ? "image_to_video" : "text_to_video"),
       aspect_ratio: body.aspectRatio || "16:9",
       duration_secs: body.durationSecs ?? 5,
       quality: body.quality || "standard",
       resolution: body.resolution || "",
       image_urls: body.imageUrls || [],
+      reference_video_urls: body.referenceVideoUrls || [],
+      reference_audio_urls: body.referenceAudioUrls || [],
       params: body.params || {},
       conversation_id: body.conversationId || "",
       turn_id: body.turnId || "",
       source: body.source || "standard",
       canvas_units: body.source === "canvas" ? Math.max(1, Math.round(body.canvasUnits || 1)) : 1,
     },
+  });
+}
+
+export async function uploadVideoReferenceVideos(files: File[], conversationId = "") {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("videos", file, file.name));
+  if (conversationId) formData.append("conversation_id", conversationId);
+  return httpRequest<AgentVideoUploadResponse>("/api/video-generation/reference-videos", {
+    method: "POST",
+    body: formData,
+    timeout: 600_000,
+  });
+}
+
+export type VideoReferenceAudioAsset = {
+  id: string;
+  title: string;
+  url: string;
+  storageRel: string;
+  duration: number;
+  size: number;
+  waveform?: number[];
+};
+
+export async function uploadVideoReferenceAudios(files: File[]) {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file, file.name));
+  return httpRequest<{ items: VideoReferenceAudioAsset[]; total: number }>("/api/video-generation/reference-audios", {
+    method: "POST",
+    body: formData,
+    timeout: 180_000,
   });
 }
 
@@ -2176,6 +2281,10 @@ export async function reportImageFailure(body: {
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
+}
+
+export async function fetchVideoGenerationModels() {
+  return httpRequest<VideoGenerationPublicConfig>("/api/video-generation/models");
 }
 
 export async function fetchSystemAnnouncements(options: { includeDisabled?: boolean; limit?: number } = {}) {

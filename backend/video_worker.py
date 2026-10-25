@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import time
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -118,6 +119,7 @@ def _process_message(message: VideoAnalysisQueueMessage, *, stop_event: threadin
         video_analysis_queue_service.defer(message)
         return
 
+    execution_started = time.monotonic()
     finished = threading.Event()
     heartbeat = threading.Thread(
         target=_lease_heartbeat,
@@ -140,6 +142,9 @@ def _process_message(message: VideoAnalysisQueueMessage, *, stop_event: threadin
     finally:
         finished.set()
         heartbeat.join(timeout=1.0)
+        video_analysis_queue_service.record_execution_latency(
+            int((time.monotonic() - execution_started) * 1000)
+        )
         video_analysis_queue_service.release_execution(lease)
 
 

@@ -35,6 +35,7 @@ from services.image.image_prompt_compliance import (
     standard_edit_allows_product_mutation,
 )
 from services.image.image_size import canvas_expected_size, canvas_media_request_size, normalize_image_size
+from services.image.reference_limits import MAX_GENERATION_REFERENCE_IMAGES
 from services.image.image_task_assets import (
     ImageAspectRatioMismatchError,
     decode_task_payload,
@@ -54,11 +55,18 @@ from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
+TASK_STATUS_RECONCILING = "reconciling"
 TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TASK_STATUS_CANCELED = "canceled"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELED}
-UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+RECONCILIATION_MAX_SECONDS = 1800
+RECONCILIATION_LEASE_SECONDS = 90
+RECONCILIATION_MAX_AGE_SECONDS = 86400
+UPSTREAM_CANCEL_WARNING = (
+    "该任务可能已提交上游。确认后会标记本地取消并继续核对上游结果，但无法保证上游停止生成，"
+    "任务仍可能完成并产生费用。"
+)
 QUEUE_PRIORITY_STANDARD = "standard"
 QUEUE_PRIORITY_AGENT = "agent"
 QUEUE_PRIORITY_BATCH = "batch"
@@ -124,6 +132,20 @@ def _positive_int(value: object, default: int = 1) -> int:
 
 def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
+
+
+def _public_status(task: dict[str, Any]) -> str:
+    return TASK_STATUS_RUNNING if task.get("status") == TASK_STATUS_RECONCILING else _clean(task.get("status"))
+
+
+def _upstream_cancel_is_uncertain(task: dict[str, Any]) -> bool:
+    if task.get("upstream_task_id") or task.get("upstream_task_ids"):
+        return True
+    if task.get("status") == TASK_STATUS_RECONCILING:
+        return True
+    if _clean(task.get("submission_state")) in {"submitting", "submitted", "provider_completed", "completed"}:
+        return True
+    return task.get("status") == TASK_STATUS_RUNNING and not _clean(task.get("submission_state"))
 
 
 def _normalize_queue_priority(value: object, default: str = QUEUE_PRIORITY_STANDARD) -> str:
@@ -202,6 +224,26 @@ def _is_retryable_provider_error(exc: Exception) -> bool:
     )
 
 
+def _is_refunded_reference_read_failure(exc: Exception) -> bool:
+    if not isinstance(exc, RelaySubmittedHTTPException):
+        return False
+    if (
+        exc.status_code != 422
+        or not exc.upstream_finished
+        or exc.submission_uncertain
+        or not exc.refunded
+        or len(exc.upstream_task_ids) != 1
+    ):
+        return False
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    message = str(detail.get("error") or "").lower()
+    return (
+        "media generation failed:" in message
+        and "参考图处理失败" in message
+        and any(marker in message for marker in ("connection reset by peer", "unexpected eof"))
+    )
+
+
 def _reconciliation_details(exc: Exception) -> dict[str, Any]:
     details = getattr(exc, "reconciliation", None)
     result = dict(details) if isinstance(details, dict) else {}
@@ -230,7 +272,7 @@ def _owner_activity_counts(items: list[tuple[str, dict[str, Any]]]) -> dict[str,
         status = task.get("status")
         if status == TASK_STATUS_QUEUED:
             activity["queued_tasks"] += 1
-        elif status == TASK_STATUS_RUNNING:
+        elif status in {TASK_STATUS_RUNNING, TASK_STATUS_RECONCILING}:
             activity["running_tasks"] += 1
     return counts
 
@@ -306,9 +348,10 @@ def _public_task(
     task: dict[str, Any],
     batch_progress: dict[str, int | str] | None = None,
 ) -> dict[str, Any]:
+    public_status = _public_status(task)
     item = {
         "id": task.get("id"),
-        "status": task.get("status"),
+        "status": public_status,
         "mode": task.get("mode"),
         "model": task.get("model"),
         "size": task.get("size"),
@@ -342,6 +385,10 @@ def _public_task(
     if task.get("reconciliation_required"):
         item["reconciliation_required"] = True
         item["reconciliation"] = task.get("reconciliation") or {}
+    if task.get("cancel_requested"):
+        item["cancel_requested"] = True
+        if task.get("status") not in TERMINAL_STATUSES:
+            item["cancellation_pending"] = True
     if task.get("error"):
         item["error"] = task.get("error")
     if task.get("progress"):
@@ -354,8 +401,8 @@ def _public_task(
         item["attempts"] = int(task.get("attempts") or 0)
     if task.get("max_retries"):
         item["max_retries"] = task.get("max_retries")
-    if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
-        if task.get("status") == TASK_STATUS_RUNNING:
+    if public_status in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
+        if public_status == TASK_STATUS_RUNNING:
             # RUNNING 状态仅在 started_ts 被设置后（image_stream_resolve_start）才计时
             base_ts = task.get("started_ts")
         else:
@@ -371,7 +418,7 @@ def _monitoring_event_task(task: dict[str, Any]) -> dict[str, Any]:
         "id": task.get("id"),
         "task_id": task.get("id"),
         "owner_id": task.get("owner_id"),
-        "status": task.get("status"),
+        "status": _public_status(task),
         "mode": task.get("mode"),
         "model": task.get("model"),
         "product_id": task.get("product_id"),
@@ -410,6 +457,7 @@ def _realtime_task_event(task: dict[str, Any]) -> dict[str, Any]:
         "status_group": "已完成" if status == TASK_STATUS_SUCCESS else "失败" if status in {TASK_STATUS_ERROR, TASK_STATUS_CANCELED} else "进行中",
         "is_final": status in TERMINAL_STATUSES,
         "progress": public.get("progress"),
+        "cancellation_pending": bool(public.get("cancellation_pending")),
         "result_url": result_url,
         "result_type": "image" if result_url else "",
         "error": public.get("error") or "",
@@ -486,6 +534,10 @@ class ImageTaskService:
         )
         self._owner_pending_limit = max(1, int(queue_settings.get("owner_pending_limit") or 50))
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._reconciliation_threads: dict[str, threading.Thread] = {}
+        self._reconciliation_concurrency = 2
+        self._inline_reconciliation_stop = threading.Event()
+        self._inline_reconciliation_scheduler: threading.Thread | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             if self._row_level_store:
@@ -507,10 +559,14 @@ class ImageTaskService:
             # enqueue is idempotent, while running rows are recovered only
             # after their stale timeout by the elected maintenance worker.
             self.requeue_unfinished()
+            self.start_pending_reconciliations()
         try:
             self.flush_pending_projections()
         except Exception:
             pass
+        if self.run_inline and self.task_store.list_reconciling():
+            self._ensure_inline_reconciliation_scheduler()
+            self.start_pending_reconciliations()
 
     def submit_generation(
         self,
@@ -616,7 +672,14 @@ class ImageTaskService:
         queue_priority: str = QUEUE_PRIORITY_STANDARD,
         agent_run_id: str = "",
     ) -> dict[str, Any]:
-        image_inputs = images or []
+        image_inputs = list(images or [])
+        reference_urls = list(dict.fromkeys(
+            str(url).strip()
+            for url in image_urls or []
+            if str(url).strip()
+        ))
+        if len(image_inputs) + len(reference_urls) > MAX_GENERATION_REFERENCE_IMAGES:
+            raise ValueError(f"generation supports at most {MAX_GENERATION_REFERENCE_IMAGES} reference images")
         engine_mode = normalize_prompt_engine_mode(prompt_engine_mode)
         reference_edit_intent = classify_reference_edit_intent(prompt) if engine_mode == "standard" else ""
         mutation_policy = normalize_subject_mutation_policy(subject_mutation_policy)
@@ -639,7 +702,7 @@ class ImageTaskService:
             prompt,
             image_count=max(requested_count, batch_total),
             image_index=batch_index,
-            has_reference=bool(image_inputs or image_urls),
+            has_reference=bool(image_inputs or reference_urls),
             preserve_subject=effective_preserve_subject,
             prompt_engine_mode=prompt_engine_mode,
             subject_mutation_policy=mutation_policy,
@@ -666,7 +729,7 @@ class ImageTaskService:
             "prompt": effective_prompt,
             "images": image_inputs,
             "mask": effective_masks,
-            "image_urls": image_urls or [],
+            "image_urls": reference_urls,
             "model": model,
             "n": requested_count,
             "size": normalized_size,
@@ -678,7 +741,7 @@ class ImageTaskService:
             "prompt_engine_mode": prompt_engine_mode,
             "response_format": "url",
             "base_url": base_url,
-            "preserve_subject": bool(effective_preserve_subject and (image_inputs or image_urls)),
+            "preserve_subject": bool(effective_preserve_subject and (image_inputs or reference_urls)),
             "subject_mutation_policy": mutation_policy,
             "conversation_id": conversation_id,
             "turn_id": turn_id,
@@ -782,49 +845,103 @@ class ImageTaskService:
             time.sleep(min(1.0, max(0.05, float(timeout_secs))))
             return False
 
-    def cancel_task(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+    def cancel_task(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        *,
+        dry_run: bool = False,
+        confirm_upstream: bool = False,
+    ) -> dict[str, Any]:
         owner = _owner_id(identity)
         normalized_task_id = _clean(task_id)
         if not normalized_task_id:
             raise ValueError("task_id is required")
         key = _task_key(owner, normalized_task_id)
+        for _ in range(4):
+            with self._lock:
+                self._refresh_locked()
+                task = self.task_store.get_task(key) if self._row_level_store else self._get_task_locked(key)
+                if task is None:
+                    raise ValueError("task not found")
+                if task.get("status") in TERMINAL_STATUSES:
+                    return _public_task(task)
+
+                needs_confirmation = _upstream_cancel_is_uncertain(task)
+                if needs_confirmation and not task.get("cancel_requested") and (dry_run or not confirm_upstream):
+                    public = _public_task(task)
+                    public["requires_confirmation"] = True
+                    public["cancellation_warning"] = UPSTREAM_CANCEL_WARNING
+                    return public
+                if dry_run:
+                    return _public_task(task)
+                if task.get("cancel_requested"):
+                    return _public_task(task)
+
+                started_ts = task.get("started_ts") or task.get("created_ts") or time.time()
+                try:
+                    duration_ms = int(max(0, time.time() - float(started_ts)) * 1000)
+                except (TypeError, ValueError):
+                    duration_ms = 0
+                if needs_confirmation:
+                    updates = {
+                        "cancel_requested": True,
+                        "cancellation_requested_at": _now_iso(),
+                        "progress": "cancellation_pending",
+                        "error": "",
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                    }
+                else:
+                    updates = {
+                        "status": TASK_STATUS_CANCELED,
+                        "error": "任务已中止",
+                        "data": [],
+                        "progress": "canceled",
+                        "duration_ms": duration_ms,
+                        "monitoring_pending": True,
+                        "library_pending": False,
+                        "projection_attempts": 0,
+                        "projection_next_attempt_at": None,
+                        "projection_last_error": "",
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                    }
+                expected = {
+                    "status": task.get("status"),
+                    "submission_state": task.get("submission_state"),
+                    "upstream_task_id": task.get("upstream_task_id"),
+                    "upstream_task_ids": task.get("upstream_task_ids"),
+                    "cancel_requested": task.get("cancel_requested"),
+                }
+                updated = self.task_store.update_task_if(
+                    key,
+                    lambda current: all(current.get(field) == value for field, value in expected.items()),
+                    updates,
+                )
+                if updated is None:
+                    continue
+                if not self._row_level_store:
+                    self._tasks[key] = updated
+                self._notify_task_update(key)
+                public = _public_task(updated)
+
+            if updated.get("status") in TERMINAL_STATUSES:
+                self.flush_task_projection(key)
+            return public
         with self._lock:
             self._refresh_locked()
-            task = self._get_task_locked(key)
+            task = self.task_store.get_task(key) if self._row_level_store else self._get_task_locked(key)
             if task is None:
                 raise ValueError("task not found")
-            if task.get("status") in TERMINAL_STATUSES:
+            if task.get("status") in TERMINAL_STATUSES or task.get("cancel_requested"):
                 return _public_task(task)
-
-            started_ts = task.get("started_ts") or task.get("created_ts") or time.time()
-            try:
-                duration_ms = int(max(0, time.time() - float(started_ts)) * 1000)
-            except (TypeError, ValueError):
-                duration_ms = 0
-            task.update(
-                {
-                    "status": TASK_STATUS_CANCELED,
-                    "error": "任务已中止",
-                    "data": [],
-                    "progress": "canceled",
-                    "duration_ms": duration_ms,
-                    "monitoring_pending": True,
-                    "library_pending": False,
-                    "projection_attempts": 0,
-                    "projection_next_attempt_at": None,
-                    "projection_last_error": "",
-                    "updated_at": _now_iso(),
-                    "updated_ts": time.time(),
-                }
-            )
-            if self._row_level_store:
-                self.task_store.save_task(key, task)
-            else:
-                self._save_locked()
-            public = _public_task(task)
-            self._notify_task_update(key)
-        self.flush_task_projection(key)
-        return public
+            if _upstream_cancel_is_uncertain(task) and not confirm_upstream:
+                public = _public_task(task)
+                public["requires_confirmation"] = True
+                public["cancellation_warning"] = UPSTREAM_CANCEL_WARNING
+                return public
+        raise ValueError("task state changed while cancellation was being processed; retry")
 
     def _enqueue_task(self, key: str, task: dict[str, Any] | None = None) -> None:
         if self.task_queue is None:
@@ -1094,6 +1211,7 @@ class ImageTaskService:
                             )
                         except Exception:
                             pass
+                    self.start_pending_reconciliations()
                     self.flush_pending_projections()
                 except Exception as exc:
                     try:
@@ -1106,6 +1224,18 @@ class ImageTaskService:
                             release_maintenance(maintenance_token)
                         except Exception:
                             pass
+
+        def _reconciliation_loop() -> None:
+            while not shutdown_event.is_set():
+                try:
+                    self.start_pending_reconciliations()
+                except Exception as exc:
+                    try:
+                        log_service.add(LOG_TYPE_CALL, "image reconciliation scan failed", {"error": str(exc)})
+                    except Exception:
+                        pass
+                if shutdown_event.wait(timeout=5):
+                    return
 
         worker_count = self._worker_thread_count()
 
@@ -1122,6 +1252,10 @@ class ImageTaskService:
         maintenance_thread = threading.Thread(target=_maintenance_loop, name="image-worker-maintenance", daemon=True)
         maintenance_thread.start()
         threads.append(maintenance_thread)
+
+        reconciliation_thread = threading.Thread(target=_reconciliation_loop, name="image-worker-reconciliation", daemon=True)
+        reconciliation_thread.start()
+        threads.append(reconciliation_thread)
 
         if heartbeat_enabled:
             heartbeat_thread = threading.Thread(target=_heartbeat_loop, name="image-worker-heartbeat", daemon=True)
@@ -1164,9 +1298,9 @@ class ImageTaskService:
                 status = task.get("status")
                 if status == TASK_STATUS_QUEUED:
                     queued_tasks += 1
-                elif status == TASK_STATUS_RUNNING:
+                elif status in {TASK_STATUS_RUNNING, TASK_STATUS_RECONCILING}:
                     running_tasks += 1
-                    if now - _task_activity_ts(task) >= self._stale_running_timeout_secs:
+                    if status == TASK_STATUS_RUNNING and now - _task_activity_ts(task) >= self._stale_running_timeout_secs:
                         stale_running_tasks += 1
             queue = self.task_queue
             try:
@@ -1233,6 +1367,10 @@ class ImageTaskService:
             }
 
     def close(self) -> None:
+        self._inline_reconciliation_stop.set()
+        scheduler = self._inline_reconciliation_scheduler
+        if scheduler is not None:
+            scheduler.join(timeout=2)
         executor = self._postprocess_executor
         self._postprocess_executor = None
         if executor is not None:
@@ -1421,6 +1559,8 @@ class ImageTaskService:
         with self._lock:
             self._refresh_locked()
             running_task = dict(self._get_task_locked(key) or {})
+        if running_task.get("submission_state") == "provider_completed" and isinstance(running_task.get("provider_result"), dict):
+            started = float(running_task.get("created_ts") or started)
         stage_timings = dict(running_task.get("stage_timings_ms") or {})
         generation_started = time.time()
         generation_recorded = False
@@ -1449,6 +1589,10 @@ class ImageTaskService:
             }
         }
         payload_with_progress = {**handler_payload, "progress_callback": progress_callback}
+        if self.relay_enabled_getter():
+            # Media providers return a task id first; polling belongs to the
+            # reconciliation path so a slow upstream task does not hold a worker slot.
+            payload_with_progress["_defer_media_poll"] = True
         try:
             stored_provider_result = running_task.get("provider_result")
             result = dict(stored_provider_result) if isinstance(stored_provider_result, dict) else None
@@ -1474,6 +1618,8 @@ class ImageTaskService:
                             task = self._get_task_locked(key)
                             if task is None or task.get("status") == TASK_STATUS_CANCELED:
                                 return
+                        if self.relay_enabled_getter() and not self._mark_upstream_submission_started(key):
+                            return
                         try:
                             result = handler(payload_with_progress)
                         except Exception as provider_exc:
@@ -1508,6 +1654,21 @@ class ImageTaskService:
                     return
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
+            if result.get("_media_pending"):
+                task_ids = result.get("_media_task_ids") or []
+                try:
+                    if not self._begin_upstream_reconciliation(
+                        key,
+                        task_ids,
+                        started=started,
+                        stage_timings=stage_timings,
+                    ):
+                        raise RuntimeError("upstream media task ids could not be saved")
+                except Exception as exc:
+                    setattr(exc, "submission_uncertain", True)
+                    setattr(exc, "upstream_task_ids", task_ids)
+                    raise
+                return
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
@@ -1629,8 +1790,20 @@ class ImageTaskService:
                 generation_ms = int((time.time() - generation_started) * 1000)
                 stage_timings["generation"] = max(0, int(stage_timings.get("generation") or 0)) + generation_ms
             submission_uncertain = _is_submission_uncertain_error(exc)
+            if submission_uncertain:
+                error_message = "提交结果尚未确认，请联系管理员核对，勿重复提交"
             persistence_uncertain = provider_completed and not provider_checkpointed
             intentional_regeneration = isinstance(exc, ImageAspectRatioMismatchError)
+            refunded_reference_failure = (
+                not provider_completed
+                and _positive_int(payload.get("n"), 1) == 1
+                and _is_refunded_reference_read_failure(exc)
+            )
+            submitted_task_ids = _submitted_upstream_task_ids(exc)
+            with self._lock:
+                self._refresh_locked()
+                latest_task = self._get_task_locked(key)
+                cancel_requested = bool(latest_task and latest_task.get("cancel_requested"))
             if intentional_regeneration:
                 self._update_task_unless_canceled(
                     key,
@@ -1640,9 +1813,17 @@ class ImageTaskService:
             safe_to_retry = (
                 intentional_regeneration
                 or provider_checkpointed
+                or refunded_reference_failure
                 or (not provider_completed and _is_retryable_provider_error(exc))
-            ) and not submission_uncertain
-            if safe_to_retry and self._retry_task(key, error_message, duration_ms, stage_timings, payload=payload):
+            ) and not submission_uncertain and not cancel_requested
+            if safe_to_retry and self._retry_task(
+                key,
+                error_message,
+                duration_ms,
+                stage_timings,
+                payload=payload,
+                retry_limit=1 if refunded_reference_failure else None,
+            ):
                 self._log_call(
                     identity,
                     mode,
@@ -1656,7 +1837,6 @@ class ImageTaskService:
                 )
                 return
             reconciliation = _reconciliation_details(exc)
-            submitted_task_ids = _submitted_upstream_task_ids(exc)
             if persistence_uncertain and isinstance(result, dict):
                 reconciliation.update(
                     {
@@ -1704,6 +1884,263 @@ class ImageTaskService:
                 error=error_message,
                 account_email=account_email,
             )
+
+    def _begin_upstream_reconciliation(
+        self,
+        key: str,
+        task_ids: object,
+        *,
+        started: float,
+        stage_timings: dict[str, int],
+        reconciliation: dict[str, Any] | None = None,
+    ) -> bool:
+        normalized_ids = list(dict.fromkeys(
+            _clean(task_id)
+            for task_id in (task_ids if isinstance(task_ids, list) else [])
+            if _clean(task_id)
+        ))
+        if not normalized_ids:
+            return False
+        now = time.time()
+        details = dict(reconciliation or {})
+        details.update({
+            "accepted_task_ids": normalized_ids,
+            "submitted_at": now,
+            "expires_at": now + RECONCILIATION_MAX_AGE_SECONDS,
+            "next_poll_at": now,
+            "lease_until": 0.0,
+            "last_error": "",
+            "results": {},
+            "failures": {},
+        })
+        started_ts = started
+        with self._lock:
+            task = self._get_task_locked(key)
+            if task is None or task.get("status") in TERMINAL_STATUSES:
+                return False
+            started_ts = task.get("started_ts") or started
+        updated = self._update_task_unless_canceled(
+            key,
+            status=TASK_STATUS_RECONCILING,
+            error="",
+            data=[],
+            progress="generating",
+            started_ts=started_ts,
+            stage_timings_ms=dict(stage_timings),
+            upstream_task_id=normalized_ids[0],
+            upstream_task_ids=normalized_ids,
+            submission_state="submitted",
+            reconciliation_required=True,
+            reconciliation=details,
+            monitoring_pending=False,
+            library_pending=False,
+        )
+        if updated is None:
+            return False
+        if self.run_inline:
+            self._ensure_inline_reconciliation_scheduler()
+        self._start_reconciliation_thread(key)
+        return True
+
+    def _ensure_inline_reconciliation_scheduler(self) -> None:
+        with self._lock:
+            if self._inline_reconciliation_scheduler is not None and self._inline_reconciliation_scheduler.is_alive():
+                return
+            self._inline_reconciliation_stop.clear()
+
+            def scan() -> None:
+                while not self._inline_reconciliation_stop.wait(5):
+                    try:
+                        self.start_pending_reconciliations()
+                        with self._lock:
+                            if not self.task_store.list_reconciling():
+                                self._inline_reconciliation_scheduler = None
+                                return
+                    except Exception as exc:
+                        try:
+                            log_service.add(LOG_TYPE_CALL, "image reconciliation scan failed", {"error": str(exc)})
+                        except Exception:
+                            pass
+
+            self._inline_reconciliation_scheduler = threading.Thread(
+                target=scan, name="image-inline-reconciliation", daemon=True,
+            )
+            self._inline_reconciliation_scheduler.start()
+
+    def _start_reconciliation_thread(self, key: str) -> bool:
+        with self._lock:
+            self._refresh_locked()
+            task = self._get_task_locked(key)
+            if task is None or task.get("status") != TASK_STATUS_RECONCILING:
+                return False
+            existing = self._reconciliation_threads.get(key)
+            if existing is not None and existing.is_alive():
+                return False
+            active_reconciliations = sum(
+                1
+                for thread in self._reconciliation_threads.values()
+                if thread.is_alive()
+            )
+            if active_reconciliations >= self._reconciliation_concurrency:
+                return False
+            details = task.get("reconciliation") if isinstance(task.get("reconciliation"), dict) else {}
+            now = time.time()
+            try:
+                next_poll_at = float(details.get("next_poll_at") or 0)
+                lease_until = float(details.get("lease_until") or 0)
+            except (TypeError, ValueError):
+                next_poll_at = 0.0
+                lease_until = 0.0
+            if next_poll_at > now or lease_until > now:
+                return False
+            lease_token = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+            claimed = self.task_store.claim_reconciliation(
+                key, lease_token, now, RECONCILIATION_LEASE_SECONDS,
+            )
+            if claimed is None:
+                return False
+            if not self._row_level_store:
+                self._tasks[key] = claimed
+            thread = threading.Thread(
+                target=self._run_upstream_reconciliation,
+                args=(key, lease_token, claimed),
+                name=f"image-reconcile-{_clean(task.get('id'))[:16]}",
+                daemon=True,
+            )
+            self._reconciliation_threads[key] = thread
+            thread.start()
+            return True
+
+    def start_pending_reconciliations(self, *, limit: int = 20) -> int:
+        with self._lock:
+            self._refresh_locked()
+            items = self.task_store.list_reconciling()
+        started = 0
+        for key, task in items:
+            if task.get("status") != TASK_STATUS_RECONCILING:
+                continue
+            if not isinstance(task.get("reconciliation"), dict):
+                continue
+            if self._start_reconciliation_thread(key):
+                started += 1
+                if started >= max(1, int(limit or 20)):
+                    break
+        return started
+
+    def _save_reconciliation(self, key: str, token: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        with self._lock:
+            updates = {**updates, "updated_at": _now_iso(), "updated_ts": time.time()}
+            updated = self.task_store.update_reconciliation(key, token, updates)
+            if updated is not None:
+                if not self._row_level_store:
+                    self._tasks[key] = updated
+                self._publish_task_event(updated)
+                self._notify_task_update(key)
+                if updated.get("status") in TERMINAL_STATUSES:
+                    self._release_canvas_reservation(updated)
+            return updated
+
+    def _run_upstream_reconciliation(self, key: str, lease_token: str, task: dict[str, Any]) -> None:
+        try:
+            details = dict(task.get("reconciliation") or {})
+            ids = list(details.get("accepted_task_ids") or task.get("upstream_task_ids") or [])
+            results = dict(details.get("results") or {})
+            failures = dict(details.get("failures") or {})
+            now = time.time()
+            legacy_submitted = float(details.get("deadline_ts") or 0) - RECONCILIATION_MAX_SECONDS
+            submitted_at = float(details.get("submitted_at") or (legacy_submitted if legacy_submitted > 0 else 0) or task.get("created_ts") or now)
+            expires_at = float(details.get("expires_at") or submitted_at + RECONCILIATION_MAX_AGE_SECONDS)
+            details.update({"submitted_at": submitted_at, "expires_at": expires_at})
+            pending = [item for item in ids if item not in results and item not in failures]
+            if pending and now < expires_at:
+                task_id = pending[0]
+                try:
+                    status = openai_relay_service.get_media_image_task_status(task_id)
+                    if status.get("state") == "success":
+                        results[task_id] = {"url": status["url"], "cost": status.get("cost")}
+                    elif status.get("state") == "failed":
+                        failures[task_id] = _clean(status.get("error"), "上游生成失败")[:500]
+                    details["last_error"] = ""
+                except Exception as exc:
+                    details["last_error"] = str(exc)[:500]
+                now = time.time()
+                pending = [item for item in ids if item not in results and item not in failures]
+            details.update({"results": results, "failures": failures})
+            if pending and now < expires_at:
+                interval = 10 if now - submitted_at < RECONCILIATION_MAX_SECONDS else 120
+                details.update({"next_poll_at": now + interval, "lease_until": 0.0, "lease_token": ""})
+                self._save_reconciliation(key, lease_token, {"reconciliation": details})
+                return
+
+            partial = [{"url": results[item]["url"]} for item in ids if item in results]
+            submission_incomplete = len(ids) < _positive_int(task.get("image_count"), 1)
+            if pending or failures or not ids or submission_incomplete:
+                unknown = bool(pending or not ids or submission_incomplete)
+                message = (
+                    "上游结果仍未确认，请联系管理员核对，勿重复提交"
+                    if unknown else "部分图片生成失败，请联系管理员核对已生成的结果"
+                    if partial else "上游图片生成失败：" + next(iter(failures.values()))
+                )
+                known_costs = [
+                    result["cost"] for result in results.values()
+                    if isinstance(result.get("cost"), (int, float)) and not isinstance(result.get("cost"), bool)
+                ]
+                details["cost_incomplete"] = len(known_costs) != len(ids)
+                updates = {
+                    "status": TASK_STATUS_ERROR,
+                    "progress": "reconciliation_unknown" if unknown else "upstream_failed",
+                    "error": message,
+                    "data": partial,
+                    "duration_ms": int(max(0, now - float(task.get("created_ts") or now)) * 1000),
+                    "reconciliation_required": unknown or bool(partial),
+                    "reconciliation": {**details, "lease_until": 0.0, "lease_token": ""},
+                    "monitoring_pending": True,
+                    "library_pending": False,
+                }
+                if known_costs:
+                    updates["cost"] = sum(known_costs)
+                updated = self._save_reconciliation(key, lease_token, updates)
+                if updated is not None:
+                    self.flush_task_projection(key)
+                return
+
+            costs = [results[item].get("cost") for item in ids]
+            provider_result = {
+                "created": int(now),
+                "data": partial,
+                "_media_task_id": ids[0],
+                "_media_task_ids": ids,
+            }
+            if all(isinstance(cost, (int, float)) and not isinstance(cost, bool) for cost in costs):
+                provider_result["cost"] = sum(costs)
+            stage_timings = dict(task.get("stage_timings_ms") or {})
+            stage_timings["generation"] = int(max(0, now - float(task.get("started_ts") or task.get("created_ts") or now)) * 1000)
+            updated = self._save_reconciliation(key, lease_token, {
+                "status": TASK_STATUS_QUEUED,
+                "progress": "receiving_image",
+                "provider_result": provider_result,
+                "submission_state": "provider_completed",
+                "reconciliation_required": False,
+                "reconciliation": {},
+                "stage_timings_ms": stage_timings,
+                "started_ts": None,
+                "started_at": "",
+            })
+            if updated is not None:
+                if self.task_queue is not None and not self.run_inline:
+                    self._enqueue_task(key, updated)
+                else:
+                    self.process_queued_task(key)
+        except Exception as exc:
+            try:
+                log_service.add(LOG_TYPE_CALL, "image reconciliation step failed", {"task_key": key, "error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                if self._reconciliation_threads.get(key) is threading.current_thread():
+                    self._reconciliation_threads.pop(key, None)
+
 
     def _postprocess_generated_result(
         self,
@@ -1887,7 +2324,7 @@ class ImageTaskService:
                     task_item
                     for _key, task_item in all_active_tasks
                     if task_item.get("owner_id") == owner_id
-                    and task_item.get("status") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+                    and task_item.get("status") in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_RECONCILING}
                 ]
                 if not can_claim_task_fairly(active_tasks, task, effective_owner_concurrency):
                     return False
@@ -1933,6 +2370,61 @@ class ImageTaskService:
             updates["updated_at"] = _now_iso()
             updates["updated_ts"] = time.time()
             return self._persist_updates_locked(key, updates, reject_status=TASK_STATUS_CANCELED) is not None
+
+    def _mark_upstream_submission_started(self, key: str) -> bool:
+        projection_key = ""
+        with self._lock:
+            self._refresh_locked()
+            task = self.task_store.get_task(key) if self._row_level_store else self._get_task_locked(key)
+            if task is None or task.get("status") != TASK_STATUS_RUNNING:
+                return False
+            expected = {
+                "status": task.get("status"),
+                "submission_state": task.get("submission_state"),
+                "cancel_requested": task.get("cancel_requested"),
+            }
+            now = time.time()
+            if task.get("cancel_requested"):
+                started_ts = task.get("started_ts") or task.get("created_ts") or now
+                try:
+                    duration_ms = int(max(0, now - float(started_ts)) * 1000)
+                except (TypeError, ValueError):
+                    duration_ms = 0
+                updates = {
+                    "status": TASK_STATUS_CANCELED,
+                    "error": "任务已中止，尚未提交上游",
+                    "data": [],
+                    "progress": "canceled",
+                    "duration_ms": duration_ms,
+                    "monitoring_pending": True,
+                    "library_pending": False,
+                    "projection_attempts": 0,
+                    "projection_next_attempt_at": None,
+                    "projection_last_error": "",
+                    "updated_at": _now_iso(),
+                    "updated_ts": now,
+                }
+                projection_key = key
+            else:
+                updates = {
+                    "submission_state": "submitting",
+                    "updated_at": _now_iso(),
+                    "updated_ts": now,
+                }
+            updated = self.task_store.update_task_if(
+                key,
+                lambda current: all(current.get(field) == value for field, value in expected.items()),
+                updates,
+            )
+            if updated is None:
+                return False
+            if not self._row_level_store:
+                self._tasks[key] = updated
+            self._notify_task_update(key)
+        if projection_key:
+            self.flush_task_projection(projection_key)
+            return False
+        return True
 
     def _save_projection_state(self, key: str, updates: dict[str, Any]) -> None:
         with self._lock:
@@ -2039,7 +2531,14 @@ class ImageTaskService:
             if not task_id or not owner:
                 continue
             status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR, TASK_STATUS_CANCELED}:
+            if status not in {
+                TASK_STATUS_QUEUED,
+                TASK_STATUS_RUNNING,
+                TASK_STATUS_RECONCILING,
+                TASK_STATUS_SUCCESS,
+                TASK_STATUS_ERROR,
+                TASK_STATUS_CANCELED,
+            }:
                 status = TASK_STATUS_ERROR
             task = {
                 "id": task_id,
@@ -2082,6 +2581,14 @@ class ImageTaskService:
                 "projection_attempts",
                 "projection_next_attempt_at",
                 "projection_last_error",
+                "reconciliation_required",
+                "reconciliation",
+                "upstream_task_ids",
+                "submission_state",
+                "cancel_requested",
+                "cancellation_requested_at",
+                "provider_result",
+                "started_at",
             ):
                 if field in item:
                     task[field] = item.get(field)
@@ -2111,6 +2618,7 @@ class ImageTaskService:
         stage_timings_ms: dict[str, int] | None = None,
         *,
         payload: dict[str, Any] | None = None,
+        retry_limit: int | None = None,
     ) -> bool:
         if self.task_queue is None or self.run_inline:
             return False
@@ -2139,6 +2647,8 @@ class ImageTaskService:
                         "确保输出真实像素尺寸与请求画布一致。"
                     )
             max_retries = max(0, int(task.get("max_retries") or self.max_retries_getter()))
+            if retry_limit is not None:
+                max_retries = min(max_retries, max(0, retry_limit))
             if self._row_level_store:
                 updated = self.task_store.retry_task(
                     key,
@@ -2150,6 +2660,7 @@ class ImageTaskService:
                         "stage_timings_ms": dict(stage_timings_ms or {}),
                         "updated_at": _now_iso(),
                         "updated_ts": time.time(),
+                        **({"max_retries": max_retries} if retry_limit is not None else {}),
                         **({"payload": retry_payload} if retry_payload is not None else {}),
                     },
                 )
@@ -2170,6 +2681,7 @@ class ImageTaskService:
                         "stage_timings_ms": dict(stage_timings_ms or {}),
                         "updated_at": _now_iso(),
                         "updated_ts": time.time(),
+                        **({"max_retries": max_retries} if retry_limit is not None else {}),
                         **({"payload": retry_payload} if retry_payload is not None else {}),
                     }
                 )
@@ -2272,16 +2784,17 @@ class ImageTaskService:
             )
         changed = False
         for task in self._tasks.values():
-            if task.get("status") in UNFINISHED_STATUSES:
-                task["status"] = TASK_STATUS_QUEUED if requeue else TASK_STATUS_ERROR
-                task["error"] = (
-                    "service restarted, unfinished image task was requeued"
-                    if requeue
-                    else "服务已重启，未完成的图片任务已中断"
-                )
-                task["updated_at"] = _now_iso()
-                task["updated_ts"] = time.time()
-                changed = True
+            if task.get("status") not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}:
+                continue
+            task["status"] = TASK_STATUS_QUEUED if requeue else TASK_STATUS_ERROR
+            task["error"] = (
+                "service restarted, unfinished image task was requeued"
+                if requeue
+                else "服务已重启，未完成的图片任务已中断"
+            )
+            task["updated_at"] = _now_iso()
+            task["updated_ts"] = time.time()
+            changed = True
         return changed
 
     def _cleanup_locked(self) -> bool:

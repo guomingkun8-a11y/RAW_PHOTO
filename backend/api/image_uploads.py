@@ -7,9 +7,10 @@ from fastapi.concurrency import run_in_threadpool
 
 from api.support import require_identity
 from services.image import reference_image_uploader
+from services.image.reference_limits import MAX_REFERENCE_IMAGES
 
 
-MAX_REFERENCE_FILES = 100
+MAX_REFERENCE_FILES = MAX_REFERENCE_IMAGES
 MAX_REFERENCE_FILE_BYTES = 50 * 1024 * 1024
 MAX_REFERENCE_BATCH_BYTES = 300 * 1024 * 1024
 

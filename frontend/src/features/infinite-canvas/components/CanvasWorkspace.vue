@@ -17,6 +17,7 @@ import {
   Scissors,
   Sparkles,
   Film,
+  Music2,
   Trash2,
   Undo2,
   Video,
@@ -30,7 +31,13 @@ import {
 } from '@/lib/api';
 import { HttpRequestError } from '@/lib/request';
 import { BUILTIN_IMAGE_MODELS } from '@/lib/image-models';
-import { videoFrameRole, videoModelUsesFirstLastFrames } from '@/lib/video-models';
+import {
+  videoFrameRole,
+  videoModelMediaSpec,
+  videoModelOptionsForSecondary,
+  selectVideoModelForMode,
+  videoModelUsesFirstLastFramesForMode,
+} from '@/lib/video-models';
 import CanvasAssistantDock from '@/features/infinite-canvas/components/CanvasAssistantDock.vue';
 import CanvasMinimap from '@/features/infinite-canvas/components/CanvasMinimap.vue';
 import CanvasNode from '@/features/infinite-canvas/components/CanvasNode.vue';
@@ -53,9 +60,11 @@ import {
   generateCanvasImage,
   generateCanvasVideo,
   loadCanvasRuntime,
+  registerCanvasVideoResultForAnalysis,
   retryCanvasVideoAnalysis,
   resumeCanvasGeneration,
   uploadCanvasImage,
+  uploadCanvasAudio,
   uploadCanvasVideo,
 } from '@/features/infinite-canvas/services/canvas-api';
 import type {
@@ -80,10 +89,12 @@ import type { CompositionTask, TimelineDocument } from '@/features/video-timelin
 
 const IMAGE_NODE_WIDTH = 440;
 const VIDEO_NODE_WIDTH = 620;
+const AUDIO_NODE_WIDTH = 440;
 const MEDIA_NODE_HEADER_HEIGHT = 38;
 const IMAGE_NODE_DEFAULT_STAGE_HEIGHT = IMAGE_NODE_WIDTH;
 const IMAGE_NODE_MAX_STAGE_HEIGHT = 800;
 const VIDEO_NODE_DEFAULT_STAGE_HEIGHT = 330;
+const AUDIO_NODE_DEFAULT_STAGE_HEIGHT = 150;
 const MEDIA_NODE_PROMPT_GAP = 14;
 const MEDIA_NODE_PROMPT_WIDTH = 620;
 const MEDIA_NODE_PROMPT_HEIGHT = 218;
@@ -220,6 +231,7 @@ const capabilities = ref<Capabilities>({
   video: false,
   referenceImageUpload: false,
   videoUpload: false,
+  audioUpload: false,
 });
 const modelOptions = ref<CanvasModelOptions>({
   imageModel: 'gpt-image-2',
@@ -279,7 +291,7 @@ const {
   maxWaitMs: 5_000,
   retryDelayMs: 5_000,
   initialPaused: true,
-  isTerminalError: (error) => error instanceof HttpRequestError && [405, 409].includes(error.status || 0),
+  isTerminalError: (error) => error instanceof HttpRequestError && error.status === 409,
 });
 
 const {
@@ -420,7 +432,9 @@ function isExpandedImageNode(node: CanvasNodeModel) {
 
 function baseMediaNodeWidth(node: CanvasNodeModel | NodeKind) {
   const kind = typeof node === 'string' ? node : node.type;
-  return kind === 'image' ? IMAGE_NODE_WIDTH : VIDEO_NODE_WIDTH;
+  if (kind === 'image') return IMAGE_NODE_WIDTH;
+  if (kind === 'audio') return AUDIO_NODE_WIDTH;
+  return VIDEO_NODE_WIDTH;
 }
 
 function mediaNodeWidth(node: CanvasNodeModel | NodeKind) {
@@ -435,6 +449,7 @@ function mediaNodeWidth(node: CanvasNodeModel | NodeKind) {
 function hasMediaPreview(node: CanvasNodeModel) {
   if (node.resultUrl || node.resultUrls?.some(Boolean)) return true;
   if (node.type === 'video') return Boolean(node.inputUrl);
+  if (node.type === 'audio') return Boolean(node.inputAudioUrl);
   return node.references.some((reference) => reference.uploadState !== 'failed');
 }
 
@@ -442,20 +457,21 @@ function mediaStageHeight(node: CanvasNodeModel | NodeKind) {
   const kind = typeof node === 'string' ? node : node.type;
   const defaultHeight = kind === 'image'
     ? IMAGE_NODE_DEFAULT_STAGE_HEIGHT
-    : VIDEO_NODE_DEFAULT_STAGE_HEIGHT;
+    : kind === 'audio' ? AUDIO_NODE_DEFAULT_STAGE_HEIGHT : VIDEO_NODE_DEFAULT_STAGE_HEIGHT;
   if (typeof node === 'string' || !hasMediaPreview(node)) return defaultHeight;
   const ratio = node.previewAspectRatio;
   if (!ratio || !Number.isFinite(ratio) || ratio <= 0) return defaultHeight;
   const naturalHeight = baseMediaNodeWidth(node) / ratio;
   return kind === 'image'
     ? Math.min(IMAGE_NODE_MAX_STAGE_HEIGHT, naturalHeight)
-    : naturalHeight;
+    : kind === 'audio' ? AUDIO_NODE_DEFAULT_STAGE_HEIGHT : naturalHeight;
 }
 
 function mediaNodeHeight(node: CanvasNodeModel | NodeKind, showPrompt = true) {
+  const kind = typeof node === 'string' ? node : node.type;
   return MEDIA_NODE_HEADER_HEIGHT
     + mediaStageHeight(node)
-    + (showPrompt ? MEDIA_NODE_PROMPT_GAP + MEDIA_NODE_PROMPT_HEIGHT : 0);
+    + (showPrompt && kind !== 'audio' ? MEDIA_NODE_PROMPT_GAP + MEDIA_NODE_PROMPT_HEIGHT : 0);
 }
 
 function nodeDimensions(node: CanvasNodeModel | NodeKind) {
@@ -671,7 +687,7 @@ function makeId(prefix: string) {
 }
 
 function nodeTitle(kind: NodeKind) {
-  const prefix = kind === 'image' ? '图片节点' : kind === 'video' ? '视频节点' : '文本节点';
+  const prefix = kind === 'image' ? '图片节点' : kind === 'video' ? '视频节点' : kind === 'audio' ? '音频节点' : '文本节点';
   const used = new Set(nodes.value
     .filter((node) => node.type === kind)
     .map((node) => Number(node.title.match(/(\d+)\s*$/)?.[1] || 0))
@@ -697,6 +713,9 @@ function createNode(kind: NodeKind, x?: number, y?: number): CanvasNodeModel {
     quality: 'auto',
     thinkingLevel: 'minimal',
     duration: 5,
+    videoVersion: '',
+    videoRequestMode: '',
+    videoReferenceMode: '',
     imageCount: 1,
     primaryImageIndex: 0,
     galleryExpanded: false,
@@ -1185,12 +1204,13 @@ function connectNodes(from: string, to: string, requestedImageIndex?: number) {
 }
 
 function mediaReferenceLabel(node: CanvasNodeModel) {
-  const match = node.title.match(/^(图片|视频)节点\s*(.+)$/);
+  const match = node.title.match(/^(图片|视频|音频)节点\s*(.+)$/);
   return match ? `${match[1]} ${match[2]}` : node.title;
 }
 
 function mediaReferencePreview(node: CanvasNodeModel, imageIndex?: number) {
   if (node.type === 'video') return node.resultUrl || node.inputUrl || '';
+  if (node.type === 'audio') return node.inputAudioUrl || '';
   return imageResultUrl(node, imageIndex ?? primaryImageIndex(node))
     || [...node.references].reverse().find((reference) => reference.uploadState !== 'failed')?.previewUrl
     || '';
@@ -1204,7 +1224,7 @@ function canvasMediaReference(node: CanvasNodeModel, direct: boolean, requestedI
   const resultLabel = imageIndex !== undefined && resultCount > 1 ? ` · 图 ${imageIndex + 1}` : '';
   return {
     nodeId: node.id,
-    type: node.type as 'image' | 'video',
+    type: node.type as 'image' | 'video' | 'audio',
     label: `${mediaReferenceLabel(node)}${resultLabel}`,
     title: `${node.title}${resultLabel}`,
     previewUrl: mediaReferencePreview(node, imageIndex),
@@ -1215,7 +1235,7 @@ function canvasMediaReference(node: CanvasNodeModel, direct: boolean, requestedI
 
 function promptReferences(nodeId: string) {
   return directSourceNodes(nodeId)
-    .filter((node): node is CanvasNodeModel & { type: 'image' | 'video' } => node.type === 'image' || node.type === 'video')
+    .filter((node): node is CanvasNodeModel & { type: 'image' | 'video' | 'audio' } => node.type === 'image' || node.type === 'video' || node.type === 'audio')
     .map((node) => canvasMediaReference(node, true, sourceImageIndexForTarget(node, nodeId)));
 }
 
@@ -1223,7 +1243,7 @@ function promptReferenceCandidates(nodeId: string) {
   const referencedIds = new Set((incomingConnectionsByNode.value.get(nodeId) || [])
     .map((connection) => connection.from));
   return nodes.value
-    .filter((node) => node.id !== nodeId && (node.type === 'image' || node.type === 'video'))
+    .filter((node) => node.id !== nodeId && (node.type === 'image' || node.type === 'video' || node.type === 'audio'))
     .filter((node) => !referencedIds.has(node.id) && !connectionCreatesCycle(node.id, nodeId))
     .map((node) => canvasMediaReference(node, true, node.type === 'image' ? primaryImageIndex(node) : undefined));
 }
@@ -1814,6 +1834,40 @@ async function uploadNodeMedia(file: File, nodeId: string) {
     await addReference(file, node.id);
     return;
   }
+  if (node.type === 'audio') {
+    if (!capabilities.value.audioUpload) {
+      showToast('服务器尚未配置音频存储。');
+      return;
+    }
+    const supportedAudio = file.type.startsWith('audio/')
+      || /\.(mp3|wav|m4a|aac|ogg|flac)$/i.test(file.name);
+    if (!supportedAudio) {
+      showToast('请选择 MP3、WAV、M4A、AAC、OGG 或 FLAC 音频。');
+      return;
+    }
+    if (file.size > 250 * 1024 * 1024) {
+      showToast('音频不能超过 250 MB。');
+      return;
+    }
+    const previousStatus = node.status;
+    node.status = 'uploading';
+    node.error = undefined;
+    try {
+      const result = await uploadCanvasAudio(file);
+      node.inputAudioId = result.id;
+      node.inputAudioUrl = result.url;
+      node.audioDuration = Number(result.duration || 0) || undefined;
+      node.audioMimeType = file.type || undefined;
+      node.status = 'ready';
+      node.resultUrl = undefined;
+    } catch (error) {
+      node.status = previousStatus;
+      node.error = `音频上传失败：${messageFrom(error)}`;
+    } finally {
+      commitCanvasHistory();
+    }
+    return;
+  }
   if (!capabilities.value.videoUpload) {
     showToast('服务器尚未配置媒体存储。');
     return;
@@ -1879,11 +1933,12 @@ function generationPrompt(
   directSources: CanvasNodeModel[],
   videoSpec?: VideoGenerationModelSpec,
 ) {
+  const promptVideoSpec = videoModelMediaSpec(videoSpec, node.videoRequestMode || '');
   let imageIndex = 0;
   const mediaContext = directSources
-    .filter((item) => item.type === 'image' || item.type === 'video')
+    .filter((item) => item.type === 'image' || item.type === 'video' || item.type === 'audio')
     .map((item) => {
-      const role = item.type === 'image' ? videoFrameRole(videoSpec, imageIndex++) : '';
+      const role = item.type === 'image' ? videoFrameRole(promptVideoSpec, imageIndex++) : '';
       const sourceImageIndex = sourceImageIndexForTarget(item, node.id);
       const resultLabel = sourceImageIndex !== undefined && imageResultUrls(item).length > 1
         ? ` · 图 ${sourceImageIndex + 1}`
@@ -1892,7 +1947,9 @@ function generationPrompt(
       const label = role ? `${role} · ${sourceLabel}` : sourceLabel;
       const purpose = role
         ? `${role}画面`
-        : item.type === 'image' ? '图片视觉参考' : '视频动作、节奏和运镜语义参考';
+        : item.type === 'image' ? '图片视觉参考'
+          : item.type === 'video' ? '视频动作、节奏和运镜语义参考'
+            : '音频节奏、音色或声音风格参考';
       const analysisLines = item.type === 'video' ? videoAnalysisPromptLines(item.videoAnalysis) : [];
       return [
         `- [${label}]：${analysisLines.length ? '已解析的视频内容参考' : purpose}`,
@@ -1909,9 +1966,27 @@ function generationPrompt(
   ].filter(Boolean).join('\n\n');
 }
 
-function videoReferenceReadinessError(directSources: CanvasNodeModel[]) {
-  for (const source of directSources) {
-    if (source.type !== 'video' || !source.inputVideoId) continue;
+function videoReferenceReadinessError(node: CanvasNodeModel, directSources: CanvasNodeModel[]) {
+  const sources = [
+    ...(node.type === 'video' && (node.inputVideoId || node.inputUrl) ? [node] : []),
+    ...directSources.filter((source) => source.type === 'video'),
+  ];
+  for (const source of sources) {
+    const hasVideoMedia = Boolean(
+      source.inputVideoId
+      || source.inputUrl
+      || source.resultUrl
+      || source.resultUrls?.some(Boolean),
+    );
+    if (!hasVideoMedia) {
+      if (source.taskId && ['uploading', 'generating'].includes(source.status)) {
+        return `${source.title} 视频任务尚未完成，请等待视频生成后再引用。`;
+      }
+      return `${source.title} 没有可用的视频地址，请先上传或生成视频。`;
+    }
+    if (!source.inputVideoId) {
+      return `${source.title} 缺少可追踪的视频分析资产，请重新上传或重新生成后再引用。`;
+    }
     const status = normalizeVideoAnalysisStatus(source.videoAnalysisStatus);
     if (status === 'failed') {
       return `${source.title} 解析失败，请在该视频节点重试解析后再生成。`;
@@ -1923,8 +1998,27 @@ function videoReferenceReadinessError(directSources: CanvasNodeModel[]) {
   return '';
 }
 
+async function registerGeneratedVideoReferences(node: CanvasNodeModel, directSources: CanvasNodeModel[]) {
+  const candidates = directSources.filter((source) => (
+    source.type === 'video'
+    && (source.resultUrl || source.inputUrl)
+    && source.taskId
+    && !source.inputVideoId
+  ));
+  for (const source of candidates) {
+    const asset = await registerCanvasVideoResultForAnalysis(source.taskId as string, activeWorkflowId.value);
+    source.inputVideoId = asset.videoId;
+    source.inputUrl = asset.url || source.inputUrl || source.resultUrl;
+    mergeVideoAnalysisAsset(source, asset);
+  }
+  if (candidates.length) {
+    touchCanvasDocument();
+    scheduleVideoAnalysisPolling(250);
+  }
+}
+
 function generationReferences(node: CanvasNodeModel, directSources: CanvasNodeModel[]) {
-  const values = [
+  const imageValues = [
     ...node.references.filter((item) => item.uploadState === 'ready').map((item) => item.url),
     ...directSources.flatMap((item) => {
       if (item.type !== 'image') return [];
@@ -1935,12 +2029,34 @@ function generationReferences(node: CanvasNodeModel, directSources: CanvasNodeMo
         .map((reference) => reference.url);
     }),
   ];
-  return Array.from(new Set(values.filter((value): value is string => Boolean(value && /^https?:\/\//i.test(value)))));
+  const videoValues = [
+    ...(node.inputUrl ? [node.inputUrl] : []),
+    ...directSources.flatMap((item) => (
+      item.type === 'video' && (item.inputUrl || item.resultUrl)
+        ? [item.inputUrl || item.resultUrl || '']
+        : []
+    )),
+  ];
+  const audioValues = [
+    ...(node.inputAudioUrl ? [node.inputAudioUrl] : []),
+    ...directSources.flatMap((item) => item.type === 'audio' && item.inputAudioUrl ? [item.inputAudioUrl] : []),
+  ];
+  const uniqueHttpUrls = (values: string[]) => Array.from(new Set(
+    values.filter((value): value is string => Boolean(value && /^https?:\/\//i.test(value))),
+  ));
+  return {
+    imageUrls: uniqueHttpUrls(imageValues),
+    videoUrls: uniqueHttpUrls(videoValues),
+    audioUrls: uniqueHttpUrls(audioValues),
+  };
 }
 
-function videoGenerationMode(node: CanvasNodeModel): 'text_to_video' | 'image_to_video' {
-  const hasImageInput = node.references.length > 0
-    || directSourceNodes(node.id).some((item) => item.type === 'image');
+function videoGenerationMode(node: CanvasNodeModel): 'text_to_video' | 'image_to_video' | 'video_to_video' {
+  const directSources = directSourceNodes(node.id);
+  const hasVideoInput = Boolean(node.inputUrl || node.inputVideoId)
+    || directSources.some((item) => item.type === 'video' && (item.inputUrl || item.resultUrl || item.inputVideoId));
+  const hasImageInput = node.references.length > 0 || directSources.some((item) => item.type === 'image');
+  if (hasVideoInput) return 'video_to_video';
   if (hasImageInput) return 'image_to_video';
   const selectedModel = modelOptions.value.videoModels.find((item) => item.id === node.model);
   if (selectedModel?.modes.includes('image_to_video') && !selectedModel.modes.includes('text_to_video')) {
@@ -1950,21 +2066,65 @@ function videoGenerationMode(node: CanvasNodeModel): 'text_to_video' | 'image_to
 }
 
 function videoModelSpec(node: CanvasNodeModel, mode = videoGenerationMode(node)): VideoGenerationModelSpec | undefined {
-  const available = modelOptions.value.videoModels.filter((item) => item.modes.includes(mode));
-  return available.find((item) => item.id === node.model) || available[0];
+  return selectVideoModelForMode(modelOptions.value.videoModels, mode, node.model);
 }
 
 function syncVideoNodeOptions(node: CanvasNodeModel, spec: VideoGenerationModelSpec) {
   node.model = spec.id;
+  const requestModes = spec.request_mode_options || [];
+  node.videoRequestMode = requestModes.includes(node.videoRequestMode || '')
+    ? node.videoRequestMode
+    : spec.request_mode_default || requestModes[0] || '';
+  const requestMode = node.videoRequestMode || '';
+  const referenceModes = spec.reference_mode_options || [];
+  node.videoReferenceMode = referenceModes.includes(node.videoReferenceMode || '')
+    ? node.videoReferenceMode
+    : spec.reference_mode_default || referenceModes[0] || '';
+  const versions = spec.secondary_options || [];
+  node.videoVersion = versions.includes(node.videoVersion || '')
+    ? node.videoVersion
+    : spec.secondary_default_option || versions[0] || '';
   if (!spec.aspect_ratios.includes(node.aspectRatio)) {
     node.aspectRatio = spec.aspect_ratios[0] || '16:9';
   }
   if (!spec.durations.includes(node.duration)) {
     node.duration = spec.default_duration ?? spec.durations[0] ?? 5;
   }
-  if (!spec.options.includes(node.quality)) {
-    node.quality = spec.default_option || spec.options[0] || '';
+  const allowedOptions = videoModelOptionsForSecondary(spec, node.videoVersion);
+  if (!allowedOptions.includes(node.quality)) {
+    node.quality = allowedOptions[0] || spec.default_option || spec.options[0] || '';
   }
+  // Keep the selected mode in the node so a saved canvas reproduces the same request.
+  if (!requestModes.length) node.videoRequestMode = '';
+}
+
+function videoRequestMode(node: CanvasNodeModel, spec: VideoGenerationModelSpec) {
+  const options = spec.request_mode_options || [];
+  return options.includes(node.videoRequestMode || '')
+    ? node.videoRequestMode || ''
+    : spec.request_mode_default || options[0] || '';
+}
+
+function videoReferenceMode(node: CanvasNodeModel, spec: VideoGenerationModelSpec) {
+  const options = spec.reference_mode_options || [];
+  return options.includes(node.videoReferenceMode || '')
+    ? node.videoReferenceMode || ''
+    : spec.reference_mode_default || options[0] || '';
+}
+
+function videoRequestParams(node: CanvasNodeModel, spec: VideoGenerationModelSpec, hasVideoReferences: boolean) {
+  const params: Record<string, unknown> = {};
+  const requestMode = videoRequestMode(node, spec);
+  if (spec.request_mode_param && requestMode) params[spec.request_mode_param] = requestMode;
+  if (spec.secondary_option_key && node.videoVersion) {
+    const versions = spec.secondary_options || [];
+    if (versions.includes(node.videoVersion)) params[spec.secondary_option_key] = node.videoVersion;
+  }
+  const referenceMode = videoReferenceMode(node, spec);
+  if (spec.reference_mode_param && requestMode === 'cankaosheng' && hasVideoReferences && referenceMode) {
+    params[spec.reference_mode_param] = referenceMode;
+  }
+  return params;
 }
 
 function updateTaskProgress(node: CanvasNodeModel, task: { progress?: string; cost?: number }) {
@@ -2004,13 +2164,19 @@ async function downloadNodeImage(nodeId: string, imageIndex: number) {
 
 async function generateNode(nodeId: string) {
   const node = nodeById.value.get(nodeId);
-  if (!node || node.type === 'text') return;
+  if (!node || node.type === 'text' || node.type === 'audio') return;
   if (!node.prompt.trim()) {
     node.error = '请先填写提示词。';
     return;
   }
   const directSources = directSourceNodes(node.id);
-  const videoReferenceError = videoReferenceReadinessError(directSources);
+  try {
+    await registerGeneratedVideoReferences(node, directSources);
+  } catch (error) {
+    node.error = `视频解析任务创建失败：${messageFrom(error)}`;
+    return;
+  }
+  const videoReferenceError = videoReferenceReadinessError(node, directSources);
   if (videoReferenceError) {
     node.error = videoReferenceError;
     return;
@@ -2020,6 +2186,10 @@ async function generateNode(nodeId: string) {
     showToast('上传失败的参考图已跳过。');
   }
   const videoMode = node.type === 'video' ? videoGenerationMode(node) : undefined;
+  if (node.type === 'video' && videoMode === 'video_to_video' && usableReferences.videoUrls.length === 0) {
+    node.error = '已连接视频节点，但没有可用的视频地址，请先上传或生成视频。';
+    return;
+  }
   const selectedVideoSpec = node.type === 'video' ? videoModelSpec(node, videoMode) : undefined;
   const model = node.type === 'image'
     ? node.model || modelOptions.value.imageModel
@@ -2030,9 +2200,15 @@ async function generateNode(nodeId: string) {
   }
   if (node.type === 'video' && selectedVideoSpec) {
     syncVideoNodeOptions(node, selectedVideoSpec);
+    const selectedRequestMode = videoRequestMode(node, selectedVideoSpec);
+    const selectedMediaSpec = videoModelMediaSpec(selectedVideoSpec, selectedRequestMode);
+    const selectedReferenceMode = videoReferenceMode(node, selectedVideoSpec);
+    const maxImages = Number(selectedMediaSpec?.max_images ?? selectedVideoSpec.max_images ?? 30);
+    const maxVideos = Number(selectedMediaSpec?.max_videos ?? selectedVideoSpec.max_videos ?? 0);
+    const maxAudios = Number(selectedMediaSpec?.max_audios ?? selectedVideoSpec.max_audios ?? 0);
     if (videoMode === 'image_to_video') {
-      const referenceCount = usableReferences.length;
-      if (videoModelUsesFirstLastFrames(selectedVideoSpec)) {
+      const referenceCount = usableReferences.imageUrls.length;
+      if (videoModelUsesFirstLastFramesForMode(selectedVideoSpec, selectedRequestMode)) {
         if (referenceCount < 1) {
           node.error = `${selectedVideoSpec.label} 请先连接或引用一张首帧图片。`;
           return;
@@ -2042,15 +2218,59 @@ async function generateNode(nodeId: string) {
           return;
         }
       } else {
-        if (referenceCount < selectedVideoSpec.min_images) {
-          node.error = `${selectedVideoSpec.label} 至少需要 ${selectedVideoSpec.min_images} 张已生成或已上传的参考图。`;
+        const minImages = Number(selectedVideoSpec.min_images || 0) || 1;
+        if (referenceCount < minImages) {
+          node.error = `${selectedVideoSpec.label} 至少需要 ${minImages} 张已生成或已上传的参考图。`;
           return;
         }
-        if (referenceCount > selectedVideoSpec.max_images) {
-          node.error = `${selectedVideoSpec.label} 最多支持 ${selectedVideoSpec.max_images} 张参考图，当前有 ${referenceCount} 张。`;
+        if (referenceCount > maxImages) {
+          node.error = `${selectedVideoSpec.label} 最多支持 ${maxImages} 张参考图，当前有 ${referenceCount} 张。`;
           return;
         }
       }
+    }
+    if (selectedRequestMode === 'shouweizhen' && (usableReferences.videoUrls.length || usableReferences.audioUrls.length)) {
+      node.error = '首尾帧模式只支持图片首帧和尾帧，请移除视频或音频引用。';
+      return;
+    }
+    if (selectedReferenceMode === 'edit' && !usableReferences.videoUrls.length) {
+      node.error = '编辑视频模式需要先连接或引用视频。';
+      return;
+    }
+    if (selectedReferenceMode === 'extend' && (
+      !usableReferences.videoUrls.length
+      || usableReferences.videoUrls.length > 3
+      || usableReferences.imageUrls.length
+      || usableReferences.audioUrls.length
+    )) {
+      node.error = '延长视频模式只支持 1 到 3 个视频，不能同时带图片或音频。';
+      return;
+    }
+    if (usableReferences.audioUrls.length && !maxAudios) {
+      node.error = `${selectedVideoSpec.label} 不支持参考音频。`;
+      return;
+    }
+    if (maxAudios && usableReferences.audioUrls.length > maxAudios) {
+      node.error = `${selectedVideoSpec.label} 最多支持 ${maxAudios} 段参考音频。`;
+      return;
+    }
+    if (usableReferences.videoUrls.length && !maxVideos) {
+      node.error = `${selectedVideoSpec.label} 不支持参考视频。`;
+      return;
+    }
+    if (maxVideos && usableReferences.videoUrls.length > maxVideos) {
+      node.error = `${selectedVideoSpec.label} 最多支持 ${maxVideos} 个参考视频。`;
+      return;
+    }
+    const minMediaInputs = Number(selectedVideoSpec.min_media_inputs || 0);
+    const mediaCount = usableReferences.imageUrls.length + usableReferences.videoUrls.length + usableReferences.audioUrls.length;
+    if (mediaCount < minMediaInputs) {
+      node.error = `${selectedVideoSpec.label} 至少需要一项图片、视频或音频参考。`;
+      return;
+    }
+    if (usableReferences.audioUrls.length && !usableReferences.imageUrls.length && !usableReferences.videoUrls.length && selectedVideoSpec.allow_audio_only === false) {
+      node.error = `${selectedVideoSpec.label} 不能只使用音频参考，请连接图片或视频。`;
+      return;
     }
   }
   commitCanvasHistory();
@@ -2075,7 +2295,7 @@ async function generateNode(nodeId: string) {
         quality: node.quality,
         thinkingLevel: node.thinkingLevel,
         imageCount: node.imageCount,
-        references: usableReferences,
+        references: usableReferences.imageUrls,
         workflowId: activeWorkflowId.value,
         nodeId: node.id,
         signal: controller.signal,
@@ -2089,7 +2309,10 @@ async function generateNode(nodeId: string) {
         aspectRatio: node.aspectRatio,
         duration: node.duration,
         quality: node.quality,
-        references: usableReferences,
+        imageReferences: usableReferences.imageUrls,
+        videoReferences: usableReferences.videoUrls,
+        audioReferences: usableReferences.audioUrls,
+        params: selectedVideoSpec ? videoRequestParams(node, selectedVideoSpec, usableReferences.videoUrls.length > 0) : {},
         workflowId: activeWorkflowId.value,
         nodeId: node.id,
         signal: controller.signal,
@@ -2116,7 +2339,7 @@ async function generateNode(nodeId: string) {
 
 async function resumeNodeTask(nodeId: string) {
   const node = nodeById.value.get(nodeId);
-  if (!node || node.type === 'text' || !node.taskId) return;
+  if (!node || node.type === 'text' || node.type === 'audio' || !node.taskId) return;
   taskControllers.get(node.id)?.abort();
   const controller = new AbortController();
   taskControllers.set(node.id, controller);
@@ -2362,7 +2585,7 @@ async function openWorkflow(summary: WorkflowSummary) {
     scheduleVideoAnalysisPolling(250);
     for (const node of nodes.value.filter((item) => (
       item.status === 'generating' || (item.status === 'ready' && !item.resultUrl)
-    ) && item.taskId && item.type !== 'text')) {
+    ) && item.taskId && item.type !== 'text' && item.type !== 'audio')) {
       void resumeNodeTask(node.id);
     }
   } catch (error) {
@@ -2723,7 +2946,11 @@ onBeforeUnmount(() => {
             :connection-target-offset="connectionTargetPoint?.nodeId === node.id ? connectionTargetPoint.offset : undefined"
             :image-enabled="capabilities.image"
             :video-enabled="capabilities.video"
-            :upload-enabled="node.type === 'image' ? capabilities.referenceImageUpload : capabilities.videoUpload"
+            :upload-enabled="node.type === 'image'
+              ? capabilities.referenceImageUpload
+              : node.type === 'video'
+                ? capabilities.videoUpload
+                : capabilities.audioUpload"
             :image-models="modelOptions.imageModels"
             :video-models="modelOptions.videoModels"
             :video-mode="node.type === 'video' ? videoGenerationMode(node) : 'text_to_video'"
@@ -2778,6 +3005,7 @@ onBeforeUnmount(() => {
             <p class="context-menu-heading">添加节点</p>
             <button type="button" role="menuitem" @click="addNodeFromContext('image')"><ImageIcon :size="15" /> 图片节点</button>
             <button type="button" role="menuitem" @click="addNodeFromContext('video')"><Video :size="15" /> 视频节点</button>
+            <button type="button" role="menuitem" @click="addNodeFromContext('audio')"><Music2 :size="15" /> 音频节点</button>
             <button type="button" role="menuitem" @click="addNodeFromContext('text')"><FileText :size="15" /> 文本节点</button>
           </template>
         </div>

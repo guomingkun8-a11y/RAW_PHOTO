@@ -34,6 +34,40 @@ class PromptAnalysisApiTests(unittest.TestCase):
         self.assertEqual(8, len(payload["items"]))
         self.assertIn("luxury_atmosphere", {item["id"] for item in payload["items"]})
 
+    def test_prompt_analysis_queues_twenty_reference_images(self):
+        expected = {"agentRun": {"runId": "analysis-1", "status": "pending"}}
+        images = [
+            {"name": f"reference-{index}.png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(20)
+        ]
+        with (
+            mock.patch.object(prompt_analysis_module, "start_prompt_analysis_run", return_value=expected) as start,
+            mock.patch.object(prompt_analysis_module, "filter_or_log", new=mock.AsyncMock()),
+        ):
+            response = self.client.post(
+                "/api/image-prompt/analyze",
+                headers=AUTH_HEADERS,
+                json={"action": "optimize", "mode": "single", "prompt": "分析全部参考图", "images": images},
+            )
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(expected, response.json())
+        self.assertEqual(20, len(start.call_args.args[0]["images"]))
+        self.assertEqual("https://cdn.example.test/0.png", start.call_args.args[0]["images"][0]["url"])
+
+    def test_prompt_analysis_rejects_twenty_one_reference_images(self):
+        images = [
+            {"name": f"reference-{index}.png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(21)
+        ]
+        response = self.client.post(
+            "/api/image-prompt/analyze",
+            headers=AUTH_HEADERS,
+            json={"action": "optimize", "mode": "single", "images": images},
+        )
+
+        self.assertEqual(422, response.status_code, response.text)
+
     def test_professional_prompt_endpoint_accepts_prompt_only(self):
         expected = {
             "model": "gpt-5.6-sol",

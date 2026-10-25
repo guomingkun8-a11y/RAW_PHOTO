@@ -32,7 +32,15 @@ import {
   type RealtimeImageTaskProgressEvent,
   type SettingsConfig,
 } from "@/lib/api";
+import { HttpRequestError } from "@/lib/request";
 import { BUILTIN_IMAGE_MODELS, filterImageModels, formatImageModel, isImageModel } from "@/lib/image-models";
+import {
+  inferImageRatio,
+  parseImageSize,
+  resolveExplicitImageSizeFromPrompt,
+  resolveImageSizeFromPrompt,
+  resolveSourceImageSize,
+} from "@/lib/image-output-size";
 import { PROMPT_TEMPLATE_USE_STORAGE_KEY, storageKey } from "@/lib/storage-namespace";
 import {
   clearImageConversations,
@@ -69,12 +77,15 @@ const IMAGE_COUNT_STORAGE_KEY = storageKey("gmkraw:image_last_count");
 const IMAGE_COUNT_DEFAULT_MIGRATION_KEY = storageKey("gmkraw:image_count_default_one_applied");
 const DEFAULT_IMAGE_COUNT = "1";
 const REFERENCE_UPLOAD_CONCURRENCY = 2;
+const REFERENCE_IMAGE_MAX = 20;
+const GENERATION_REFERENCE_IMAGE_MAX = 14;
 const SCENE_IMAGE_OPTIMIZE_MIN_BYTES = 768 * 1024;
 const SCENE_IMAGE_MAX_DIMENSION = 2048;
 const SCENE_IMAGE_WEBP_QUALITY = 0.92;
 const DEFAULT_OWNER_CONCURRENCY = 3;
 const DEFAULT_OWNER_PENDING_LIMIT = 30;
 const TASK_STATUS_PERSIST_INTERVAL_MS = 5000;
+const UPSTREAM_CANCEL_WARNING = "确认后会标记本地取消并继续核对上游结果，但无法保证上游停止生成，任务仍可能完成并产生费用。";
 const BATCH_REPLACE_BASE_PROMPT = [
   "以第一张参考图作为唯一商品主体，逐张处理第二张参考图。",
   "把第二张参考图中的原商品替换为第一张参考图里的商品。",
@@ -162,74 +173,6 @@ function isCanceledFailureReport(report: VisibleFailureReport) {
 function clampImageCount(value: string, max = 100) {
   return String(Math.min(Math.max(1, max), Math.max(1, Math.floor(Number(value) || 1))));
 }
-function parseImageSize(size: unknown) {
-  const text = typeof size === "string" ? size : "";
-  const match = text.match(/^(\d+)x(\d+)$/);
-  return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
-}
-function inferImageRatio(size: string, fallback = "auto") {
-  const parsed = parseImageSize(size);
-  const width = Number(parsed.width);
-  const height = Number(parsed.height);
-  if (!width || !height) return fallback;
-  const candidates = [
-    { label: "1:1", value: 1 },
-    { label: "2:3", value: 2 / 3 },
-    { label: "3:2", value: 3 / 2 },
-    { label: "3:4", value: 3 / 4 },
-    { label: "4:3", value: 4 / 3 },
-    { label: "4:5", value: 4 / 5 },
-    { label: "5:4", value: 5 / 4 },
-    { label: "9:16", value: 9 / 16 },
-    { label: "16:9", value: 16 / 9 },
-  ];
-  const ratio = width / height;
-  const nearest = candidates.reduce((best, item) => Math.abs(item.value - ratio) < Math.abs(best.value - ratio) ? item : best);
-  return Math.abs(nearest.value - ratio) <= 0.025 ? nearest.label : fallback;
-}
-const IMAGE_SIZE_PRESETS: Record<string, string> = {
-  "1:1": "1024x1024",
-  "2:3": "1024x1536",
-  "3:2": "1536x1024",
-  "3:4": "1024x1365",
-  "4:3": "1365x1024",
-  "4:5": "1024x1280",
-  "5:4": "1280x1024",
-  "9:16": "1088x1920",
-  "16:9": "1920x1088",
-};
-function isNegatedSizeMatch(text: string, start: number) {
-  const prefix = text.slice(Math.max(0, start - 24), start);
-  const boundary = Math.max(...[",", "，", ".", "。", ";", "；", "!", "！", "?", "？"].map((marker) => prefix.lastIndexOf(marker)));
-  const clausePrefix = prefix.slice(boundary + 1);
-  return /(?:不要|不需要|不用|不是|排除|避免|非)\s*(?:使用|采用|选择|设置(?:为|成)?|做成|生成|输出|比例(?:为|是)?|尺寸(?:为|是)?)?\s*$/.test(clausePrefix);
-}
-function ratioToImageSize(widthRatio: number, heightRatio: number) {
-  const preset = IMAGE_SIZE_PRESETS[`${widthRatio}:${heightRatio}`];
-  if (preset) return preset;
-  if (widthRatio <= heightRatio) return `1024x${Math.round(1024 * heightRatio / Math.max(1, widthRatio))}`;
-  return `${Math.round(1024 * widthRatio / Math.max(1, heightRatio))}x1024`;
-}
-function resolveImageSizeFromPrompt(prompt: string, configuredSize: string) {
-  const text = prompt.toLowerCase().replace(/：/g, ":");
-  for (const match of text.matchAll(/(?<!\d)(\d{3,4})\s*[xX×]\s*(\d{3,4})(?!\d)/g)) {
-    if (!isNegatedSizeMatch(text, match.index)) return `${Number(match[1])}x${Number(match[2])}`;
-  }
-  for (const match of text.matchAll(/(?<!\d)(\d{1,2})\s*[:比]\s*(\d{1,2})(?!\d)/g)) {
-    if (!isNegatedSizeMatch(text, match.index)) return ratioToImageSize(Number(match[1]), Number(match[2]));
-  }
-  if (/(?:横版|横图|横向构图|宽图|landscape)/.test(text)) return IMAGE_SIZE_PRESETS["3:2"];
-  if (/(?:竖版|竖图|竖向构图|长图|portrait)/.test(text)) return IMAGE_SIZE_PRESETS["2:3"];
-  const compact = text.replace(/\s+/g, "");
-  const requestsDifferentRatio = [
-    "不要1:1", "不需要1:1", "不用1:1", "不是1:1", "非1:1",
-    "不要一比一", "不要方图", "不是方图", "非正方形",
-    "其他比例", "其它比例", "换个比例", "换一种比例",
-  ].some((marker) => compact.includes(marker));
-  if (!requestsDifferentRatio) return configuredSize;
-  const configured = parseImageSize(configuredSize);
-  return configured.width === configured.height ? IMAGE_SIZE_PRESETS["2:3"] : configuredSize;
-}
 function createId() { return `${Date.now()}-${Math.random().toString(16).slice(2)}`; }
 function imageTurnQueueKey(conversationId: string, turnId: string) { return `${conversationId}:${turnId}`; }
 function mergeAgentEvents(...groups: Array<AgentEvent[] | undefined>) {
@@ -290,7 +233,7 @@ function latestConversationReferences(conversation: ImageConversation | null) {
     const turn = conversation.turns[index];
     if (!isAgentImageTurn(turn)) continue;
     const references = turn.referenceImages.filter(hasUsableReference);
-    if (references.length) return references.slice(-4);
+    if (references.length) return references.slice(-REFERENCE_IMAGE_MAX);
   }
   return [];
 }
@@ -459,8 +402,38 @@ function readFileAsDataUrl(file: File) {
     reader.readAsDataURL(file);
   });
 }
+async function readImageDimensions(file: File) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    const dimensions = { width: bitmap.width, height: bitmap.height };
+    bitmap.close();
+    return dimensions;
+  } catch {
+    return new Promise<{ width?: number; height?: number }>((resolve) => {
+      const url = URL.createObjectURL(file);
+      const image = new Image();
+      image.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve({ width: image.naturalWidth || undefined, height: image.naturalHeight || undefined });
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve({});
+      };
+      image.src = url;
+    });
+  }
+}
 async function fileToReference(file: File): Promise<StoredReferenceImage> {
-  return { name: file.name, type: file.type || "image/png", dataUrl: await readFileAsDataUrl(file) };
+  const [dataUrl, dimensions] = await Promise.all([readFileAsDataUrl(file), readImageDimensions(file)]);
+  return { name: file.name, type: file.type || "image/png", dataUrl, ...dimensions };
+}
+async function filesToReferences(files: File[]) {
+  const references = new Array<StoredReferenceImage>(files.length);
+  await runWithConcurrency(files, 4, async (file, index) => {
+    references[index] = await fileToReference(file);
+  });
+  return references;
 }
 function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   const [header, content] = dataUrl.split(",", 2);
@@ -538,6 +511,8 @@ function storedImageToReference(image: StoredImage, fileName: string) {
         name: fileName,
         type: "image/png",
         dataUrl: `data:image/png;base64,${image.b64_json}`,
+        width: image.width,
+        height: image.height,
       },
     };
   }
@@ -548,7 +523,7 @@ function storedImageToReference(image: StoredImage, fileName: string) {
     : pathname.endsWith(".webp")
       ? "image/webp"
       : "image/png";
-  return { referenceImage: { name: fileName, type, url: image.url } };
+  return { referenceImage: { name: fileName, type, url: image.url, width: image.width, height: image.height } };
 }
 
 function referenceRole(image: StoredReferenceImage) {
@@ -639,7 +614,7 @@ function continuationAgentReferences(conversation: ImageConversation | null, pro
   if (shouldUseOriginalProductAnchor(prompt)) return productAnchorReferences(conversation);
   const workingCanvas = latestWorkingCanvasReference(conversation);
   const anchors = productAnchorReferences(conversation);
-  if (workingCanvas) return [workingCanvas, ...anchors].slice(0, 4);
+  if (workingCanvas) return [workingCanvas, ...anchors].slice(0, REFERENCE_IMAGE_MAX);
   return anchors.length ? anchors : latestConversationReferences(conversation);
 }
 
@@ -665,7 +640,7 @@ function normalizeUploadedAgentReference(image: StoredReferenceImage): StoredRef
   return { ...image, role: "reference" as const };
 }
 
-function pushUniqueReference(target: StoredReferenceImage[], image: StoredReferenceImage, max = 4) {
+function pushUniqueReference(target: StoredReferenceImage[], image: StoredReferenceImage, max = REFERENCE_IMAGE_MAX) {
   if (!hasUsableReference(image) || target.length >= max) return;
   const duplicateIndex = target.findIndex((current) =>
     Boolean((image.url && image.url === current.url) || (image.dataUrl && image.dataUrl === current.dataUrl)),
@@ -681,13 +656,13 @@ function agentReferencesForPrompt(
 ) {
   const uploads = uploadedReferences.filter(hasUsableReference).map(normalizeUploadedAgentReference);
   if (!uploads.length) return continuationAgentReferences(conversation, prompt);
-  if (!conversation || shouldUseUploadedReferencesOnly(prompt) || !shouldContinuePreviousAgentResult(prompt)) return uploads.slice(-4);
+  if (!conversation || shouldUseUploadedReferencesOnly(prompt) || !shouldContinuePreviousAgentResult(prompt)) return uploads.slice(-REFERENCE_IMAGE_MAX);
   const workingCanvas = latestWorkingCanvasReference(conversation);
-  if (!workingCanvas) return uploads.slice(-4);
+  if (!workingCanvas) return uploads.slice(-REFERENCE_IMAGE_MAX);
   const merged: StoredReferenceImage[] = [];
   pushUniqueReference(merged, workingCanvas);
   for (const image of uploads) pushUniqueReference(merged, image);
-  return merged.length ? merged : uploads.slice(-4);
+  return merged.length ? merged : uploads.slice(-REFERENCE_IMAGE_MAX);
 }
 
 async function buildReferencePayload(
@@ -721,7 +696,7 @@ async function buildReferencePayload(
 function agentReferencePayload(images: StoredReferenceImage[]) {
   return images
     .filter(hasUsableReference)
-    .slice(-4)
+    .slice(-REFERENCE_IMAGE_MAX)
     .map((image) => ({
       name: image.name,
       type: image.type,
@@ -756,12 +731,20 @@ function hasUsableReference(image: StoredReferenceImage) {
   return Boolean(String(image.dataUrl || "").trim() || String(image.url || "").trim());
 }
 
+function preferredSourceReference(images: StoredReferenceImage[]) {
+  return images.find((image) => referenceRole(image) === "working_canvas") || images[0];
+}
+
+function sourceRatioImageOptions(model: string) {
+  return /^gpt-image-2(?:\.5(?:-.+)?)?$/i.test(model) ? { aspectRatio: "auto" } : {};
+}
+
 async function prepareAgentReferencePayload(
   images: StoredReferenceImage[],
   turnId: string,
   preparedReferences: Map<string, ReferenceUploadItem> = new Map(),
 ): Promise<AgentReferencePayloadItem[]> {
-  const references = images.filter(hasUsableReference).slice(-4);
+  const references = images.filter(hasUsableReference).slice(-REFERENCE_IMAGE_MAX);
   if (!references.length) return [];
   const items = await Promise.all<AgentReferencePayloadItem | null>(references.map(async (image, index) => {
     const publicUrl = String(image.url || "").trim();
@@ -864,6 +847,7 @@ function progressLabel(progress?: string) {
     starting_generation: "正在提交生成",
     image_stream_resolve_start: "上游生成中",
     generating: "上游生成中",
+    cancellation_pending: "已标记本地取消，正在核对上游结果（仍可能计费）",
     receiving_image: "正在接收图片",
     stale_requeued: "超时后重新排队",
   };
@@ -902,7 +886,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       revised_prompt: first.revised_prompt,
       width: first.width,
       height: first.height,
-      requestedSize: first.requested_size,
+      requestedSize: first.requested_size || image.requestedSize,
       aspectRatioCorrected: first.aspect_ratio_corrected,
       error: undefined,
       durationMs: task.duration_ms,
@@ -915,11 +899,16 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
   const taskStatus = task.status === "queued" ? "queued" : task.status === "running" ? "running" : image.taskStatus;
   const batch = task.batch_progress;
   const batchProgress = batch ? `批次 ${batch.completed + batch.failed + batch.canceled}/${batch.total}` : "";
-  return { ...image, taskId: task.id, status: "loading", taskStatus, progress: progressLabel(task.progress) || batchProgress || image.progress, error: undefined, startTime: taskStatus === "running" && !image.startTime ? Date.now() : image.startTime, elapsedSecs: taskStatus === "running" && typeof task.elapsed_secs === "number" ? task.elapsed_secs : undefined, elapsedUpdatedAt: typeof task.elapsed_secs === "number" ? Date.now() : undefined };
+  const progress = task.cancellation_pending
+    ? "已标记本地取消，上游结果仍在核对，可能产生费用"
+    : progressLabel(task.progress) || batchProgress || image.progress;
+  return { ...image, taskId: task.id, status: "loading", taskStatus, progress, error: undefined, startTime: taskStatus === "running" && !image.startTime ? Date.now() : image.startTime, elapsedSecs: taskStatus === "running" && typeof task.elapsed_secs === "number" ? task.elapsed_secs : undefined, elapsedUpdatedAt: typeof task.elapsed_secs === "number" ? Date.now() : undefined };
 }
 function applyRealtimeTaskToImage(image: StoredImage, event: RealtimeImageTaskProgressEvent): StoredImage {
   const state = String(event.state || "").toLowerCase();
-  const progress = progressLabel(event.progress) || image.progress;
+  const progress = event.cancellation_pending
+    ? "已标记本地取消，上游结果仍在核对，可能产生费用"
+    : progressLabel(event.progress) || image.progress;
   const base = {
     ...image,
     taskId: event.task_id,
@@ -1146,6 +1135,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   const imageTier = ref("1k");
   const imageWidth = ref("1024");
   const imageHeight = ref("1024");
+  const imageRatioExplicitlySelected = ref(false);
   const imageQuality = ref("auto");
   const imageModel = ref<ImageModel>("gpt-image-2");
   const imageModels = ref<ImageModel[]>([...BUILTIN_IMAGE_MODELS]);
@@ -1647,6 +1637,25 @@ export function useImageWorkspace(isAdmin: boolean) {
       scanQueues();
     }
   }
+  function useSourceRatioByDefault() {
+    if (imageRatioExplicitlySelected.value) return;
+    imageRatio.value = "source";
+    imageTier.value = "1k";
+    imageWidth.value = "1024";
+    imageHeight.value = "1024";
+  }
+  function markImageRatioExplicit() {
+    imageRatioExplicitlySelected.value = true;
+  }
+  function resetSourceRatio() {
+    if (imageRatio.value === "source") {
+      imageRatio.value = "1:1";
+      imageTier.value = "1k";
+      imageWidth.value = "1024";
+      imageHeight.value = "1024";
+    }
+    imageRatioExplicitlySelected.value = false;
+  }
   function clearComposer() {
     imagePrompt.value = "";
     referenceImages.value = [];
@@ -1654,6 +1663,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     batchProductImage.value = null;
     batchFolderImages.value = [];
     agentFolder.value = null;
+    resetSourceRatio();
   }
   function setSelectedConversationId(id: string | null, append: boolean) {
     selectedConversationId.value = id;
@@ -1699,7 +1709,8 @@ export function useImageWorkspace(isAdmin: boolean) {
         localStorage.setItem(IMAGE_COUNT_DEFAULT_MIGRATION_KEY, "true");
       }
       const storedTier = localStorage.getItem(IMAGE_TIER_STORAGE_KEY);
-      imageRatio.value = storedTier === "2k" ? "1:1" : localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) || "1:1";
+      const storedRatio = localStorage.getItem(IMAGE_RATIO_STORAGE_KEY);
+      imageRatio.value = storedTier === "2k" || storedRatio === "source" ? "1:1" : storedRatio || "1:1";
       imageTier.value = storedTier === "2k" ? "1k" : storedTier || "1k";
       imageQuality.value = localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) || "auto";
       imageCount.value = clampImageCount(localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) || DEFAULT_IMAGE_COUNT);
@@ -1785,12 +1796,23 @@ export function useImageWorkspace(isAdmin: boolean) {
 
   async function appendReferenceFiles(files: File[]) {
     if (!files.length) return;
+    const remaining = Math.max(0, REFERENCE_IMAGE_MAX - referenceImages.value.length);
+    if (!remaining) {
+      toast.error(`参考图最多上传 ${REFERENCE_IMAGE_MAX} 张`);
+      return;
+    }
+    const selected = files.slice(0, remaining);
+    if (selected.length < files.length) toast.error(`参考图最多上传 ${REFERENCE_IMAGE_MAX} 张，已保留前 ${selected.length} 张`);
     try {
-      const next = await Promise.all(files.map(fileToReference));
+      const next = await filesToReferences(selected);
       referenceImages.value = [...referenceImages.value, ...next];
+      useSourceRatioByDefault();
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取参考图失败"); }
   }
-  function removeReference(index: number) { referenceImages.value = referenceImages.value.filter((_, current) => current !== index); }
+  function removeReference(index: number) {
+    referenceImages.value = referenceImages.value.filter((_, current) => current !== index);
+    if (!referenceImages.value.length && !batchFolderImages.value.length) resetSourceRatio();
+  }
   async function appendAgentVideoFiles(files: File[]) {
     const selected = files.filter(isVideoFile).slice(0, Math.max(0, AGENT_VIDEO_MAX_ITEMS - agentVideos.value.length));
     if (!selected.length) {
@@ -1845,16 +1867,24 @@ export function useImageWorkspace(isAdmin: boolean) {
         toast.success(`已保存文件夹：${folder.itemCount} 张图片，Agent 将先分析摘要`);
         return;
       }
-      batchFolderImages.value = await Promise.all(files.map(fileToReference));
+      batchFolderImages.value = await filesToReferences(files);
       imageCount.value = String(batchFolderImages.value.length);
       preserveSubject.value = true;
+      useSourceRatioByDefault();
       if (batchProductImage.value && !imagePrompt.value.trim()) {
         imagePrompt.value = "把主图商品替换到每张文件夹图片中，保持原图场景、光线、构图和风格不变。";
       }
       toast.success(batchProductImage.value ? `已读取 ${files.length} 张文件夹图片，可批量换商品` : `已读取 ${files.length} 张文件夹图片，输入提示词后可批量生图`);
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取文件夹失败"); }
   }
-  function clearBatch() { agentFolder.value = null; batchProductImage.value = null; batchFolderImages.value = []; imageCount.value = DEFAULT_IMAGE_COUNT; toast.success("已清空批量素材"); }
+  function clearBatch() {
+    agentFolder.value = null;
+    batchProductImage.value = null;
+    batchFolderImages.value = [];
+    imageCount.value = DEFAULT_IMAGE_COUNT;
+    if (!referenceImages.value.length) resetSourceRatio();
+    toast.success("已清空批量素材");
+  }
 
   function createLoadingImages(turnId: string, count: number): StoredImage[] {
     return Array.from({ length: count }, (_, index) => {
@@ -1921,7 +1951,7 @@ export function useImageWorkspace(isAdmin: boolean) {
       const batchSourceImage = activeTurn.batchFolder && sourceIndex !== undefined ? activeTurn.batchFolder.folderImages[sourceIndex] : undefined;
       if (batchSourceImage) return [batchSourceImage];
       const indexedReference = sourceIndex !== undefined ? activeTurn.referenceImages[sourceIndex] : undefined;
-      return indexedReference ? [indexedReference] : activeTurn.referenceImages;
+      return indexedReference ? [indexedReference] : activeTurn.referenceImages.slice(0, GENERATION_REFERENCE_IMAGE_MAX);
     };
     const submitImage = async (image: StoredImage, imageIndex: number) => {
       const taskId = image.taskId || image.id;
@@ -1933,10 +1963,51 @@ export function useImageWorkspace(isAdmin: boolean) {
       const taskPrompt = buildCompliantImagePrompt(activeTurn.prompt, imageIndex, activeTurn.images.length, Boolean(activeTurn.batchReplace));
       const taskModel = resolveAllowedImageModel(activeTurn.model);
       const taskPromptEngineMode = activeTurn.promptEngine?.engineMode || (activeTurn.promptEngine ? "professional" : "standard");
+      const taskSize = image.requestedSize || activeTurn.size;
+      const taskImageOptions = activeTurn.ratio === "source" ? sourceRatioImageOptions(taskModel) : {};
       const task = activeTurn.mode === "edit"
-        ? await createImageEditTask(taskId, payload.files, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, payload.urls, activeTurn.preserveSubject === true, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, payload.referenceUploadMs, payload.referenceCacheHits, taskPromptEngineMode)
-        : await createImageGenerationTask(taskId, taskPrompt, taskModel, activeTurn.size, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, taskPromptEngineMode);
-      if (canceledImageTaskIds.has(taskId)) await cancelImageTask(taskId).catch(() => undefined);
+        ? await createImageEditTask(taskId, payload.files, taskPrompt, taskModel, taskSize, activeTurn.quality, payload.urls, activeTurn.preserveSubject === true, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, payload.referenceUploadMs, payload.referenceCacheHits, taskPromptEngineMode, taskImageOptions)
+        : await createImageGenerationTask(taskId, taskPrompt, taskModel, taskSize, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, taskPromptEngineMode);
+      if (canceledImageTaskIds.has(taskId)) {
+        const restoreTracking = async (latest: ImageTask) => {
+          canceledImageTaskIds.delete(taskId);
+          submittedImageTaskIds.add(taskId);
+          await updateConversation(conversationId, (current) => {
+            const conversation = current || snapshot;
+            const turns = conversation.turns.map((turn) => turn.id !== activeTurn.id ? turn : {
+              ...turn,
+              images: turn.images.map((item) => (item.taskId || item.id) === taskId
+                ? taskDataToStoredImage({ ...item, taskId }, latest)
+                : item),
+            });
+            return { ...conversation, updatedAt: new Date().toISOString(), turns };
+          });
+        };
+        try {
+          const preview = await cancelImageTask(taskId, { dryRun: true });
+          if (preview.requires_confirmation) {
+            const confirmed = window.confirm(
+              `该任务可能已提交上游。${UPSTREAM_CANCEL_WARNING}确定继续吗？`,
+            );
+            if (!confirmed) {
+              await restoreTracking(preview);
+              toast.info("已继续跟踪该任务，上游可能仍在生成");
+              return preview;
+            }
+            const requested = await cancelImageTask(taskId, { confirmUpstream: true });
+            if (requested.cancellation_pending) {
+              await restoreTracking(requested);
+              toast.info("已标记本地取消，上游结果仍在核对，可能产生费用");
+              return requested;
+            }
+          } else {
+            return await cancelImageTask(taskId);
+          }
+        } catch {
+          await restoreTracking(task);
+          toast.warning("取消状态未确认，系统会继续检查任务结果");
+        }
+      }
       return task;
     };
 
@@ -2334,6 +2405,10 @@ export function useImageWorkspace(isAdmin: boolean) {
     const isBatchFolder = Boolean(hasBatchFolder && !batchProductImage.value);
     const isImageAgent = promptEngineMode.value === "professional" && !isBatchReplace && !isBatchFolder;
     const composerReferences = referenceImages.value.filter(hasUsableReference);
+    if (!isBatchReplace && !isBatchFolder && composerReferences.length > GENERATION_REFERENCE_IMAGE_MAX) {
+      toast.error(`单次生图最多支持 ${GENERATION_REFERENCE_IMAGE_MAX} 张参考图，请移除多余图片后再提交`);
+      return;
+    }
     const currentAgentVideos = isImageAgent ? agentVideos.value.filter((video) => video.videoId && video.url).slice(-AGENT_VIDEO_MAX_ITEMS) : [];
     const referencePayload = isImageAgent ? agentReferencePayload(composerReferences) : [];
     if (!prompt && !isBatchReplace && !referencePayload.length && !currentAgentVideos.length && !hasAgentFolder) { toast.error("请输入提示词，或上传图片、视频、文件夹"); return; }
@@ -2401,11 +2476,33 @@ export function useImageWorkspace(isAdmin: boolean) {
       const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : folderId ? folderCount : resolveImageCountFromPrompt(prompt, selectedCount);
       const submitModel = resolveAllowedImageModel(imageModel.value);
       const configuredSize = `${imageWidth.value || 1024}x${imageHeight.value || 1024}`;
-      const resolvedSize = resolveImageSizeFromPrompt(conversationalPrompt, configuredSize);
-      const resolvedRatio = inferImageRatio(resolvedSize, imageRatio.value);
+      const explicitSize = resolveExplicitImageSizeFromPrompt(conversationalPrompt);
+      const sourceReference = batchReplace?.folderImages[0]
+        || batchFolder?.folderImages[0]
+        || preferredSourceReference(effectiveReferences);
+      const followsSourceRatio = mode === "edit" && imageRatio.value === "source" && !explicitSize;
+      const resolvedSize = explicitSize
+        || (followsSourceRatio ? resolveSourceImageSize(sourceReference, configuredSize) : null)
+        || resolveImageSizeFromPrompt(conversationalPrompt, configuredSize);
+      const resolvedRatio = followsSourceRatio ? "source" : inferImageRatio(resolvedSize, imageRatio.value);
       imageModel.value = submitModel;
       if (promptEngine && !promptEngine.model) promptEngine.model = submitModel;
       const agentCount = isImageAgent ? Math.min(folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, count) : count;
+      const loadingImages = batchReplace
+        ? createBatchLoadingImages(turnId, batchReplace.folderImages)
+        : batchFolder
+          ? createBatchLoadingImages(turnId, batchFolder.folderImages)
+          : isImageAgent
+            ? []
+            : createLoadingImages(turnId, agentCount);
+      loadingImages.forEach((image) => {
+        const itemSource = typeof image.sourceImageIndex === "number"
+          ? batchReplace?.folderImages[image.sourceImageIndex] || batchFolder?.folderImages[image.sourceImageIndex]
+          : sourceReference;
+        image.requestedSize = followsSourceRatio
+          ? resolveSourceImageSize(itemSource, configuredSize)
+          : resolvedSize;
+      });
       const turn: ImageTurn = {
         id: turnId,
         prompt: effectivePrompt,
@@ -2426,13 +2523,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         ratio: resolvedRatio,
         tier: imageTier.value,
         quality: imageQuality.value,
-        images: batchReplace
-          ? createBatchLoadingImages(turnId, batchReplace.folderImages)
-          : batchFolder
-            ? createBatchLoadingImages(turnId, batchFolder.folderImages)
-          : isImageAgent
-              ? []
-              : createLoadingImages(turnId, agentCount),
+        images: loadingImages,
         createdAt: now,
         status: isImageAgent ? "planning" : "queued",
       };
@@ -2508,7 +2599,35 @@ export function useImageWorkspace(isAdmin: boolean) {
     const batchFolder = source.batchFolder;
     const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : Math.max(1, source.count || source.images.length || 1);
     const isAgentTurn = Boolean(source.agentRequested || source.promptEngine?.mode === "professional");
-    const nextTurn: ImageTurn = { ...source, id: nextId, model: resolveAllowedImageModel(source.model), createdAt: now, status: isAgentTurn ? "planning" : "queued", error: undefined, agentRun: undefined, agentRequested: isAgentTurn, agentRetryImageId: undefined, agentProposal: undefined, agentAdvisor: undefined, images: batchReplace ? createBatchLoadingImages(nextId, batchReplace.folderImages) : batchFolder ? createBatchLoadingImages(nextId, batchFolder.folderImages) : isAgentTurn ? [] : createLoadingImages(nextId, count), count };
+    const nextImages = batchReplace
+      ? createBatchLoadingImages(nextId, batchReplace.folderImages)
+      : batchFolder
+        ? createBatchLoadingImages(nextId, batchFolder.folderImages)
+        : isAgentTurn
+          ? []
+          : createLoadingImages(nextId, count);
+    nextImages.forEach((image, index) => {
+      const sourceImage = batchReplace?.folderImages[index]
+        || batchFolder?.folderImages[index]
+        || preferredSourceReference(source.referenceImages);
+      image.requestedSize = source.images[index]?.requestedSize
+        || (source.ratio === "source" ? resolveSourceImageSize(sourceImage, source.size) : source.size);
+    });
+    const nextTurn: ImageTurn = {
+      ...source,
+      id: nextId,
+      model: resolveAllowedImageModel(source.model),
+      createdAt: now,
+      status: isAgentTurn ? "planning" : "queued",
+      error: undefined,
+      agentRun: undefined,
+      agentRequested: isAgentTurn,
+      agentRetryImageId: undefined,
+      agentProposal: undefined,
+      agentAdvisor: undefined,
+      images: nextImages,
+      count,
+    };
     await persistConversation({ ...conversation, updatedAt: now, turns: [...conversation.turns, nextTurn] });
     if (nextTurn.agentRequested) void startAgentForTurn(conversation.id, nextTurn);
     else void runConversationQueue(conversation.id, nextId);
@@ -2522,7 +2641,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     if (!turn) return;
     const retryId = `${turnId}-${createId()}`;
     const isAgentTurn = Boolean(turn.agentRequested || turn.promptEngine?.mode === "professional");
-    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, agentRequested: isAgentTurn, agentRun: isAgentTurn ? undefined : item.agentRun, agentRetryImageId: isAgentTurn ? retryId : undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, failureReportId: image.failureReportId || image.id || image.taskId || retryId, status: "loading" as const, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
+    const next = { ...conversation, updatedAt: new Date().toISOString(), turns: conversation.turns.map((item) => item.id !== turnId ? item : { ...item, status: "queued" as const, error: undefined, agentRequested: isAgentTurn, agentRun: isAgentTurn ? undefined : item.agentRun, agentRetryImageId: isAgentTurn ? retryId : undefined, images: item.images.map((image) => image.id !== imageId ? image : { id: retryId, taskId: retryId, failureReportId: image.failureReportId || image.id || image.taskId || retryId, status: "loading" as const, requestedSize: image.requestedSize, sourceImageIndex: image.sourceImageIndex, sourceName: image.sourceName }) }) };
     await persistConversation(next);
     if (isAgentTurn) {
       canceledImageAgentTurnIds.delete(imageTurnQueueKey(conversation.id, turnId));
@@ -2603,18 +2722,128 @@ export function useImageWorkspace(isAdmin: boolean) {
     const turn = conversation?.turns.find((item) => item.id === turnId);
     if (!conversation || !turn) return;
     const activeAgent = turn.agentRun && (turn.agentRun.status === "pending" || turn.agentRun.status === "running" || turn.agentRun.status === "waiting_for_images" || turn.agentRun.status === "waiting_for_input") ? turn.agentRun : undefined;
-    if (turn.agentRequested) canceledImageAgentTurnIds.add(imageTurnQueueKey(conversation.id, turnId));
     const loadingIds = turn.images.flatMap((image) => image.status === "loading" && image.taskId ? [image.taskId] : []);
-    if (!loadingIds.length && !activeAgent) return;
+    const agentTaskIds = [
+      ...(turn.agentBatchItems || [])
+        .filter((item) => item.taskId && !["success", "error", "canceled"].includes(item.status))
+        .map((item) => item.taskId as string),
+      ...(activeAgent?.events || []).flatMap((event) => {
+        const ids = event.payload?.taskIds;
+        return Array.isArray(ids) ? ids.map((id) => String(id || "").trim()).filter(Boolean) : [];
+      }),
+    ];
+    const cancellationTaskIds = Array.from(new Set([...loadingIds, ...agentTaskIds]));
+    if (!cancellationTaskIds.length && !activeAgent) return;
+
+    const localOnlyIds = new Set<string>();
+    const previews = await Promise.all(cancellationTaskIds.map(async (id) => {
+      try {
+        return { id, task: await cancelImageTask(id, { dryRun: true }) };
+      } catch (error) {
+        if (error instanceof HttpRequestError && error.status === 400 && error.message === "task not found") {
+          localOnlyIds.add(id);
+        }
+        return { id, task: null };
+      }
+    }));
+    const confirmationIds = new Set(
+      previews.filter(({ task }) => task?.requires_confirmation).map(({ id }) => id),
+    );
+    if ((confirmationIds.size || activeAgent?.status === "waiting_for_images") && !window.confirm(
+      `该任务可能已提交上游。${UPSTREAM_CANCEL_WARNING}确定继续吗？`,
+    )) return;
+    if (turn.agentRequested) canceledImageAgentTurnIds.add(imageTurnQueueKey(conversation.id, turnId));
+
     let canceledAgentRun: AgentRun | undefined;
     if (activeAgent) {
       try { canceledAgentRun = (await cancelAgentRun(activeAgent.runId)).agentRun; } catch { /* Local state still blocks late Agent results. */ }
     }
+
+    const results = new Map<string, ImageTask>();
+    const uncertainIds = new Set<string>();
+    const requestedIds = cancellationTaskIds.filter((id) => !localOnlyIds.has(id));
+    const responses = await Promise.all(requestedIds.map(async (id) => {
+      try {
+        return { id, task: await cancelImageTask(id, { confirmUpstream: confirmationIds.has(id) }) };
+      } catch {
+        uncertainIds.add(id);
+        return { id, task: null };
+      }
+    }));
+    responses.forEach(({ id, task }) => { if (task) results.set(id, task); });
+
+    const racedIds = responses
+      .filter(({ id, task }) => task?.requires_confirmation && !confirmationIds.has(id))
+      .map(({ id }) => id);
+    if (racedIds.length) {
+      if (window.confirm(
+        `任务刚刚进入上游提交阶段。${UPSTREAM_CANCEL_WARNING}确定继续吗？`,
+      )) {
+        const confirmed = await Promise.all(racedIds.map(async (id) => {
+          try {
+            return { id, task: await cancelImageTask(id, { confirmUpstream: true }) };
+          } catch {
+            uncertainIds.add(id);
+            return { id, task: null };
+          }
+        }));
+        confirmed.forEach(({ id, task }) => { if (task) results.set(id, task); });
+      } else {
+        racedIds.forEach((id) => uncertainIds.add(id));
+      }
+    }
+
+    const pendingIds = new Set(
+      [...results.entries()].filter(([, task]) => task.cancellation_pending).map(([id]) => id),
+    );
+    const canceledIds = new Set([
+      ...localOnlyIds,
+      ...[...results.entries()].filter(([, task]) => task.status === "canceled").map(([id]) => id),
+    ]);
+    [...results.entries()]
+      .filter(([, task]) => ["success", "error", "canceled"].includes(task.status))
+      .forEach(([id]) => submittedImageTaskIds.delete(id));
+    canceledIds.forEach((id) => { canceledImageTaskIds.add(id); submittedImageTaskIds.delete(id); });
+    pendingIds.forEach((id) => { canceledImageTaskIds.delete(id); });
     const taskIds = new Set(loadingIds);
-    loadingIds.forEach((id) => { canceledImageTaskIds.add(id); submittedImageTaskIds.delete(id); });
     await updateConversation(conversation.id, (current) => {
       const base = current || conversation;
-      return { ...base, updatedAt: new Date().toISOString(), turns: base.turns.map((item) => item.id !== turnId ? item : { ...item, ...deriveTurnStatus({ ...item, images: item.images.map((image) => image.taskId && taskIds.has(image.taskId) ? { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" } : image) }), images: item.images.map((image) => image.taskId && taskIds.has(image.taskId) ? { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" } : image) }) };
+      return {
+        ...base,
+        updatedAt: new Date().toISOString(),
+        turns: base.turns.map((item) => item.id !== turnId ? item : {
+          ...item,
+          ...deriveTurnStatus({
+            ...item,
+            images: item.images.map((image) => {
+              const id = image.taskId;
+              if (!id || !taskIds.has(id)) return image;
+              const latestTask = results.get(id);
+              if (latestTask) return taskDataToStoredImage({ ...image, taskId: id }, latestTask);
+              if (pendingIds.has(id)) {
+                return { ...image, status: "loading" as const, taskStatus: "running" as const, progress: "已标记本地取消，上游结果仍在核对，可能产生费用", error: undefined };
+              }
+              if (uncertainIds.has(id)) {
+                return { ...image, status: "loading" as const, progress: "取消状态未确认，仍在检查任务结果", error: undefined };
+              }
+              return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
+            }),
+          }),
+          images: item.images.map((image) => {
+            const id = image.taskId;
+            if (!id || !taskIds.has(id)) return image;
+            const latestTask = results.get(id);
+            if (latestTask) return taskDataToStoredImage({ ...image, taskId: id }, latestTask);
+            if (pendingIds.has(id)) {
+              return { ...image, status: "loading" as const, taskStatus: "running" as const, progress: "已标记本地取消，上游结果仍在核对，可能产生费用", error: undefined };
+            }
+            if (uncertainIds.has(id)) {
+              return { ...image, status: "loading" as const, progress: "取消状态未确认，仍在检查任务结果", error: undefined };
+            }
+            return { ...image, status: "canceled" as const, taskStatus: undefined, progress: undefined, error: "任务已中止" };
+          }),
+        }),
+      };
     });
     if (canceledAgentRun) {
       await updateConversation(conversation.id, (current) => {
@@ -2622,8 +2851,13 @@ export function useImageWorkspace(isAdmin: boolean) {
         return { ...current, updatedAt: new Date().toISOString(), turns: current.turns.map((item) => item.id === turnId ? { ...item, status: "canceled" as const, agentRun: canceledAgentRun } : item) };
       });
     }
-    await Promise.allSettled(loadingIds.map((id) => cancelImageTask(id)));
-    toast.info(loadingIds.length ? `已中止 ${loadingIds.length} 个生成任务` : "已取消本次图片方案");
+    if (uncertainIds.size) {
+      toast.warning(`${uncertainIds.size} 个任务取消状态未确认，系统仍会继续检查结果`);
+    } else if (pendingIds.size) {
+      toast.info(`${pendingIds.size} 个任务已标记本地取消，上游仍可能完成并计费`);
+    } else {
+      toast.info(cancellationTaskIds.length ? `已中止 ${cancellationTaskIds.length} 个生成任务` : "已取消本次图片方案");
+    }
   }
 
   async function continueTimeoutRetry() {
@@ -2726,9 +2960,29 @@ export function useImageWorkspace(isAdmin: boolean) {
   async function reuseTurnConfig(turnId: string) {
     const turn = selectedConversation.value?.turns.find((item) => item.id === turnId);
     if (!turn || !turn.prompt.trim()) return;
-    imagePrompt.value = turn.sourcePrompt || turn.prompt; imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1)); imageRatio.value = turn.ratio; imageTier.value = turn.tier; const parsed = parseImageSize(turn.size); imageWidth.value = parsed.width; imageHeight.value = parsed.height; imageQuality.value = turn.quality; imageModel.value = resolveAllowedImageModel(turn.model); preserveSubject.value = turn.preserveSubject === true; longTermMemoryEnabled.value = turn.useLongTermMemory !== false; promptEngineMode.value = isAgentImageTurn(turn) ? "professional" : "standard"; referenceImages.value = turn.referenceImages; agentVideos.value = turn.agentVideos || []; toast.success("已复用这条内容和配置"); await nextTick();
+    const parsed = parseImageSize(turn.size);
+    imagePrompt.value = turn.sourcePrompt || turn.prompt;
+    imageCount.value = String(Math.max(1, turn.count || turn.images.length || 1));
+    imageRatio.value = turn.ratio;
+    imageTier.value = turn.tier;
+    imageWidth.value = parsed.width;
+    imageHeight.value = parsed.height;
+    imageQuality.value = turn.quality;
+    imageModel.value = resolveAllowedImageModel(turn.model);
+    preserveSubject.value = turn.preserveSubject === true;
+    longTermMemoryEnabled.value = turn.useLongTermMemory !== false;
+    promptEngineMode.value = isAgentImageTurn(turn) ? "professional" : "standard";
+    referenceImages.value = turn.referenceImages.slice(0, REFERENCE_IMAGE_MAX);
+    agentVideos.value = turn.agentVideos || [];
+    imageRatioExplicitlySelected.value = turn.ratio !== "source";
+    toast.success("已复用这条内容和配置");
+    await nextTick();
   }
   async function continueEdit(image: StoredImage | StoredReferenceImage) {
+    if (referenceImages.value.length >= REFERENCE_IMAGE_MAX) {
+      toast.error(`参考图最多上传 ${REFERENCE_IMAGE_MAX} 张`);
+      return;
+    }
     try {
       const reference = "name" in image && "type" in image
         ? image.dataUrl || image.url
@@ -2740,6 +2994,8 @@ export function useImageWorkspace(isAdmin: boolean) {
         ? reference.referenceImage
         : markReferenceRole(reference.referenceImage, "working_canvas", `working-canvas-manual-${Date.now()}`);
       referenceImages.value = [...referenceImages.value, nextReference];
+      imageRatioExplicitlySelected.value = false;
+      useSourceRatioByDefault();
       imagePrompt.value = "";
       toast.success("已加入当前参考图，继续输入描述即可编辑");
     } catch (error) { toast.error(error instanceof Error ? error.message : "读取结果图失败"); }
@@ -2747,7 +3003,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   function openLightbox(images: Array<{ id: string; src: string; name?: string }>, index: number) { lightboxImages.value = images; lightboxIndex.value = Math.max(0, index); lightboxOpen.value = true; }
 
   function persistPreferences() {
-    localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio.value);
+    if (imageRatio.value !== "source") localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio.value);
     localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier.value);
     localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality.value);
     localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel.value);
@@ -2803,7 +3059,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
-    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, isLoadingMoreHistory, hasMoreHistory, historyTotal, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, loadMoreHistory, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox, consumePendingPromptTemplate,
+    settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, isLoadingMoreHistory, hasMoreHistory, historyTotal, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, loadMoreHistory, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, markImageRatioExplicit, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox, consumePendingPromptTemplate,
   };
 }
 

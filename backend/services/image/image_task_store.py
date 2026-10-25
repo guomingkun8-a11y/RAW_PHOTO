@@ -172,6 +172,9 @@ class ImageTaskStore(Protocol):
     def list_unfinished(self) -> list[tuple[str, dict[str, Any]]]:
         ...
 
+    def list_reconciling(self) -> list[tuple[str, dict[str, Any]]]:
+        ...
+
     def list_projection_pending(self, *, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
         ...
 
@@ -194,6 +197,14 @@ class ImageTaskStore(Protocol):
         *,
         expected_status: str | None = None,
         reject_status: str | None = None,
+    ) -> dict[str, Any] | None:
+        ...
+
+    def update_task_if(
+        self,
+        key: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        updates: dict[str, Any],
     ) -> dict[str, Any] | None:
         ...
 
@@ -225,6 +236,12 @@ class ImageTaskStore(Protocol):
         max_retries: int,
         updates: dict[str, Any],
     ) -> dict[str, Any] | None:
+        ...
+
+    def claim_reconciliation(self, key: str, token: str, now: float, lease_secs: float) -> dict[str, Any] | None:
+        ...
+
+    def update_reconciliation(self, key: str, token: str, updates: dict[str, Any]) -> dict[str, Any] | None:
         ...
 
 
@@ -300,7 +317,13 @@ class JsonImageTaskStore:
         return [
             (key, task)
             for key, task in self.load_all().items()
-            if task.get("status") in {"queued", "running"}
+            if task.get("status") in {"queued", "running", "reconciling"}
+        ]
+
+    def list_reconciling(self) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (key, task) for key, task in self.load_all().items()
+            if task.get("status") == "reconciling"
         ]
 
     def list_projection_pending(self, *, limit: int = 100) -> list[tuple[str, dict[str, Any]]]:
@@ -338,7 +361,7 @@ class JsonImageTaskStore:
                 1
                 for item in tasks.values()
                 if _clean(item.get("owner_id"), "anonymous") == owner_id
-                and item.get("status") in {"queued", "running"}
+                and item.get("status") in {"queued", "running", "reconciling"}
             )
             if active_count >= max(1, int(owner_pending_limit)):
                 raise OwnerPendingLimitError("user task queue is full; wait for existing tasks to finish")
@@ -361,6 +384,42 @@ class JsonImageTaskStore:
         if expected_status is not None and task.get("status") != expected_status:
             return None
         if reject_status is not None and task.get("status") == reject_status:
+            return None
+        task.update(updates)
+        self.save_all(tasks)
+        return task
+
+    def update_task_if(
+        self,
+        key: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tasks = self.load_all()
+        task = tasks.get(key)
+        if task is None or not predicate(task):
+            return None
+        task.update(updates)
+        self.save_all(tasks)
+        return task
+
+    def claim_reconciliation(self, key: str, token: str, now: float, lease_secs: float) -> dict[str, Any] | None:
+        tasks = self.load_all()
+        task = tasks.get(key)
+        details = task.get("reconciliation") if isinstance(task, dict) else None
+        if not isinstance(details, dict) or task.get("status") != "reconciling":
+            return None
+        if float(details.get("next_poll_at") or 0) > now or float(details.get("lease_until") or 0) > now:
+            return None
+        task["reconciliation"] = {**details, "lease_token": token, "lease_until": now + lease_secs}
+        self.save_all(tasks)
+        return task
+
+    def update_reconciliation(self, key: str, token: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        tasks = self.load_all()
+        task = tasks.get(key)
+        details = task.get("reconciliation") if isinstance(task, dict) else None
+        if not isinstance(details, dict) or task.get("status") != "reconciling" or details.get("lease_token") != token:
             return None
         task.update(updates)
         self.save_all(tasks)
@@ -449,7 +508,7 @@ class JsonImageTaskStore:
             "completed": sum(1 for task in items if task.get("status") == "success"),
             "failed": sum(1 for task in items if task.get("status") == "error"),
             "canceled": sum(1 for task in items if task.get("status") == "canceled"),
-            "running": sum(1 for task in items if task.get("status") == "running"),
+            "running": sum(1 for task in items if task.get("status") in {"running", "reconciling"}),
             "queued": sum(1 for task in items if task.get("status") == "queued"),
         }
 
@@ -704,7 +763,7 @@ class DatabaseImageTaskStore:
         try:
             rows = (
                 session.query(ImageTaskModel)
-                .filter(ImageTaskModel.status.in_(["queued", "running"]))
+                .filter(ImageTaskModel.status.in_(["queued", "running", "reconciling"]))
                 .all()
             )
             return [
@@ -712,6 +771,14 @@ class DatabaseImageTaskStore:
                 for row in rows
                 if (task := self._row_to_task(row)) is not None
             ]
+        finally:
+            session.close()
+
+    def list_reconciling(self) -> list[tuple[str, dict[str, Any]]]:
+        session = self.Session()
+        try:
+            rows = session.query(ImageTaskModel).filter(ImageTaskModel.status == "reconciling").all()
+            return [(row.key, task) for row in rows if (task := self._row_to_task(row)) is not None]
         finally:
             session.close()
 
@@ -790,7 +857,7 @@ class DatabaseImageTaskStore:
                     session.query(ImageTaskModel)
                     .filter(
                         ImageTaskModel.owner_id == owner_id,
-                        ImageTaskModel.status.in_(["queued", "running"]),
+                        ImageTaskModel.status.in_(["queued", "running", "reconciling"]),
                     )
                     .count()
                 )
@@ -833,6 +900,66 @@ class DatabaseImageTaskStore:
             if expected_status is not None and task.get("status") != expected_status:
                 return None
             if reject_status is not None and task.get("status") == reject_status:
+                return None
+            task.update(updates)
+            self._apply_row(row, key, task)
+            return task
+
+        return self._run_write_transaction(operation)
+
+    def update_task_if(
+        self,
+        key: str,
+        predicate: Callable[[dict[str, Any]], bool],
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        def operation(session):
+            row = (
+                session.query(ImageTaskModel)
+                .filter(ImageTaskModel.key == key)
+                .with_for_update()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            task = self._row_to_task(row)
+            if task is None or not predicate(task):
+                return None
+            task.update(updates)
+            self._apply_row(row, key, task)
+            return task
+
+        return self._run_write_transaction(operation)
+
+    def claim_reconciliation(self, key: str, token: str, now: float, lease_secs: float) -> dict[str, Any] | None:
+        def operation(session):
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            row = session.query(ImageTaskModel).filter(ImageTaskModel.key == key).with_for_update().one_or_none()
+            if row is None or row.status != "reconciling":
+                return None
+            task = self._row_to_task(row)
+            details = task.get("reconciliation") if isinstance(task, dict) else None
+            if not isinstance(details, dict):
+                return None
+            if float(details.get("next_poll_at") or 0) > now or float(details.get("lease_until") or 0) > now:
+                return None
+            task["reconciliation"] = {**details, "lease_token": token, "lease_until": now + lease_secs}
+            self._apply_row(row, key, task)
+            return task
+
+        return self._run_write_transaction(operation)
+
+    def update_reconciliation(self, key: str, token: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        def operation(session):
+            if self.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            row = session.query(ImageTaskModel).filter(ImageTaskModel.key == key).with_for_update().one_or_none()
+            if row is None or row.status != "reconciling":
+                return None
+            task = self._row_to_task(row)
+            details = task.get("reconciliation") if isinstance(task, dict) else None
+            if not isinstance(details, dict) or details.get("lease_token") != token:
                 return None
             task.update(updates)
             self._apply_row(row, key, task)
@@ -1023,7 +1150,7 @@ class DatabaseImageTaskStore:
                 "completed": sum(1 for task in tasks if task.get("status") == "success"),
                 "failed": sum(1 for task in tasks if task.get("status") == "error"),
                 "canceled": sum(1 for task in tasks if task.get("status") == "canceled"),
-                "running": sum(1 for task in tasks if task.get("status") == "running"),
+                "running": sum(1 for task in tasks if task.get("status") in {"running", "reconciling"}),
                 "queued": sum(1 for task in tasks if task.get("status") == "queued"),
             }
         finally:

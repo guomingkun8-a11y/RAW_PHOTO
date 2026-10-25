@@ -134,6 +134,35 @@ class ImageAgentApiTests(unittest.TestCase):
         self.assertEqual(expected, response.json())
         self.assertTrue(start.call_args.args[0]["inherit_reference_images"])
 
+    def test_agent_accepts_twenty_reference_images(self):
+        expected = {"agentRun": {"runId": "run-20", "status": "pending"}}
+        images = [
+            {"name": f"reference-{index}.png", "type": "image/png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(20)
+        ]
+        with mock.patch.object(image_agent_module, "start_cow_agent_run", return_value=expected) as start:
+            response = self.client.post(
+                "/api/image-agent/runs",
+                headers={"Authorization": "Bearer test"},
+                json={"prompt": "分析这些参考图", "mode": "edit", "images": images},
+            )
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(20, len(start.call_args.args[0]["images"]))
+
+    def test_agent_rejects_twenty_one_reference_images(self):
+        images = [
+            {"name": f"reference-{index}.png", "type": "image/png", "url": f"https://cdn.example.test/{index}.png"}
+            for index in range(21)
+        ]
+        response = self.client.post(
+            "/api/image-agent/runs",
+            headers={"Authorization": "Bearer test"},
+            json={"prompt": "分析这些参考图", "mode": "edit", "images": images},
+        )
+
+        self.assertEqual(422, response.status_code, response.text)
+
     def test_resumes_waiting_image_agent_run(self):
         expected = {"agentRun": {"runId": "run-1", "status": "running"}}
         with mock.patch.object(image_agent_module, "resume_cow_agent_run", return_value=expected) as resume:

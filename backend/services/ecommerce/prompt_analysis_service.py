@@ -4,19 +4,22 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
+from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
 
+from services.billing.chat_usage import capture_chat_response, chat_usage_scope
 from services.billing.chat_usage_attribution import record_chat_attribution
+from services.image.reference_limits import MAX_REFERENCE_IMAGES as MAX_ANALYSIS_REFERENCE_IMAGES
 from services.platform.config import config
 from services.providers.openai_relay_pool import current_relay_account, run_with_relay_pool
 from services.platform.proxy_service import proxy_settings
 
 
 REQUEST_TIMEOUT_SECONDS = 120
-MAX_REFERENCE_IMAGES = 6
+MAX_REFERENCE_IMAGES = MAX_ANALYSIS_REFERENCE_IMAGES
 MAX_IMAGE_DATA_URL_CHARS = 10 * 1024 * 1024
 MAX_TOTAL_IMAGE_DATA_URL_CHARS = 24 * 1024 * 1024
 DEFAULT_PROMPT_ANALYSIS_MODEL = "gpt-5.6-sol"
@@ -203,14 +206,21 @@ def validate_reference_images(
     normalized: list[dict[str, str]] = []
     for index, image in enumerate(images, start=1):
         data_url = str(image.get("data_url") or image.get("dataUrl") or "").strip()
-        if not data_url.startswith("data:image/") or ";base64," not in data_url:
-            raise HTTPException(status_code=400, detail={"error": f"reference image {index} must be a data:image base64 URL"})
-        if len(data_url) > MAX_IMAGE_DATA_URL_CHARS:
-            raise HTTPException(status_code=413, detail={"error": f"reference image {index} is too large"})
-        total_chars += len(data_url)
+        remote_url = str(image.get("url") or "").strip()
+        source_url = data_url or remote_url
+        if data_url:
+            if not data_url.startswith("data:image/") or ";base64," not in data_url:
+                raise HTTPException(status_code=400, detail={"error": f"reference image {index} must be a data:image base64 URL"})
+            if len(data_url) > MAX_IMAGE_DATA_URL_CHARS:
+                raise HTTPException(status_code=413, detail={"error": f"reference image {index} is too large"})
+            total_chars += len(data_url)
+        else:
+            parsed = urlparse(remote_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise HTTPException(status_code=400, detail={"error": f"reference image {index} must include a data URL or HTTP URL"})
         normalized.append({
             "name": str(image.get("name") or f"reference-{index}.png").strip()[:120],
-            "data_url": data_url,
+            "data_url": source_url,
         })
 
     if total_chars > MAX_TOTAL_IMAGE_DATA_URL_CHARS:
@@ -263,13 +273,15 @@ def _parse_json_content(content: str) -> dict[str, Any]:
 
 
 def _chat_completion_once(payload: dict[str, Any]) -> dict[str, Any]:
+    headers = _relay_headers()
     response = requests.post(
         _relay_url("/v1/chat/completions"),
-        headers=_relay_headers(),
+        headers=headers,
         json=payload,
         timeout=REQUEST_TIMEOUT_SECONDS,
         **proxy_settings.build_session_kwargs(),
     )
+    capture_chat_response(response, model=payload.get("model"), api_key=headers["Authorization"].removeprefix("Bearer "))
     if 200 <= response.status_code < 300:
         try:
             data = response.json()
@@ -277,9 +289,10 @@ def _chat_completion_once(payload: dict[str, Any]) -> dict[str, Any]:
             raise HTTPException(status_code=502, detail={"error": "vision model response is not JSON"}) from exc
         if not isinstance(data, dict):
             raise HTTPException(status_code=502, detail={"error": "vision model response is not a JSON object"})
+        raw_headers = getattr(response, "headers", None)
         response_headers = {
             str(key).lower(): str(value)
-            for key, value in getattr(response, "headers", {}).items()
+            for key, value in (raw_headers.items() if isinstance(raw_headers, Mapping) else ())
             if str(key).lower() in {"x-task-id", "task-id", "x-request-id", "request-id", "x-trace-id", "trace-id"}
         }
         header_task_id = response_headers.get("x-task-id") or response_headers.get("task-id")
@@ -302,11 +315,12 @@ def _chat_completion_once(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _chat_completion(payload: dict[str, Any], operation: str = "prompt_analysis") -> dict[str, Any]:
-    return run_with_relay_pool(
-        _relay_settings(),
-        operation,
-        lambda: _chat_completion_once(payload),
-    )
+    with chat_usage_scope(str(payload.get("user") or ""), operation):
+        return run_with_relay_pool(
+            _relay_settings(),
+            operation,
+            lambda: _chat_completion_once(payload),
+        )
 
 
 def request_json_completion_details(

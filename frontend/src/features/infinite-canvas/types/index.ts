@@ -1,7 +1,7 @@
 import type { VideoGenerationDuration, VideoGenerationModelSpec } from '@/lib/api';
 import type { CompositionTask, TimelineDocument } from '@/features/video-timeline/types/timeline';
 
-export type NodeKind = 'text' | 'image' | 'video';
+export type NodeKind = 'text' | 'image' | 'video' | 'audio';
 export type NodeStatus = 'idle' | 'uploading' | 'generating' | 'ready' | 'failed';
 export type VideoAnalysisStatus = 'pending' | 'queued' | 'processing' | 'analyzing' | 'ready' | 'failed';
 
@@ -36,7 +36,7 @@ export interface ReferenceImage {
 
 export interface CanvasMediaReference {
   nodeId: string;
-  type: 'image' | 'video';
+  type: 'image' | 'video' | 'audio';
   label: string;
   title: string;
   previewUrl?: string;
@@ -68,6 +68,9 @@ export interface CanvasNode {
   thinkingLevel: string;
   imageCount: number;
   duration: VideoGenerationDuration;
+  videoVersion?: string;
+  videoRequestMode?: string;
+  videoReferenceMode?: string;
   references: ReferenceImage[];
   model?: string;
   taskId?: string;
@@ -77,6 +80,10 @@ export interface CanvasNode {
   sourceDuration?: number;
   inputVideoId?: string;
   inputUrl?: string;
+  inputAudioUrl?: string;
+  inputAudioId?: string;
+  audioDuration?: number;
+  audioMimeType?: string;
   videoAnalysisStatus?: VideoAnalysisStatus;
   videoAnalysisError?: string;
   videoAnalysis?: CanvasVideoAnalysis;
@@ -141,6 +148,7 @@ export interface Capabilities {
   video: boolean;
   referenceImageUpload: boolean;
   videoUpload: boolean;
+  audioUpload: boolean;
 }
 
 export interface CanvasModelOptions {

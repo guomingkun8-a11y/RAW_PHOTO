@@ -4,10 +4,12 @@ import {
   createVideoGenerationTask,
   downloadImageTaskZip,
   fetchAgentVideoStatuses,
-  fetchSettingsConfig,
+  fetchVideoGenerationModels,
   preuploadImageReferences,
+  registerGeneratedVideoForAnalysis,
   resolveApiAssetUrl,
   retryAgentVideoAnalysis,
+  uploadVideoReferenceAudios,
   uploadAgentVideos,
   type ImageTask,
   type VideoGenerationDuration,
@@ -54,23 +56,20 @@ export async function loadCanvasRuntime(): Promise<{
   capabilities: Capabilities;
   models: CanvasModelOptions;
 }> {
-  const [settingsResult] = await Promise.allSettled([fetchSettingsConfig()]);
-  const settings = settingsResult.status === "fulfilled" ? settingsResult.value.config : null;
+  const [videoResult] = await Promise.allSettled([fetchVideoGenerationModels()]);
+  const publicVideoSettings = videoResult.status === "fulfilled" ? videoResult.value : null;
   const imageModels = [...BUILTIN_IMAGE_MODELS];
-  const videoSpecs = normalizeVideoModelSpecs(settings?.video_generation?.models);
+  const videoSpecs = normalizeVideoModelSpecs(publicVideoSettings?.models);
   const textVideoSpec = videoSpecs.find((item) => item.modes.includes("text_to_video"));
   const imageVideoSpec = videoSpecs.find((item) => item.modes.includes("image_to_video"));
-  const videoSettings = settings?.video_generation;
-  const relaySettings = settings?.openai_relay;
-  const chatConfigured = Boolean(
-    relaySettings?.enabled
-    && String(relaySettings.base_url || '').trim()
-    && (relaySettings.has_api_key || Number(relaySettings.api_key_count || 0) > 0),
-  );
+  const videoSettings = publicVideoSettings;
+  const chatConfigured = Boolean(publicVideoSettings?.chat_enabled);
   const videoConfigured = Boolean(
     videoSettings?.enabled
-    && String(videoSettings.base_url || "").trim()
-    && (videoSettings.has_api_key || Number(videoSettings.api_key_count || 0) > 0),
+    && (videoSettings.configured ?? Boolean(
+      String(videoSettings.base_url || "").trim()
+      && (videoSettings.has_api_key || Number(videoSettings.api_key_count || 0) > 0),
+    )),
   );
 
   return {
@@ -78,8 +77,9 @@ export async function loadCanvasRuntime(): Promise<{
       chat: chatConfigured,
       image: imageModels.length > 0,
       video: videoConfigured,
-      referenceImageUpload: Boolean(settings?.image_reference_upload?.enabled),
-      videoUpload: Boolean(settings?.video_upload?.enabled),
+      referenceImageUpload: Boolean(publicVideoSettings?.reference_image_upload_enabled),
+      videoUpload: Boolean(publicVideoSettings?.video_upload_enabled),
+      audioUpload: true,
     },
     models: {
       imageModel: "gpt-image-2",
@@ -112,6 +112,13 @@ export async function uploadCanvasVideo(file: File, workflowId: string) {
   };
 }
 
+export async function uploadCanvasAudio(file: File) {
+  const response = await uploadVideoReferenceAudios([file]);
+  const uploaded = response.items[0];
+  if (!uploaded?.url) throw new Error("音频上传结果不完整");
+  return uploaded;
+}
+
 export function fetchCanvasVideoAnalysisStatuses(ids: string[]) {
   return fetchAgentVideoStatuses(ids);
 }
@@ -119,6 +126,10 @@ export function fetchCanvasVideoAnalysisStatuses(ids: string[]) {
 export async function retryCanvasVideoAnalysis(videoId: string) {
   const response = await retryAgentVideoAnalysis(videoId);
   return response.item;
+}
+
+export async function registerCanvasVideoResultForAnalysis(taskId: string, workflowId: string) {
+  return registerGeneratedVideoForAnalysis(taskId, workflowId);
 }
 
 export async function generateCanvasImage(input: {
@@ -206,11 +217,14 @@ export async function generateCanvasVideo(input: {
   taskId: string;
   prompt: string;
   model: string;
-  mode: "text_to_video" | "image_to_video";
+  mode: "text_to_video" | "image_to_video" | "video_to_video";
   aspectRatio: string;
   duration: VideoGenerationDuration;
   quality: string;
-  references: string[];
+  imageReferences: string[];
+  videoReferences: string[];
+  audioReferences: string[];
+  params?: Record<string, unknown>;
   workflowId: string;
   nodeId: string;
   signal?: AbortSignal;
@@ -225,7 +239,10 @@ export async function generateCanvasVideo(input: {
     durationSecs: input.duration,
     quality: input.quality,
     resolution: input.quality,
-    imageUrls: input.references,
+    imageUrls: input.imageReferences,
+    referenceVideoUrls: input.videoReferences,
+    referenceAudioUrls: input.audioReferences,
+    params: input.params,
     conversationId: input.workflowId,
     turnId: input.nodeId,
     source: "canvas",

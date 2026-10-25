@@ -3,12 +3,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import inspect, select, text
 
-from services.billing.upstream_usage_models import UpstreamUsageRecord
-from services.billing.upstream_usage_service import UpstreamUsageService, UpstreamUsageSettings
+from services.billing.upstream_usage_models import UpstreamUsageAttribution, UpstreamUsageRecord
+from services.billing.upstream_usage_service import UpstreamUsageService, UpstreamUsageSettings, _scheduler_worker
 
 
 class FakeResponse:
@@ -218,6 +220,121 @@ class UpstreamUsageServiceTests(unittest.TestCase):
 
         self.settings = replace(self.settings, enabled=False)
         self.assertFalse(self.service.status()["enabled"])
+
+    def test_chat_capture_survives_periodic_sync_without_duplicate_cost(self):
+        self.service.capture_chat_call(
+            task_id="chat-call-1", model="tt-5.6-sol", owner_id="user-a",
+            source="canvas_assistant", local_task_id="run-1", api_key="secret-key-must-not-be-stored",
+        )
+        self.service.capture_chat_call(
+            task_id="chat-call-1", model="tt-5.6-sol", owner_id="user-b",
+            source="video_agent", local_task_id="run-2", api_key="secret-key-must-not-be-stored",
+        )
+        self.service.capture_chat_call(
+            task_id="chat-call-1", model="tt-5.6-sol", owner_id="user-a",
+            source="canvas_assistant", local_task_id="run-1", api_key="secret-key-must-not-be-stored",
+        )
+        with self.service.Session.begin() as session:
+            session.add(UpstreamUsageAttribution(
+                provider="lk888", upstream_task_id="chat-call-1", owner_id="user-a",
+                local_source="canvas_assistant", local_task_id="legacy-link-1",
+                requested_model="gpt-5.6-sol",
+            ))
+        self.records.append(usage_record("chat-call-1", "chat", model="tt-5.6-sol", cost="0.345"))
+        self.service.sync_usage(days=2)
+        self.service.sync_usage(days=2)
+
+        with self.service.Session() as session:
+            rows = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == "chat-call-1"
+            )).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0].owner_id, rows[0].local_source, rows[0].local_task_id),
+                             ("user-a", "canvas_assistant", "run-1"))
+            self.assertEqual(str(rows[0].cost), "0.345000000000")
+            self.assertNotIn("secret-key-must-not-be-stored", repr(rows[0].__dict__))
+        self.assertEqual(self.service.summary(source="chat")["record_count"], 2)
+
+    def test_chat_status_settles_only_after_final_cost(self):
+        task_id = "chat-call-2"
+        self.service.capture_chat_call(
+            task_id=task_id, model="tt-5.6-sol", owner_id="user-a",
+            source="video_agent", local_task_id="turn-1", api_key="secret-key-must-not-be-stored",
+        )
+        payload = {"is_final": False, "cost": 0}
+        calls = []
+
+        def status_get(url, *, params, headers, **_kwargs):
+            calls.append((url, params, headers))
+            return FakeResponse(payload.copy())
+
+        self.service._http_get = status_get
+        with self.service.Session.begin() as session:
+            row = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == task_id
+            )).one()
+            row.updated_at = datetime.now() - timedelta(seconds=5)
+        self.assertEqual(self.service.reconcile_chat_usage(), 0)
+        self.assertEqual(self.service.summary(source="chat")["unsettled_count"], 1)
+
+        payload.update({
+            "is_final": True, "state": "completed", "cost": "0.125",
+            "channel_group": "chat-relay", "refunded": True, "refunded_amount": "0.025",
+        })
+        with self.service.Session.begin() as session:
+            row = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == task_id
+            )).one()
+            row.updated_at = datetime.now() - timedelta(seconds=5)
+        self.assertEqual(self.service.reconcile_chat_usage(), 1)
+        self.assertEqual(self.service.reconcile_chat_usage(), 0)
+        with self.service.Session() as session:
+            row = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == task_id
+            )).one()
+            self.assertEqual((row.owner_id, row.state, row.unit), ("user-a", "completed", "算力"))
+            self.assertEqual(str(row.cost), "0.125000000000")
+            self.assertEqual((row.refunded, str(row.refunded_amount)), (True, "0.025000000000"))
+        self.assertEqual(self.service.summary(source="chat")["unsettled_count"], 0)
+        self.assertEqual(len(calls), 2)
+
+    def test_chat_reconciliation_runs_even_when_periodic_sync_is_disabled(self):
+        class StopAfterOnePass:
+            stopped = False
+
+            def is_set(self):
+                return self.stopped
+
+            def wait(self, _seconds):
+                self.stopped = True
+
+        self.settings = replace(self.settings, enabled=False)
+        with (
+            patch.object(self.service, "reconcile_chat_usage", return_value=0) as reconcile,
+            patch.object(self.service, "sync_usage") as sync,
+        ):
+            _scheduler_worker(StopAfterOnePass(), self.service)
+        reconcile.assert_called_once()
+        sync.assert_not_called()
+
+    def test_invalid_final_chat_cost_is_not_recorded_as_zero(self):
+        self.service.capture_chat_call(
+            task_id="bad-cost", model="tt-5.6-sol", owner_id="user-a",
+            source="canvas_assistant", api_key="secret-key-must-not-be-stored",
+        )
+        self.service._http_get = lambda *_args, **_kwargs: FakeResponse({"is_final": True, "cost": None})
+        with self.service.Session.begin() as session:
+            row = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == "bad-cost"
+            )).one()
+            row.updated_at = datetime.now() - timedelta(seconds=5)
+        self.assertEqual(self.service.reconcile_chat_usage(), 0)
+        with self.service.Session() as session:
+            row = session.scalars(select(UpstreamUsageRecord).where(
+                UpstreamUsageRecord.upstream_task_id == "bad-cost"
+            )).one()
+            self.assertEqual(row.state, "settling")
+            self.assertEqual(row.cost, 0)
 
 
 if __name__ == "__main__":
