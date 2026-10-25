@@ -1,26 +1,56 @@
 # RAW_PHOTO
 
-RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，覆盖图片、视频、音频和无限画布工作流。项目将模型调用、异步队列、素材历史、提示词模板、实时进度、费用监控和团队权限集中在同一套内网系统中。
+RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，支持商品图片、营销视频、配音音频和无限画布工作流。团队成员可以在同一套系统中提交创作任务、管理素材和提示词模板、查看生成进度与费用，并向管理员反馈使用问题。
+
+项目采用 Vue 3 + FastAPI，使用 MySQL 保存业务数据、Redis 调度异步任务，可接入 Qdrant 向量检索和 OSS / S3 对象存储，支持本地局域网运行与服务器部署。
+
+[功能概览](#功能概览) · [最新功能](#最新功能2026-10-25) · [模型目录](#当前内置模型) · [本地运行](#本地开发运行) · [Docker 部署](#docker-内网部署) · [更新记录](CHANGELOG.md)
 
 ## 功能概览
 
 - 图片生成：支持文生图、图生图、多图参考、文件夹批量生图、批量换商品和多画布比例。
 - 专业图片 Agent：支持多轮创作、商品与人物一致性、视觉分析、营销策略、知识检索、长期记忆和批量方案执行。
-- 视频生成：支持文生视频、图生视频、多图参考、首尾帧、任务取消、失败重试、结果持久化和历史管理。
+- 视频生成：支持文生视频、图生视频、视频参考，以及部分模型的图像、视频、音频联合参考、视频编辑和延长。
 - 视频助手与时间线：支持视频理解、创作方案、素材编排、配音、语音转写、字幕及异步合成任务。
 - 音频生成：支持 `doubao-tts-2.0` 和 `gem-3.1-tts`，覆盖多音色、语速、情感、单人朗读和双人对话。
-- 无限画布：支持图片、视频和文本节点编排、工作流保存、创意助手、分镜脚本以及生成任务状态跟踪。
+- 无限画布：支持图片、视频、音频和文本节点编排、工作流保存、创意助手、分镜脚本以及生成任务状态跟踪。
 - 提示词模板：支持模板创建、管理和一键应用，沉淀团队常用创作方案。
 - 统一历史：集中查看和管理图片、视频、音频及生成任务记录。
 - 账号系统：支持用户注册、登录、普通用户和管理员角色。
-- 管理后台：管理员可管理用户、查看任务状态、队列、模型费用和系统运行情况。
+- 管理后台：支持用户管理、任务与费用查询、公告管理，以及全员导航排序和显示设置。
 - 实时通知：使用 SSE 推送系统公告和图片任务状态变化，页面无需持续高频刷新。
+- 用户反馈：支持问题、建议、使用咨询、截图附件、管理员回复、未读提醒和处理状态跟踪。
+- 运维告警：监测后端、数据库、Redis、Worker 与队列状态，支持企业微信通知、告警去重和恢复提醒。
 - 任务队列：图片、视频、音频、Agent 和视频合成任务由独立 Worker 异步消费。
 - 并发控制：支持全局并发、单用户并发、单用户排队上限和 API Key 池。
 - API Key 池：可配置多个 OpenAI-compatible 中转站 Key，按池化方式分配生成任务。
 - 素材存储：支持本地、WebDAV、MinIO/S3 兼容存储和阿里云 OSS，并可为结果生成受控访问地址。
 - 监控与计费：提供任务明细、成功/失败统计、队列状态、用户/模型费用和上游用量对账。
 - 内网部署：支持本地局域网运行，也支持 Docker Compose 部署到服务器。
+
+## 最新功能（2026-10-25）
+
+### 用户反馈与问题跟进
+
+用户可以从顶部“问题反馈”入口提交功能异常、需求建议或使用咨询，附上文字和截图，并在反馈列表中继续查看管理员回复。每条消息最多支持 6 张 PNG、JPG 或 WebP 截图，每张不超过 8 MB。
+
+管理员可在反馈管理页面搜索、筛选和认领问题，回复用户、添加仅管理员可见的内部备注，并调整“待处理、处理中、待补充、已解决”状态。用户可以重新打开已解决的问题。
+
+消息通过 HTTP 接口提交并持久化，WebSocket 用于实时同步，Redis Pub/Sub 用于跨进程转发，另有定时同步作为补充。配置企业微信机器人后，还可接收用户消息与管理员公开回复的通知。
+
+### 公告、导航与运行告警
+
+- 公告管理：在系统管理中创建、编辑、保存未发布公告、发布或下架，支持普通通知、功能更新、重要提醒和故障通知。
+- 未读提醒：已发布公告通过 SSE 同步；新增或更新内容显示红色未读角标，阅读状态按用户和公告版本在当前浏览器保存。
+- 导航布局：初始管理员可调整全员侧栏顺序与显示状态，管理员专属菜单仍受权限限制。
+- 运行告警：检测服务不可用、数据库或 Redis 连接异常、Worker 离线、队列积压、死信和长时间未更新任务。
+- 通知管理：支持多个企业微信机器人，分别选择接收运行告警或反馈消息；运行告警支持冷却、重复提醒、恢复通知和历史记录。
+
+### 任务恢复与费用核对
+
+图片任务支持上游结果继续核对和迟到结果恢复，减少本地等待结束后丢失上游结果的情况；视频任务支持状态查询、结果核对和历史管理。费用模块记录上游用量及用户、模型、任务来源归属，便于核对本地生成记录与上游账单。
+
+已提交上游的图片任务在取消前会提示二次确认。本地取消无法保证上游终止生成，任务仍可能完成并产生费用；任务状态和计费结果需要分别核对。
 
 ## 当前内置模型
 
@@ -29,9 +59,10 @@ RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，
 | 图片 | `banana-2`、`gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst` |
 | 文生视频 | `hailuo-h3`、`doubao-seedance-2-5-260628`、`kling-v3-video` |
 | 图生视频 | `hailuo-h3-cankaosheng`、`hailuo-h3-max-shouweizhen`、`gk-video-3.5`、`doubao-seedance-2-5-cankaosheng` |
+| 全能参考与视频参考 | `seedance-2.0-guanfang`、`doubao-seedance-2-5-quannengcankao`、`wan3.0-video-quannengcankao`、`hailuo-h3-quannengcankao`、`wan2.7-cankaosheng` |
 | 音频 | `doubao-tts-2.0`、`gem-3.1-tts` |
 
-模型是否可用仍取决于实际配置的上游渠道、API Key 和账户权限。
+图片工作台当前展示上述 4 个图片模型。视频模型的参考素材类型、数量、时长、清晰度和编辑能力由模型目录分别约束；全能参考模型并非都支持相同的功能。实际可用模型、参数和价格以页面及所配置的上游渠道为准。
 
 ## 技术栈
 
@@ -39,11 +70,13 @@ RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，
 | --- | --- |
 | 前端 | Vue 3、Vite、TypeScript、Tailwind CSS、lucide-vue |
 | 后端 | Python 3.13、FastAPI、Uvicorn |
-| 队列与实时事件 | Redis、Celery 或轻量 Redis Worker、SSE |
+| 任务调度 | Redis、Celery 或轻量 Redis Worker、独立媒体与 Agent Worker |
+| 实时通信 | SSE 公告与任务事件、WebSocket 反馈同步、Redis Pub/Sub |
 | 数据库 | MySQL / PostgreSQL / SQLite，生产建议 MySQL 或 PostgreSQL |
 | 向量检索 | Qdrant、OpenAI-compatible Embedding |
 | 媒体处理 | Pillow、FFmpeg / FFprobe |
 | 对象存储 | 本地、WebDAV、MinIO/S3 兼容存储、阿里云 OSS |
+| 运行告警 | 独立监控进程、告警记录、企业微信机器人 Webhook |
 | 部署 | Docker、Docker Compose |
 | 测试 | unittest、Playwright、k6、本地 mock 压测脚本 |
 
@@ -52,18 +85,20 @@ RAW_PHOTO 是一个面向电商团队的多模态 AI 创作与生产工作台，
 ```text
 RAW_PHOTO/
 ├── backend/                  # FastAPI 接口、业务服务、测试和迁移脚本
-│   ├── api/                  # 图片、视频、音频、画布、计费和系统 API
-│   ├── services/             # 图片、视频、音频、Agent、存储和平台服务
+│   ├── api/                  # 创作、反馈、告警、导航和系统 API
+│   ├── services/             # 创作、计费、存储、反馈、告警和平台服务
+│   ├── monitor_worker.py     # 独立运行监控与告警进程
 │   ├── scripts/              # 数据库迁移、压测、初始化脚本
 │   └── test/                 # 后端单元测试
 ├── frontend/                 # Vue 前端项目
 │   ├── src/components/       # 通用组件和图片工作台组件
-│   ├── src/features/         # 音频、无限画布、视频时间线和计费模块
+│   ├── src/features/         # 画布、视频时间线、计费、反馈、告警和公告管理
 │   ├── src/pages/            # 图片、视频、音频、画布、历史和管理页面
 │   └── vite.config.ts        # 开发代理和构建配置
 ├── docs/                     # 部署、队列、安全和监控文档
 ├── scripts/                  # Windows 内网部署辅助脚本
 ├── data/                     # 本地运行数据，已被 Git 忽略
+├── logs/                     # 运行日志和本地备份，已被 Git 忽略
 ├── main.py                   # 后端应用入口
 ├── worker.py                 # 图片生成 Worker
 ├── agent_worker.py           # 专业图片 Agent Worker
@@ -85,8 +120,16 @@ RAW_PHOTO/
 
 - Python 3.13
 - Node.js 22 或兼容版本
+- MySQL（推荐用于团队业务数据）
 - Redis
 - Git
+
+先获取代码，再从项目根目录完成后续配置：
+
+```powershell
+git clone https://github.com/guomingkun8-a11y/RAW_PHOTO.git
+cd RAW_PHOTO
+```
 
 建议使用 `uv` 管理 Python 依赖：
 
@@ -121,7 +164,10 @@ GMKRAW_OPENAI_RELAY_BASE_URL=https://your-relay.example.com/v1
 GMKRAW_OPENAI_RELAY_API_KEY=replace-with-relay-api-key
 IMAGE_TASK_QUEUE_ENABLED=true
 IMAGE_TASK_REDIS_URL=redis://127.0.0.1:6379/0
+MYSQL_DATABASE_URL=mysql+pymysql://raw_photo:replace-with-db-password@127.0.0.1:3306/raw_photo?charset=utf8mb4
 ```
+
+先在 MySQL 中创建相应数据库和用户，再填写数据库连接配置。数据库密码包含特殊字符时，需要进行 URL 编码。
 
 如果使用多个中转站 Key，可使用环境变量或 `config.json` 配置 API Key 池。真实 Key 只放在 `.env.local` 或服务器环境变量里，不要提交到 GitHub。
 
@@ -218,6 +264,14 @@ cd "D:\raw photo"
 
 未在配置中启用的队列不需要启动相应 Worker。专业 Agent Worker 负责对话、文件夹分析、批计划执行和长期记忆蒸馏。
 
+需要持续运行健康检查与企业微信告警时，再启动独立监控进程：
+
+```powershell
+.\.venv\Scripts\python.exe backend\monitor_worker.py
+```
+
+监控进程需要与后端使用一致的数据库、Redis 和告警配置，详细设置见下文“反馈与告警配置”。
+
 ### 7. 启动前端
 
 新开一个 PowerShell：
@@ -239,11 +293,7 @@ http://127.0.0.1:4399/image
 http://你的电脑局域网IP:4399/image
 ```
 
-例如：
-
-```text
-http://192.168.9.94:4399/image
-```
+反向代理部署时，需要同时转发 `/api/feedback/ws` 的 WebSocket 升级请求，并允许 `/api/events/stream` 持续返回 SSE 数据。Vite 开发代理已配置 WebSocket 转发。
 
 ## Docker 内网部署
 
@@ -360,7 +410,9 @@ AGENT_OWNER_PENDING_LIMIT=10
 - `AGENT_OWNER_CONCURRENCY`：单个用户同时执行的 Agent 数量上限。
 - `AGENT_OWNER_PENDING_LIMIT`：单个用户排队加运行的 Agent 数量上限。
 
-专业 Agent 的 run、事件和取消状态保存在 MySQL，Redis Streams 负责持久排队、分布式并发槽、用户会话锁与 SSE 事件唤醒。部署时必须同时运行 `agent-worker.py`；多个 app 实例和 Agent worker 需要共用 MySQL、Redis 以及 `data` 目录。
+专业 Agent 的 run、事件和取消状态保存在 MySQL，Redis Streams 负责持久排队、分布式并发槽、用户会话锁与 SSE 事件唤醒。部署时必须同时运行 `agent_worker.py`；多个 app 实例和 Agent worker 需要共用 MySQL、Redis 以及 `data` 目录。
+
+一次生成多张图片时，系统会将生成请求拆分成独立任务，通过队列和多个 Worker 按并发限制执行。普通上传和参考图分析最多支持 20 张图片；单次生图最多使用 14 张参考图。这些限制分别约束上传数量和单个生成任务的参考图数量。
 
 建议先保守设置，例如：
 
@@ -395,14 +447,33 @@ GMKRAW_MINIO_SECURE=true
 
 阿里云 OSS 可通过 S3 兼容方式接入，项目里使用 `minio` provider 对接即可。
 
+### 反馈与告警配置
+
+反馈实时同步默认使用图片队列的 Redis，也可通过 `FEEDBACK_REDIS_URL` 单独指定。反馈会话、消息、截图元数据、已读位置和通知待投递事件保存在业务数据库中。截图上传需要配置参考图上传所使用的 OSS / S3 对象存储，截图通过鉴权接口读取。
+
+运行告警的环境变量示例：
+
+```text
+WECOM_ALERT_ENABLED=true
+WECOM_ALERT_ENVIRONMENT=production
+WECOM_ALERT_INTERNAL_TOKEN=replace-with-a-long-random-monitor-token
+WECOM_ALERT_CHECK_INTERVAL_SECS=30
+GMKRAW_BASE_URL=http://127.0.0.1:8002
+```
+
+`GMKRAW_BASE_URL` 应指向监控进程能访问的实际后端地址；`WECOM_ALERT_INTERNAL_TOKEN` 在后端和监控进程中需要一致。以上仅为本机端口示例，部署时应按实际地址填写。
+
+初始管理员可以在“系统管理 → 监控告警”中配置企业微信机器人、告警开关和阈值，并选择机器人接收告警或用户反馈。需要反馈通知时，再到反馈管理的“通知设置”启用推送，并填写用户可以访问的系统地址。
+
 ## 用户和权限
 
-项目当前设计为两类角色：
+项目使用普通用户和管理员两类角色，部分系统级操作进一步限制为初始管理员：
 
-- 普通用户：登录后使用图片、视频、音频、无限画布、模板中心和自己的历史资产。
-- 管理员：管理用户、查看监控与费用、处理账号启停和权限调整。
+- 普通用户：使用已开放的创作功能、管理自己的历史资产、提交反馈并查看回复。
+- 管理员：管理用户、查看监控与费用、处理用户反馈及内部备注。
+- 初始管理员：额外通过系统管理页面管理全员导航、公告、运行告警与机器人配置，以及反馈通知设置。
 
-当前不设计复杂的超级管理员体系，适合公司内部工具场景。管理员账号应只分配给少数维护人员。
+导航显示状态用于组织页面入口，接口仍独立校验身份和权限。管理员账号应只分配给负责维护和问题处理的人员。
 
 ## 测试
 
@@ -491,18 +562,26 @@ scripts/k6-image-workspace.js
 
 前端点击生成后，后端只负责创建任务和入队。真正调用模型或执行媒体处理的是对应 Worker；图片、视频、音频和视频合成都有各自的 Worker，未运行时相应任务会一直排队。
 
+### 为什么取消或失败的任务仍可能计费？
+
+如果请求已被上游接受，本地取消、等待超时或网络中断并不代表上游已经停止执行。系统会对能够查询的上游任务继续核对结果和费用；具体扣费与退款应以上游最终账单和系统同步记录为准。
+
+### 为什么反馈能提交，但没有实时收到回复？
+
+反馈提交使用 HTTP，实时同步使用 WebSocket。请检查后端 WebSocket 依赖、代理升级转发及 Redis 连接；连接恢复前，页面仍可通过定时同步获取消息。企业微信反馈提醒还需要单独配置机器人并启用通知。
+
 ### 生成图片要不要永久保存？
 
 本地 `data/` 可以保存历史，但不适合多人长期依赖。建议开启对象存储，并将图片 URL 保存到数据库。这样服务器迁移或重启后，用户历史图片仍然可访问。
 
 ## 安全注意事项
 
-- 不要提交 `.env.local`、`.env`、`config.json`、`data/`。
+- 不要提交 `.env.local`、`.env`、`config.json`、`data/`、`logs/`、`tmp/`。
 - 不要把 API Key、阿里云 AccessKey、数据库密码写进 README。
 - GitHub 公开仓库中只保留 `.env.example` 和 `config.example.json` 这种占位示例。
 - 已经泄露过的 Key 建议轮换。
 - 生产环境建议使用 RAM 子账号，并按最小权限授权对象存储。
-- 管理员账号建议开启强密码，后续可接入验证码、审计日志和访问白名单。
+- 使用强管理员密码，按实际部署需要配置验证码、访问控制与审计策略。
 
 ## Git 工作流建议
 
