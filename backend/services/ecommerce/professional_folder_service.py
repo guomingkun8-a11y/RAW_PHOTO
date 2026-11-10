@@ -21,6 +21,7 @@ from services.ecommerce.professional_knowledge_service import (
     professional_retrieval_terms,
 )
 from services.image.image_storage_service import image_storage_service
+from services.providers import openai_relay_service
 from services.platform.enterprise_schema import resolve_enterprise_database_url
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -778,6 +779,7 @@ class ProfessionalFolderAssetService:
         prompt_engine_mode: str = "professional",
         item_ids: set[int] | None = None,
         agent_run_id: str = "",
+        image_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         owner = _owner_id(owner_id)
         current = self.get_batch_plan(plan_id, owner_id=owner)
@@ -788,6 +790,17 @@ class ProfessionalFolderAssetService:
             plan = session.query(ProfessionalBatchPlanModel).filter(ProfessionalBatchPlanModel.plan_id == _clean(plan_id, limit=191), ProfessionalBatchPlanModel.owner_id == owner).one_or_none()
             if plan is None:
                 raise KeyError("batch plan not found")
+            request_options = {**_load(plan.request_json, {}), **dict(image_options or {})}
+            model_options = {
+                key: request_options[key]
+                for key in ("complexity", "output_format", "frame_count", "frame_duration_ms", "background", "aspect_ratio", "image_size")
+                if request_options.get(key) is not None
+            }
+            resolved_size = (
+                openai_relay_service.tt_image_2_6_native_size(size)
+                if openai_relay_service._upstream_media_model(model) == "tt-image-2.6"
+                else _clean(size)
+            )
             rows = session.query(ProfessionalBatchPlanItemModel).filter(ProfessionalBatchPlanItemModel.plan_id == plan.plan_id).order_by(ProfessionalBatchPlanItemModel.item_index.asc()).all()
             folder_items = {int(item.id): item for item in session.query(ProfessionalFolderItemModel).filter(ProfessionalFolderItemModel.folder_id == plan.folder_id, ProfessionalFolderItemModel.owner_id == owner).all()}
             plan.status = "executing"
@@ -810,8 +823,9 @@ class ProfessionalFolderAssetService:
                         client_task_id=f"{plan.plan_id}-{row.item_index}-{row.attempts + 1}",
                         prompt=row.prompt,
                         model=_clean(model, "gpt-image-2"),
-                        size=_clean(size),
+                        size=resolved_size,
                         quality=_clean(quality, "auto"),
+                        **model_options,
                         prompt_engine_mode=prompt_engine_mode,
                         base_url=_clean(base_url),
                         images=[(payload, item.filename, item.mime_type)],
@@ -852,6 +866,7 @@ class ProfessionalFolderAssetService:
         size: str,
         quality: str,
         agent_run_id: str = "",
+        image_options: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         owner = _owner_id(owner_id)
         session = self._session()
@@ -878,6 +893,7 @@ class ProfessionalFolderAssetService:
             quality=quality,
             item_ids={int(item_id)},
             agent_run_id=agent_run_id,
+            image_options=image_options,
         )
 
 

@@ -1,14 +1,16 @@
 import { httpRequest, request } from "@/lib/request";
 import { webConfig } from "@/lib/config";
 import { getStoredAuthKey } from "@/stores/auth";
+import { image26Quality, image26RequestFields, image26Size, isImage26Model, type Image26Options } from "@/lib/image-model-parameters";
 
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
 
-export type ImageTaskImageOptions = {
+export type ImageTaskImageOptions = Image26Options & {
   aspectRatio?: string;
   imageSize?: string;
   thinkingLevel?: string;
+  background?: string;
   imageCount?: number;
   source?: "standard" | "canvas";
   canvasUnits?: number;
@@ -191,6 +193,8 @@ export type ImageTask = {
   data?: Array<{
     b64_json?: string;
     url?: string;
+    filename?: string;
+    mime_type?: string;
     storage_rel?: string;
     revised_prompt?: string;
     width?: number;
@@ -496,6 +500,8 @@ export type ImageAgentResult = {
     width?: number | null;
     height?: number | null;
     requestedSize?: string | null;
+    filename?: string | null;
+    mime_type?: string | null;
     aspectRatioCorrected?: boolean;
     cost?: number | null;
   }>;
@@ -1443,6 +1449,13 @@ export async function startImageAgentRun(body: {
   model: ImageModel;
   size?: string;
   quality: string;
+  aspect_ratio?: string;
+  image_size?: string;
+  background?: string;
+  complexity?: string;
+  output_format?: string;
+  frame_count?: number;
+  frame_duration_ms?: number;
   count: number;
   sceneType: ProfessionalSceneType;
   preserveSubject?: boolean;
@@ -1464,9 +1477,18 @@ export async function startImageAgentRun(body: {
     creativeBrief?: ImageAgentCreativeBrief;
   }>;
 }) {
+  if (isImage26Model(body.model) && (body.images?.length || 0) > 16) throw new Error("gpt-image-2.6 最多支持 16 张参考图");
   return httpRequest<{ agentRun: AgentRun }>("/api/image-agent/runs", {
     method: "POST",
-    body,
+    body: isImage26Model(body.model) ? {
+      ...body,
+      size: image26Size(body.size),
+      quality: image26Quality(body.model, body.quality),
+      ...image26RequestFields(body.model, {
+        complexity: body.complexity, outputFormat: body.output_format, background: body.background,
+        frameCount: body.frame_count, frameDurationMs: body.frame_duration_ms,
+      }),
+    } : body,
     timeout: 120_000,
   });
 }
@@ -1585,13 +1607,14 @@ export async function fetchAgentBatchPlan(planId: string) {
   return httpRequest<AgentBatchPlan>(`/api/image-agent/batch-plans/${encodeURIComponent(planId)}`);
 }
 
-export async function retryAgentBatchItem(planId: string, itemId: number, body: { model?: ImageModel; size?: string; quality?: string } = {}) {
+export async function retryAgentBatchItem(planId: string, itemId: number, body: { model?: ImageModel; size?: string; quality?: string; imageOptions?: ImageTaskImageOptions } = {}) {
   return httpRequest<AgentBatchPlan>(`/api/image-agent/batch-plans/${encodeURIComponent(planId)}/items/${encodeURIComponent(String(itemId))}/retry`, {
     method: "POST",
     body: {
       model: body.model || "gpt-image-2",
       size: body.size || "",
       quality: body.quality || "auto",
+      ...image26RequestFields(body.model, body.imageOptions),
     },
   });
 }
@@ -1714,11 +1737,13 @@ export async function createImageGenerationTask(
       client_task_id: clientTaskId,
       prompt,
       ...(model ? { model } : {}),
-      ...(size ? { size } : {}),
-      quality,
+      ...(size || isImage26Model(model) ? { size: isImage26Model(model) ? image26Size(size) : size } : {}),
+      quality: image26Quality(model, quality),
       ...(imageOptions.aspectRatio ? { aspect_ratio: imageOptions.aspectRatio } : {}),
-      ...(imageOptions.imageSize ? { image_size: imageOptions.imageSize } : {}),
-      ...(imageOptions.thinkingLevel ? { thinking_level: imageOptions.thinkingLevel } : {}),
+      ...(!isImage26Model(model) && imageOptions.imageSize ? { image_size: imageOptions.imageSize } : {}),
+      ...(!isImage26Model(model) && imageOptions.thinkingLevel ? { thinking_level: imageOptions.thinkingLevel } : {}),
+      ...(imageOptions.background ? { background: imageOptions.background } : {}),
+      ...image26RequestFields(model, imageOptions),
       ...(imageOptions.imageCount ? { n: Math.min(4, Math.max(1, Math.round(imageOptions.imageCount))) } : {}),
       ...(imageOptions.source ? { source: imageOptions.source } : {}),
       ...(imageOptions.source === "canvas" ? { canvas_units: Math.max(1, Math.round(imageOptions.canvasUnits || imageOptions.imageCount || 1)) } : {}),
@@ -1755,6 +1780,7 @@ export async function createImageEditTask(
 ) {
   const formData = new FormData();
   const uploadFiles = Array.isArray(files) ? files : [files];
+  if (isImage26Model(model) && uploadFiles.length + imageUrls.length > 16) throw new Error("gpt-image-2.6 最多支持 16 张参考图");
 
   uploadFiles.forEach((file) => {
     formData.append("image", file);
@@ -1767,18 +1793,24 @@ export async function createImageEditTask(
   if (model) {
     formData.append("model", model);
   }
-  if (size) {
-    formData.append("size", size);
+  if (size || isImage26Model(model)) {
+    formData.append("size", isImage26Model(model) ? image26Size(size) : size!);
   }
-  formData.append("quality", quality);
+  formData.append("quality", image26Quality(model, quality));
   if (imageOptions.aspectRatio) {
     formData.append("aspect_ratio", imageOptions.aspectRatio);
   }
-  if (imageOptions.imageSize) {
+  if (!isImage26Model(model) && imageOptions.imageSize) {
     formData.append("image_size", imageOptions.imageSize);
   }
-  if (imageOptions.thinkingLevel) {
+  if (!isImage26Model(model) && imageOptions.thinkingLevel) {
     formData.append("thinking_level", imageOptions.thinkingLevel);
+  }
+  if (imageOptions.background) {
+    formData.append("background", imageOptions.background);
+  }
+  for (const [key, value] of Object.entries(image26RequestFields(model, imageOptions))) {
+    if (value !== undefined) formData.set(key, String(value));
   }
   if (imageOptions.imageCount) {
     formData.append("n", String(Math.min(4, Math.max(1, Math.round(imageOptions.imageCount)))));

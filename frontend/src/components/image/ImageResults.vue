@@ -68,13 +68,18 @@ watch(() => props.conversation?.id, () => {
 });
 
 function imageSrc(image: StoredImage) {
-  return image.b64_json ? `data:image/png;base64,${image.b64_json}` : image.url || "";
+  return image.b64_json ? `data:${image.mimeType || "image/png"};base64,${image.b64_json}` : image.url || "";
+}
+function imageFilename(image: StoredImage) {
+  if (image.sourceName) return image.sourceName;
+  const extension = ({ "image/jpeg": "jpg", "image/svg+xml": "svg", "image/gif": "gif", "image/webp": "webp" } as Record<string, string>)[image.mimeType || ""] || "png";
+  return `${image.id}.${extension}`;
 }
 function referenceSrc(image: StoredReferenceImage) {
   return image.dataUrl || image.url || "";
 }
 function imageItems(turn: ImageTurn) {
-  return turn.images.filter((image) => image.status === "success" && imageSrc(image)).map((image) => ({ id: image.id, src: imageSrc(image), name: image.sourceName || `${image.id}.png` }));
+  return turn.images.filter((image) => image.status === "success" && imageSrc(image)).map((image) => ({ id: image.id, src: imageSrc(image), name: imageFilename(image) }));
 }
 function referenceItems(turn: ImageTurn) {
   return turn.referenceImages
@@ -285,7 +290,7 @@ function downloadImage(image: StoredImage) {
   if (!src) return;
   const link = document.createElement("a");
   link.href = src;
-  link.download = image.sourceName || `${image.id}.png`;
+  link.download = imageFilename(image);
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -307,7 +312,7 @@ async function downloadZip(turn: ImageTurn) {
       folderName,
       items: images.map((image, index) => ({
         taskId: image.taskId!,
-        filename: `${String(index + 1).padStart(2, "0")}-${image.sourceName || "image.png"}`,
+        filename: `${String(index + 1).padStart(2, "0")}-${imageFilename(image)}`,
       })),
     });
     const url = URL.createObjectURL(blob);

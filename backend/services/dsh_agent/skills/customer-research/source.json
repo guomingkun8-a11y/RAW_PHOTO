@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/coreyhaines31/marketingskills",
+  "revision": "96798cf38736ecdba015a1d2b0521b0c8f8f41dd",
+  "path": "skills/customer-research",
+  "license": "MIT",
+  "vendored": [
+    "SKILL.md",
+    "references/interviews-and-surveys.md",
+    "references/source-guides.md",
+    "LICENSE"
+  ],
+  "upstream_sha256": {
+    "SKILL.md": "22964b89315a6cf5524d3f627904843e7826d40e06689a07faa5df25fc730bc7",
+    "references/interviews-and-surveys.md": "56adecdc40af1242464937100349fc1a161627394909551720494bc5ee537076",
+    "references/source-guides.md": "7490a8d04f209d4c8c987530e79d0883a6b42027b86a920fc751cf8ea9904892"
+  },
+  "integration": "Read-only DSH skill. Explicit per-turn selection required. Existing web_search/web_fetch and uploaded materials only. No third-party scripts, credentials, SDKs, scheduled monitoring, Google Sheets access or model endpoints are installed. Missing metrics must be reported as unavailable."
+}

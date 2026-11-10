@@ -164,6 +164,37 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual("batch", task["queue_priority"])
             self.assertEqual(["batch"], queue.priorities)
 
+    def test_dsh_tasks_keep_source_and_owner_in_existing_database_queue(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            queue = MemoryTaskQueue()
+            handler = mock.Mock(side_effect=AssertionError("must not call upstream"))
+            service = self.make_service(
+                root / "image_tasks.json", handler,
+                task_store=DatabaseImageTaskStore(f"sqlite:///{root / 'tasks.db'}"),
+                task_queue=queue, run_inline=False,
+            )
+            try:
+                for mode in ("generate", "edit"):
+                    submit = service.submit_generation if mode == "generate" else service.submit_edit
+                    kwargs = dict(
+                        client_task_id=f"dsh-{mode}", prompt="product photo", model="gpt-image-2",
+                        size="1024x1024", source="dsh", conversation_id="dsh-session", turn_id="turn-one",
+                    )
+                    if mode == "edit":
+                        kwargs["image_urls"] = ["https://example.test/reference.png"]
+                    first = submit(OWNER, **kwargs)
+                    self.assertEqual(first["id"], submit(OWNER, **kwargs)["id"])
+                    loaded = service.list_tasks(OWNER, [first["id"]])["items"][0]
+                    self.assertEqual("dsh", loaded["source"])
+                    self.assertEqual("dsh-session", loaded["conversation_id"])
+                    self.assertEqual("turn-one", loaded["turn_id"])
+                    self.assertEqual([], service.list_tasks(OTHER_OWNER, [first["id"]])["items"])
+                self.assertEqual(2, len(queue.items))
+                handler.assert_not_called()
+            finally:
+                service.close()
+
     def test_result_postprocessing_releases_queue_consumer(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

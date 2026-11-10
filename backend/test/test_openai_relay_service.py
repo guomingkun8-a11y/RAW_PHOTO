@@ -66,6 +66,54 @@ class OpenAIRelayServiceTests(unittest.TestCase):
         openai_relay_pool._LOCAL_INFLIGHT.clear()
         openai_relay_pool._LOCAL_COOLDOWNS.clear()
 
+    def test_image_25_auto_aspect_ratio_follows_requested_size(self):
+        params = openai_relay_service._media_image_params(
+            {"model": "gpt-image-2.5-flare", "aspect_ratio": "auto"},
+            upstream_model="tt-image-2.5",
+            requested_size="1536x1024",
+            reference_urls=[],
+        )
+        self.assertEqual("3:2", params["aspect_ratio"])
+
+    def test_image_2_auto_aspect_ratio_uses_requested_size(self):
+        params = openai_relay_service._media_image_params(
+            {"model": "gpt-image-2", "aspect_ratio": "auto"},
+            upstream_model="tt-image-2",
+            requested_size="1024x1216",
+            reference_urls=[],
+        )
+        self.assertEqual("1024x1216", params["size"])
+        with self.assertRaises(Exception):
+            openai_relay_service._tt_image_size({"aspect_ratio": "1:4"}, "1024x1024")
+
+    def test_image_26_versions_params_and_cost(self):
+        for version in ("flare", "sunburst"):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(openai_relay_service, "settings", side_effect=relay_settings),
+                mock.patch.object(openai_relay_service.requests, "post", return_value=FakeResponse(payload={"task_id": "test-task"})) as post,
+                mock.patch.object(openai_relay_service.requests, "get", return_value=FakeResponse(payload={"data": {"is_final": True, "state": "success", "result_url": "https://example.test/result.png", "cost": "0.42"}})),
+            ):
+                result = openai_relay_service._media_image_generation({
+                    "model": f"gpt-image-2.6-{version}", "prompt": "product",
+                    "size": "1536x1024", "quality": "high", "background": "auto",
+                    "complexity": "medium", "output_format": "png",
+                })
+                payload = post.call_args.kwargs["json"]
+                self.assertEqual("tt-image-2.6", payload["model"])
+                self.assertEqual({"size": "1536x1024", "version": version, "quality": "high", "background": "auto", "complexity": "medium", "output_format": "png"}, payload["params"])
+                self.assertEqual(0.42, result["cost"])
+
+    def test_image_26_gif_and_invalid_options(self):
+        params = openai_relay_service.tt_image_2_6_params({
+            "model": "gpt-image-2.6-sunburst", "output_format": "gif",
+            "frame_count": 16, "frame_duration_ms": 500,
+        }, "auto")
+        self.assertEqual(("sunburst", 16, 500), (params["version"], params["frame_count"], params["frame_duration_ms"]))
+        for body, size in (({"output_format": "png", "frame_count": 6}, "auto"), ({"output_format": "gif", "frame_count": 8}, "auto"), ({}, "2048x2048")):
+            with self.subTest(body=body, size=size), self.assertRaises(Exception):
+                openai_relay_service.tt_image_2_6_params(body, size)
+
     def assertPromptEngineered(
         self,
         prompt: str,

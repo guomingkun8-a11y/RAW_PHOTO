@@ -16,6 +16,7 @@ from services.platform.enterprise_schema import EnterpriseBase
 from services.image.image_task_store import Base as ImageTaskBase
 from services.alerts.incident_store import AlertBase
 from services.feedback.store import FeedbackBase
+from services.dsh_agent.store import DshAgentBase
 from services.platform.navigation_settings import NavigationBase
 
 MIGRATION_TABLE = "schema_migrations"
@@ -1382,6 +1383,36 @@ def _apply_professional_agent_operational_indexes(engine: Engine) -> None:
                     pass
 
 
+def _apply_dsh_agent_schema(engine: Engine) -> None:
+    DshAgentBase.metadata.create_all(engine)
+
+
+def _apply_dsh_agent_activity_columns(engine: Engine) -> None:
+    with engine.connect() as connection:
+        columns = _column_names(connection, "dsh_agent_messages")
+    with engine.begin() as connection:
+        if "activity_json" not in columns:
+            connection.execute(text("ALTER TABLE dsh_agent_messages ADD COLUMN activity_json TEXT"))
+        if "timings_json" not in columns:
+            connection.execute(text("ALTER TABLE dsh_agent_messages ADD COLUMN timings_json TEXT"))
+
+
+def _apply_dsh_agent_model_selection(engine: Engine) -> None:
+    with engine.connect() as connection:
+        columns = _column_names(connection, "dsh_agent_conversations")
+    if "model" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE dsh_agent_conversations ADD COLUMN model VARCHAR(191) NOT NULL DEFAULT ''"))
+
+
+def _apply_dsh_agent_message_feedback(engine: Engine) -> None:
+    with engine.connect() as connection:
+        columns = _column_names(connection, "dsh_agent_messages")
+    if "feedback" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE dsh_agent_messages ADD COLUMN feedback VARCHAR(8)"))
+
+
 def _apply_feedback_alerts_navigation(engine: Engine) -> None:
     AlertBase.metadata.create_all(engine)
     FeedbackBase.metadata.create_all(engine)
@@ -1438,6 +1469,11 @@ MIGRATIONS: tuple[tuple[str, Callable[[Engine], None]], ...] = (
     ("042_audio_generation_tasks", _apply_audio_generation_schema),
     ("043_canvas_workflows_production", _apply_canvas_workflow_schema),
     ("044_feedback_alerts_navigation", _apply_feedback_alerts_navigation),
+    ("052_dsh_agent", _apply_dsh_agent_schema),
+    ("053_dsh_agent_activities", _apply_dsh_agent_activity_columns),
+    ("054_dsh_agent_model_selection", _apply_dsh_agent_model_selection),
+    ("055_dsh_agent_image_tools", _apply_dsh_agent_schema),
+    ("056_dsh_agent_message_feedback", _apply_dsh_agent_message_feedback),
 )
 
 

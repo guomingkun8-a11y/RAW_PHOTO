@@ -99,11 +99,12 @@ function formatCostNumber(value: unknown, explicitUnit = "") {
 function displayModel(model: string, requestedModel = "", modelVersion = "") {
   const source = requestedModel || model;
   if (/^tt-5\.6-sol$/i.test(source)) return "gpt-5.6-sol";
-  if (!requestedModel && modelVersion && /image-2\.5/i.test(source)) {
-    return `gpt-image-2.5 · ${modelVersion}`;
+  const version = source.match(/image-(2\.[56])/i)?.[1];
+  if (modelVersion && version && !/-(?:flare|sunburst)$/i.test(source)) {
+    return `gpt-image-${version} · ${modelVersion}`;
   }
-  if (!requestedModel && /^(?:tt|gpt)-image-2\.5$/i.test(source)) {
-    return "gpt-image-2.5（未区分版本）";
+  if (/^(?:tt|gpt)-image-2\.[56](?:-token)?$/i.test(source)) {
+    return `gpt-image-${version}（未区分版本）`;
   }
   return formatImageModel(source);
 }

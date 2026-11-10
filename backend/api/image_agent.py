@@ -95,6 +95,13 @@ class ImageAgentRequest(BaseModel):
     model: str = Field(default="gpt-image-2", max_length=160)
     size: str = Field(default="", max_length=40)
     quality: str = Field(default="auto", max_length=40)
+    complexity: str | None = Field(default=None, max_length=40)
+    output_format: str | None = Field(default=None, max_length=40)
+    frame_count: int | None = Field(default=None, ge=1)
+    frame_duration_ms: int | None = Field(default=None, ge=1)
+    background: str | None = Field(default=None, max_length=40)
+    aspect_ratio: str | None = Field(default=None, max_length=40)
+    image_size: str | None = Field(default=None, max_length=40)
     count: int = Field(default=1, ge=1, le=300)
     scene_type: str = Field(default="auto", alias="sceneType", max_length=100)
     platform: str = Field(default="general", max_length=80)
@@ -131,6 +138,13 @@ class ImageAgentBatchRetryRequest(BaseModel):
     model: str = Field(default="gpt-image-2", max_length=160)
     size: str = Field(default="", max_length=40)
     quality: str = Field(default="auto", max_length=40)
+    complexity: str | None = Field(default=None, max_length=40)
+    output_format: str | None = Field(default=None, max_length=40)
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
+    background: str | None = Field(default=None, max_length=40)
+    aspect_ratio: str | None = Field(default=None, max_length=40)
+    image_size: str | None = Field(default=None, max_length=40)
 
 
 class ImageAgentMemoryCreateRequest(BaseModel):
@@ -472,6 +486,7 @@ def create_router() -> APIRouter:
                 model=body.model,
                 size=body.size,
                 quality=body.quality,
+                image_options=body.model_dump(exclude={"model", "size", "quality"}, exclude_none=True),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc

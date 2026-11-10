@@ -1,0 +1,8 @@
+{
+  "reference_project": "https://github.com/freestylefly/awesome-gpt-image-2",
+  "reference_commit": "53d3927ee3c45f6c54a12d86aabcf5c921670e11",
+  "reference_path": "agents/skills/gpt-image-2-style-library/SKILL.md",
+  "reference_license": "MIT; Copyright (c) 2026 freestylefly",
+  "adaptation": "References the category/style/scene selection workflow and on-demand reference organization. Expert policy and business rules are original to this project. No upstream executable code, gallery images or third-party example prompts are bundled.",
+  "rights_notice": "The upstream docs/disclaimer.md states third-party images and prompts retain their original rights. Repository licensing does not guarantee their commercial reuse."
+}

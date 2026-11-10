@@ -357,6 +357,7 @@ def _public_task(
         "size": task.get("size"),
         "quality": task.get("quality"),
         "image_count": task.get("image_count") or 1,
+        "source": task.get("source") or "standard",
         "queue_priority": task.get("queue_priority"),
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
@@ -580,6 +581,11 @@ class ImageTaskService:
         aspect_ratio: str = "",
         image_size: str = "",
         thinking_level: str = "",
+        background: str = "",
+        complexity: str = "",
+        output_format: str = "",
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
         n: int = 1,
         prompt_engine_mode: str = "professional",
         base_url: str = "",
@@ -594,6 +600,7 @@ class ImageTaskService:
         reference_cache_hits: int = 0,
         queue_priority: str = QUEUE_PRIORITY_STANDARD,
         agent_run_id: str = "",
+        source: str = "standard",
     ) -> dict[str, Any]:
         try:
             requested_count = int(n or 1)
@@ -607,7 +614,7 @@ class ImageTaskService:
             image_index=batch_index,
             prompt_engine_mode=prompt_engine_mode,
         )
-        normalized_size = normalize_image_size(size)
+        normalized_size = size if openai_relay_service._upstream_media_model(model) == "tt-image-2.6" else normalize_image_size(size)
         expected_size = (
             canvas_media_request_size(aspect_ratio, image_size)
             or canvas_expected_size(aspect_ratio, image_size)
@@ -623,6 +630,11 @@ class ImageTaskService:
             "aspect_ratio": aspect_ratio,
             "image_size": image_size,
             "thinking_level": thinking_level,
+            "background": background,
+            "complexity": complexity,
+            "output_format": output_format,
+            "frame_count": frame_count,
+            "frame_duration_ms": frame_duration_ms,
             "prompt_engine_mode": prompt_engine_mode,
             "response_format": "url",
             "base_url": base_url,
@@ -637,6 +649,7 @@ class ImageTaskService:
             "reference_cache_hits": max(0, int(reference_cache_hits or 0)),
             "queue_priority": _normalize_queue_priority(queue_priority),
             "agent_run_id": _clean(agent_run_id),
+            "source": "dsh" if source == "dsh" else "standard",
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -652,6 +665,11 @@ class ImageTaskService:
         aspect_ratio: str = "",
         image_size: str = "",
         thinking_level: str = "",
+        background: str = "",
+        complexity: str = "",
+        output_format: str = "",
+        frame_count: int | None = None,
+        frame_duration_ms: int | None = None,
         n: int = 1,
         prompt_engine_mode: str = "professional",
         base_url: str = "",
@@ -671,6 +689,7 @@ class ImageTaskService:
         reference_cache_hits: int = 0,
         queue_priority: str = QUEUE_PRIORITY_STANDARD,
         agent_run_id: str = "",
+        source: str = "standard",
     ) -> dict[str, Any]:
         image_inputs = list(images or [])
         reference_urls = list(dict.fromkeys(
@@ -678,8 +697,9 @@ class ImageTaskService:
             for url in image_urls or []
             if str(url).strip()
         ))
-        if len(image_inputs) + len(reference_urls) > MAX_GENERATION_REFERENCE_IMAGES:
-            raise ValueError(f"generation supports at most {MAX_GENERATION_REFERENCE_IMAGES} reference images")
+        max_reference_images = 16 if openai_relay_service._upstream_media_model(model) == "tt-image-2.6" else MAX_GENERATION_REFERENCE_IMAGES
+        if len(image_inputs) + len(reference_urls) > max_reference_images:
+            raise ValueError(f"generation supports at most {max_reference_images} reference images")
         engine_mode = normalize_prompt_engine_mode(prompt_engine_mode)
         reference_edit_intent = classify_reference_edit_intent(prompt) if engine_mode == "standard" else ""
         mutation_policy = normalize_subject_mutation_policy(subject_mutation_policy)
@@ -719,7 +739,7 @@ class ImageTaskService:
             preserve_mask = build_preserve_subject_mask(image_inputs[0])
             if preserve_mask is not None:
                 effective_masks.append(preserve_mask)
-        normalized_size = normalize_image_size(size)
+        normalized_size = size if openai_relay_service._upstream_media_model(model) == "tt-image-2.6" else normalize_image_size(size)
         expected_size = (
             canvas_media_request_size(aspect_ratio, image_size)
             or canvas_expected_size(aspect_ratio, image_size)
@@ -738,6 +758,11 @@ class ImageTaskService:
             "aspect_ratio": aspect_ratio,
             "image_size": image_size,
             "thinking_level": thinking_level,
+            "background": background,
+            "complexity": complexity,
+            "output_format": output_format,
+            "frame_count": frame_count,
+            "frame_duration_ms": frame_duration_ms,
             "prompt_engine_mode": prompt_engine_mode,
             "response_format": "url",
             "base_url": base_url,
@@ -755,6 +780,7 @@ class ImageTaskService:
             "queue_priority": _normalize_queue_priority(queue_priority),
             "agent_run_id": _clean(agent_run_id),
         }
+        payload["source"] = "dsh" if source == "dsh" else "standard"
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
     def list_tasks(self, identity: dict[str, object], task_ids: list[str], *, limit: int | None = None) -> dict[str, Any]:
@@ -1390,6 +1416,12 @@ class ImageTaskService:
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
+        if openai_relay_service._upstream_media_model(payload.get("model")) == "tt-image-2.6":
+            params = openai_relay_service.tt_image_2_6_params(payload, _clean(payload.get("size"), "auto"))
+            payload["size"] = params["size"]
+            payload["expected_size"] = params["size"]
+            if len(payload.get("images") or []) + len(payload.get("image_urls") or []) > 16:
+                raise ValueError("tt-image-2.6 supports at most 16 reference images")
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         now = _now_iso()
@@ -1436,6 +1468,7 @@ class ImageTaskService:
                 "queue_priority": _normalize_queue_priority(payload.get("queue_priority")),
                 "agent_run_id": _clean(payload.get("agent_run_id")),
                 "prompt": _clean(payload.get("prompt")),
+                "source": _clean(payload.get("source"), "standard"),
                 "conversation_id": _clean(payload.get("conversation_id")),
                 "turn_id": _clean(payload.get("turn_id")),
                 "product_id": int(payload.get("product_id") or 0),
@@ -2550,6 +2583,7 @@ class ImageTaskService:
                 "quality": _clean(item.get("quality"), "auto"),
                 "queue_priority": _normalize_queue_priority(item.get("queue_priority")),
                 "agent_run_id": _clean(item.get("agent_run_id")),
+                "source": _clean(item.get("source"), "standard"),
                 "prompt": _clean(item.get("prompt")),
                 "conversation_id": _clean(item.get("conversation_id")),
                 "turn_id": _clean(item.get("turn_id")),

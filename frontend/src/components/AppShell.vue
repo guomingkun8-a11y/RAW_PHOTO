@@ -22,7 +22,7 @@ import { toast } from "vue-sonner";
 
 import BaseModal from "@/components/BaseModal.vue";
 import FeedbackLauncher from "@/features/feedback/components/FeedbackLauncher.vue";
-import { fetchNavigationLayout, navigationLayout, navItems } from "@/features/system/navigation";
+import { dshAgentEnabled, fetchDshAgentStatus, fetchNavigationLayout, navigationLayout, navItems } from "@/features/system/navigation";
 import { useAnnouncementUnread } from "@/features/system/useAnnouncementUnread";
 import { changePassword, fetchImageConversationCount, fetchSystemAnnouncements, logout as logoutApi, resolveApiAssetUrl, streamRealtimeEvents, updateCurrentUserProfile, uploadAvatar, type RealtimeAnnouncementEvent, type RealtimeEvent, type SystemAnnouncement } from "@/lib/api";
 import { storageKey } from "@/lib/storage-namespace";
@@ -79,7 +79,8 @@ let contentInsetTransitionTimer = 0;
 const isSuperAdmin = computed(() => sessionState.session?.role === "admin" && sessionState.session.subjectId === "local-admin");
 const visibleNavItems = computed(() => navigationLayout.value.flatMap(({ id, visible }) => {
   const item = navItems.find((definition) => definition.id === id);
-  return visible && item && (!item.adminOnly || sessionState.session?.role === "admin") ? [item] : [];
+  const featureEnabled = !id.startsWith("dsh-agent") || dshAgentEnabled.value;
+  return visible && featureEnabled && item && (!item.adminOnly || sessionState.session?.role === "admin") ? [item] : [];
 }));
 const isFullscreenRoute = computed(() => route.meta.fullscreen === true);
 const contentInsetClass = computed(() => (
@@ -92,7 +93,10 @@ const userInitial = computed(() => {
 const userAvatarUrl = computed(() => resolveApiAssetUrl(sessionState.session?.avatarUrl));
 
 function refreshNavigationWhenVisible() {
-  if (!document.hidden) void fetchNavigationLayout().catch(() => {});
+  if (!document.hidden) {
+    void fetchNavigationLayout().catch(() => {});
+    void fetchDshAgentStatus().catch(() => { dshAgentEnabled.value = false; });
+  }
 }
 
 function isActive(item: (typeof navItems)[number]) {

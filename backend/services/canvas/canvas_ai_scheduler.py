@@ -69,6 +69,17 @@ class CanvasAIScheduler:
         redis.call('ZREM', KEYS[2], ARGV[1])
         return 1
     """
+    _renew_source = """
+        local now = tonumber(ARGV[1])
+        local global_expiry = tonumber(redis.call('ZSCORE', KEYS[1], ARGV[3]) or '0')
+        local owner_expiry = tonumber(redis.call('ZSCORE', KEYS[2], ARGV[3]) or '0')
+        if global_expiry <= now or owner_expiry <= now then return 0 end
+        redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+        redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
+        redis.call('EXPIRE', KEYS[1], ARGV[4])
+        redis.call('EXPIRE', KEYS[2], ARGV[4])
+        return 1
+    """
 
     def __init__(
         self,
@@ -141,7 +152,7 @@ class CanvasAIScheduler:
             f"{prefix}:metrics:latency",
         )
 
-    def acquire(self, owner_id: str, operation: str = "assistant") -> CanvasAISlot:
+    def acquire(self, owner_id: str, operation: str = "assistant", *, cancel_event=None) -> CanvasAISlot:
         normalized_owner = _clean(owner_id, "anonymous")
         token = uuid4().hex
         keys = self._keys(normalized_owner)
@@ -164,6 +175,8 @@ class CanvasAIScheduler:
         deadline = time.monotonic() + self.acquire_timeout_secs
         try:
             while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CanvasAISchedulerError("请求已停止")
                 acquired = self._script("admit", self._admit_source)(
                     keys=[keys[0], keys[1]],
                     args=[
@@ -212,6 +225,20 @@ class CanvasAIScheduler:
             pipe.execute()
         except Exception:
             return
+
+    def renew(self, slot: CanvasAISlot) -> bool:
+        keys = self._keys(slot.owner_id)
+        now = int(time.time())
+        try:
+            renewed = self._script("renew", self._renew_source)(
+                keys=[keys[0], keys[1]],
+                args=[now, now + self.lease_secs, slot.token, self.lease_secs * 2],
+            )
+            return int(renewed or 0) == 1
+        except CanvasAISchedulerUnavailable:
+            raise
+        except Exception as exc:
+            raise CanvasAISchedulerUnavailable(f"canvas_ai Redis lease renewal failed: {exc}") from exc
 
     def snapshot(self) -> dict[str, object]:
         try:

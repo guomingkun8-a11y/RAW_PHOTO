@@ -1,4 +1,5 @@
 import type { VideoGenerationDuration, VideoGenerationModelSpec } from '@/lib/api';
+import type { Image26Options } from '@/lib/image-model-parameters';
 import type { CompositionTask, TimelineDocument } from '@/features/video-timeline/types/timeline';
 
 export type NodeKind = 'text' | 'image' | 'video' | 'audio';
@@ -64,6 +65,7 @@ export interface CanvasNode {
   aspectRatio: string;
   resolution?: string;
   imageSize: string;
+  imageOptions?: Image26Options;
   quality: string;
   thinkingLevel: string;
   imageCount: number;

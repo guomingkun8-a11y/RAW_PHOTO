@@ -39,6 +39,11 @@ class ImageGenerationTaskRequest(BaseModel):
     aspect_ratio: str | None = None
     image_size: str | None = None
     thinking_level: str | None = None
+    background: str | None = None
+    complexity: str | None = None
+    output_format: str | None = None
+    frame_count: int | None = None
+    frame_duration_ms: int | None = None
     prompt_engine_mode: Literal["standard", "professional", "general"] = "standard"
     conversation_id: str | None = None
     turn_id: str | None = None
@@ -91,6 +96,8 @@ def _zip_safe_name(value: str, fallback: str) -> str:
 
 def _image_ext_from_content_type(content_type: str, fallback_name: str) -> str:
     content_type = content_type.lower()
+    if "svg" in content_type:
+        return "svg"
     if "jpeg" in content_type:
         return "jpg"
     if "webp" in content_type:
@@ -100,7 +107,7 @@ def _image_ext_from_content_type(content_type: str, fallback_name: str) -> str:
     if "avif" in content_type:
         return "avif"
     suffix = fallback_name.rsplit(".", 1)[-1].lower() if "." in fallback_name else ""
-    if suffix in {"png", "jpg", "jpeg", "webp", "gif", "avif"}:
+    if suffix in {"png", "jpg", "jpeg", "webp", "gif", "avif", "svg"}:
         return "jpg" if suffix == "jpeg" else suffix
     return "png"
 
@@ -286,6 +293,11 @@ def create_router() -> APIRouter:
                 aspect_ratio=str(body.aspect_ratio or ""),
                 image_size=str(body.image_size or ""),
                 thinking_level=str(body.thinking_level or ""),
+                background=str(body.background or ""),
+                complexity=str(body.complexity or ""),
+                output_format=str(body.output_format or ""),
+                frame_count=body.frame_count,
+                frame_duration_ms=body.frame_duration_ms,
                 prompt_engine_mode=body.prompt_engine_mode,
                 base_url=resolve_image_base_url(request),
                 conversation_id=str(body.conversation_id or ""),
@@ -349,6 +361,11 @@ def create_router() -> APIRouter:
                 aspect_ratio=str(payload.get("aspect_ratio") or ""),
                 image_size=str(payload.get("image_size") or ""),
                 thinking_level=str(payload.get("thinking_level") or ""),
+                background=str(payload.get("background") or ""),
+                complexity=str(payload.get("complexity") or ""),
+                output_format=str(payload.get("output_format") or ""),
+                frame_count=payload.get("frame_count"),
+                frame_duration_ms=payload.get("frame_duration_ms"),
                 prompt_engine_mode=str(payload.get("prompt_engine_mode") or "standard"),
                 base_url=resolve_image_base_url(request),
                 images=images,

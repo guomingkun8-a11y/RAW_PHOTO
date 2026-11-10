@@ -22,6 +22,8 @@ export const IMAGE_MODEL_CATALOG: ImageModelInfo[] = [
   { id: "gpt-image-2", label: "GPT Image 2", features: ["文生图", "图生图"] },
   { id: "gpt-image-2.5-flare", label: "gpt-image-2.5 · flare", features: ["文生图", "图生图"] },
   { id: "gpt-image-2.5-sunburst", label: "gpt-image-2.5 · sunburst", features: ["文生图", "图生图"] },
+  { id: "gpt-image-2.6-flare", label: "gpt-image-2.6 · flare", features: ["文生图", "图生图", "多图参考", "图像编辑"] },
+  { id: "gpt-image-2.6-sunburst", label: "gpt-image-2.6 · sunburst", features: ["文生图", "图生图", "多图参考", "图像编辑"] },
 ];
 
 const IMAGE_MODEL_BY_ID = new Map(IMAGE_MODEL_CATALOG.map((model) => [model.id, model]));
@@ -29,6 +31,10 @@ const IMAGE_MODEL_DISPLAY_ALIASES = new Map<string, string>([
   ["tt-image-2", "gpt-image-2"],
   ["tt-image-2.5", "gpt-image-2.5（未区分版本）"],
   ["gpt-image-2.5", "gpt-image-2.5（未区分版本）"],
+  ["tt-image-2.6", "gpt-image-2.6（未区分版本）"],
+  ["gpt-image-2.6", "gpt-image-2.6（未区分版本）"],
+  ["tt-image-2.6-flare", "gpt-image-2.6 · flare"],
+  ["tt-image-2.6-sunburst", "gpt-image-2.6 · sunburst"],
 ]);
 const HIDDEN_IMAGE_MODEL_IDS = new Set([
   "doubao-seedream-5-0-pro-260628",
@@ -48,6 +54,10 @@ const HIDDEN_IMAGE_MODEL_IDS = new Set([
   "gpt-image-2.5",
   "tt-image-2.5",
   "tt-image-2.5-token",
+  "tt-image-2.6",
+  "tt-image-2.6-token",
+  "gpt-image-2.6",
+  "gpt-image-2.6-token",
 ]);
 const HIDDEN_IMAGE_MODEL_PATTERNS = [
   /seedream/i,
@@ -69,6 +79,8 @@ export const BUILTIN_IMAGE_MODELS: ImageModel[] = [
   "gpt-image-2",
   "gpt-image-2.5-flare",
   "gpt-image-2.5-sunburst",
+  "gpt-image-2.6-flare",
+  "gpt-image-2.6-sunburst",
 ];
 
 export function imageModelInfo(model: ImageModel | string): ImageModelInfo | undefined {

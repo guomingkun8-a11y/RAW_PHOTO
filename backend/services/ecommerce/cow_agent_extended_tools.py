@@ -478,7 +478,11 @@ def _scheduler_for(runtime) -> tuple[TaskStore, SchedulerService]:
         default_conversation_id = runtime.conversation_id
         request_defaults = {
             key: runtime.run.request.get(key)
-            for key in ("base_url", "count", "mode", "model", "planner_model", "quality", "size")
+            for key in (
+                "base_url", "count", "mode", "model", "planner_model", "quality", "size",
+                "complexity", "output_format", "frame_count", "frame_duration_ms",
+                "background", "aspect_ratio", "image_size",
+            )
         }
 
         def execute_task(task: dict):
@@ -488,12 +492,9 @@ def _scheduler_for(runtime) -> tuple[TaskStore, SchedulerService]:
                 from services.ecommerce.cow_agent_runtime_service import start_cow_agent_run
 
                 body = {
+                    **request_defaults,
                     "prompt": _clean(action.get("task_description"), limit=8000),
                     "conversation_id": conversation_id,
-                    "model": request_defaults.get("model"),
-                    "planner_model": request_defaults.get("planner_model"),
-                    "quality": request_defaults.get("quality"),
-                    "size": request_defaults.get("size"),
                     "count": request_defaults.get("count") or 1,
                     "mode": request_defaults.get("mode") or "generate",
                 }

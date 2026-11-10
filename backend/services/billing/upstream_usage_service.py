@@ -92,8 +92,10 @@ def _display_model(
     else:
         value = _clean(upstream_model, "unknown", 191)
     version = _clean(model_version, limit=64).lower()
-    if version in {"flare", "sunburst"} and value.lower() in {"tt-image-2.5", "gpt-image-2.5"}:
-        return f"gpt-image-2.5-{version}"
+    if version in {"flare", "sunburst"} and value.lower() in {
+        "tt-image-2.5", "gpt-image-2.5", "tt-image-2.6", "gpt-image-2.6",
+    }:
+        return f"gpt-image-{value.rsplit('-', 1)[-1]}-{version}"
     normalized = value.lower()
     if _clean(model_type, limit=32).lower() == "chat" and normalized.startswith("tt-"):
         return f"gpt-{value[3:]}"

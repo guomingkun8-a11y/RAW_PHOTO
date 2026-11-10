@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/cathrynlavery/diagram-design",
+  "revision": "e57eda6102a19444538ebd611d39534fad65b663",
+  "license": "MIT",
+  "vendored": ["skills/diagram-design/SKILL.md", "skills/diagram-design/references/*.md", "LICENSE"],
+  "integration": "Read-only instructions; no upstream scripts or commands. Outputs use the authenticated render_diagram tool."
+}

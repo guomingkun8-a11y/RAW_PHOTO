@@ -40,6 +40,7 @@ const {
   imageWidth,
   imageHeight,
   imageQuality,
+  imageOptions,
   imageModel,
   imageModels,
   referenceImages,
@@ -543,6 +544,7 @@ onBeforeUnmount(() => { videoHistoryDisposed = true; });
           v-model:image-width="imageWidth"
           v-model:image-height="imageHeight"
           v-model:image-quality="imageQuality"
+          v-model:image-options="imageOptions"
           v-model:image-model="imageModel"
           v-model:preserve-subject="preserveSubject"
           v-model:prompt-engine-mode="promptEngineMode"

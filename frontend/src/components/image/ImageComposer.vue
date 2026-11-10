@@ -35,6 +35,7 @@ import {
 } from "@/lib/api";
 import type { AgentFolderAsset } from "@/lib/api";
 import { formatImageModel, imageModelFeatures } from "@/lib/image-models";
+import { IMAGE_26_BACKGROUNDS, IMAGE_26_COMPLEXITIES, IMAGE_26_FRAME_COUNTS, IMAGE_26_FRAME_DURATIONS, IMAGE_26_OUTPUT_FORMATS, IMAGE_26_RATIOS, IMAGE_26_QUALITIES, image26Size, isImage26Model, type Image26Options } from "@/lib/image-model-parameters";
 import { resolveSourceImageSize, sourceRatioLabel } from "@/lib/image-output-size";
 import type { StoredAgentVideo, StoredReferenceImage } from "@/stores/image-conversations";
 import EngineSwitch from "@/components/image/EngineSwitch.vue";
@@ -80,6 +81,7 @@ const imageTier = defineModel<string>("imageTier", { required: true });
 const imageWidth = defineModel<string>("imageWidth", { required: true });
 const imageHeight = defineModel<string>("imageHeight", { required: true });
 const imageQuality = defineModel<string>("imageQuality", { required: true });
+const imageOptions = defineModel<Image26Options>("imageOptions", { required: true });
 const imageModel = defineModel<ImageModel>("imageModel", { required: true });
 const preserveSubject = defineModel<boolean>("preserveSubject", { required: true });
 const promptEngineMode = defineModel<PromptEngineMode>("promptEngineMode", { required: true });
@@ -106,12 +108,26 @@ const assistOptions: { action: PromptAssistAction; label: string; description: s
   { action: "optimize", label: "优化", description: "整理现有提示词" },
   { action: "enhance", label: "润色", description: "强化细节和质感" },
 ];
-const qualityOptions = [
+const image26BackgroundLabels: Record<string, string> = {
+  auto: "自动",
+  opaque: "不透明背景",
+  transparent: "透明背景",
+};
+const image26ComplexityLabels: Record<string, string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+};
+const isImage26 = computed(() => isImage26Model(imageModel.value));
+const legacyQualityOptions = [
   { value: "auto", label: "智能", description: "由图片模型自动平衡速度和质量" },
   { value: "low", label: "极速", description: "优先缩短生成时间" },
   { value: "medium", label: "均衡", description: "兼顾生成速度和细节" },
   { value: "high", label: "精细", description: "优先细节，允许一次原生比例重试" },
 ];
+const qualityOptions = computed(() => isImage26.value
+  ? IMAGE_26_QUALITIES.map((value) => ({ value, label: value, description: value }))
+  : legacyQualityOptions);
 type AspectOption = {
   ratio: string;
   tier: string;
@@ -156,14 +172,14 @@ const sourceOutputLabel = computed(() => {
   if (imageRatio.value !== "source") return "";
   if (sourceRatioImages.value.length > 1) return "逐张匹配";
   const resolved = resolveSourceImageSize(sourceRatioImages.value[0], `${imageWidth.value || 1024}x${imageHeight.value || 1024}`);
-  return resolved.replace("x", " × ");
+  return (isImage26.value ? image26Size(resolved) : resolved).replace("x", " × ");
 });
+const modelAspectOptions = computed(() => isImage26.value ? fixedAspectOptions.filter((option) => IMAGE_26_RATIOS.includes(option.ratio)) : fixedAspectOptions);
 const aspectOptions = computed<AspectOption[]>(() => sourceRatioImages.value.length
-  ? [{ ratio: "source", tier: "1k", width: "1024", height: "1024", label: "跟随原图", detail: sourceRatioDetail.value, icon: Ratio }, ...fixedAspectOptions]
-  : fixedAspectOptions);
+  ? [{ ratio: "source", tier: "1k", width: "1024", height: "1024", label: "跟随原图", detail: sourceRatioDetail.value, icon: Ratio }, ...modelAspectOptions.value]
+  : modelAspectOptions.value);
 const modelLabel = computed(() => formatImageModel(imageModel.value));
 const modelFeatures = computed(() => imageModelFeatures(imageModel.value));
-const qualityLabel = computed(() => qualityOptions.find((item) => item.value === imageQuality.value)?.label || "自动");
 const canvasLabel = computed(() => imageRatio.value === "source" ? sourceRatioText.value : imageRatio.value === "auto" ? "智能构图" : imageRatio.value);
 const countLabel = computed(() => `${normalizeCountValue(imageCount.value, countMaxForCurrentMode())} 张`);
 const preferencesLabel = computed(() => `${canvasLabel.value} · ${countLabel.value}`);
@@ -885,7 +901,7 @@ watch(promptEngineMode, () => {
                 </div>
                 <div>
                   <label class="mb-2 block text-xs font-semibold text-slate-500">输出尺寸</label>
-                  <output v-if="imageRatio === 'source'" class="studio-input flex h-10 items-center justify-center px-3 text-sm font-semibold text-slate-700 dark:text-stone-200">{{ sourceOutputLabel }}</output>
+                  <output v-if="imageRatio === 'source' || isImage26" class="studio-input flex h-10 items-center justify-center px-3 text-sm font-semibold text-slate-700 dark:text-stone-200">{{ imageRatio === 'source' ? sourceOutputLabel : imageRatio === 'auto' ? 'auto' : `${imageWidth} × ${imageHeight}` }}</output>
                   <div v-else class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
                     <input v-model="imageWidth" type="number" min="1" class="studio-input h-10 px-3 text-center" @input="emit('ratioSelected')" />
                     <span class="text-sm text-slate-400">x</span>
@@ -920,6 +936,25 @@ watch(promptEngineMode, () => {
                     <small>{{ item.description }}</small>
                   </span>
                 </button>
+              </div>
+              <div v-if="isImage26 && (renderedSettingCard === 'model' || renderedSettingCard === 'preferences')" class="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3" data-testid="image-26-options">
+                <label class="grid min-w-0 gap-1 text-xs text-slate-600 dark:text-stone-300">复杂度
+                  <select v-model="imageOptions.complexity" aria-label="复杂度" class="studio-input h-10 px-2"><option v-for="value in IMAGE_26_COMPLEXITIES" :key="value" :value="value">{{ image26ComplexityLabels[value] || value }}</option></select>
+                </label>
+                <label class="grid min-w-0 gap-1 text-xs text-slate-600 dark:text-stone-300">输出格式
+                  <select v-model="imageOptions.outputFormat" aria-label="输出格式" class="studio-input h-10 px-2"><option v-for="value in IMAGE_26_OUTPUT_FORMATS" :key="value" :value="value">{{ value }}</option></select>
+                </label>
+                <label class="grid min-w-0 gap-1 text-xs text-slate-600 dark:text-stone-300">背景
+                  <select v-model="imageOptions.background" aria-label="背景" class="studio-input h-10 px-2"><option v-for="value in IMAGE_26_BACKGROUNDS" :key="value" :value="value">{{ image26BackgroundLabels[value] || value }}</option></select>
+                </label>
+                <template v-if="imageOptions.outputFormat === 'gif'">
+                  <label class="grid min-w-0 gap-1 text-xs text-slate-600 dark:text-stone-300">GIF 帧数
+                    <select :value="imageOptions.frameCount || 9" aria-label="GIF 帧数" class="studio-input h-10 px-2" @change="imageOptions.frameCount = Number(($event.target as HTMLSelectElement).value)"><option v-for="value in IMAGE_26_FRAME_COUNTS" :key="value" :value="value">{{ value }}</option></select>
+                  </label>
+                  <label class="grid min-w-0 gap-1 text-xs text-slate-600 dark:text-stone-300">GIF 每帧时长
+                    <select :value="imageOptions.frameDurationMs || 200" aria-label="GIF 每帧时长" class="studio-input h-10 px-2" @change="imageOptions.frameDurationMs = Number(($event.target as HTMLSelectElement).value)"><option v-for="value in IMAGE_26_FRAME_DURATIONS" :key="value" :value="value">{{ value }} ms</option></select>
+                  </label>
+                </template>
               </div>
             </div>
           </div>

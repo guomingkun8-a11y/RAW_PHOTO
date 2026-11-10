@@ -13,7 +13,7 @@ from services.platform.enterprise_schema import resolve_enterprise_database_url
 
 NavigationBase = declarative_base()
 NAVIGATION_IDS = (
-    "image", "video-generation", "audio-generation", "infinite-canvas",
+    "image", "dsh-agent", "dsh-agent-monitoring", "video-generation", "audio-generation", "infinite-canvas",
     "prompt-templates", "image-library", "monitoring", "costs", "users",
     "generation-records",
 )
@@ -56,7 +56,29 @@ class NavigationSettingsStore:
         session = self._session()
         try:
             row = session.get(NavigationSettingsModel, "default")
-            return {"items": list(row.items_json) if row else self.defaults()}
+            if row is None or not isinstance(row.items_json, list):
+                return {"items": self.defaults()}
+
+            known_ids = set(NAVIGATION_IDS)
+            items: list[dict[str, object]] = []
+            seen: set[str] = set()
+            for item in row.items_json:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "")
+                if item_id not in known_ids or item_id in seen:
+                    continue
+                seen.add(item_id)
+                items.append({"id": item_id, "visible": bool(item.get("visible", True))})
+
+            # Existing installations may have a saved layout from before new
+            # navigation entries were introduced. Preserve it and append new items.
+            items.extend(
+                {"id": item_id, "visible": True}
+                for item_id in NAVIGATION_IDS
+                if item_id not in seen
+            )
+            return {"items": items}
         finally:
             session.close()
 

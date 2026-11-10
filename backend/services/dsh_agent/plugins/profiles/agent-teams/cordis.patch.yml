@@ -1,0 +1,12 @@
+- insert:
+    - id: subagent
+      name: '@deepseek-ai/dsh-subagent'
+      config:
+        maxActiveSubagents: 2
+        maxDepth: 1
+    - id: subagent-spawn
+      name: '@deepseek-ai/dsh-subagent-spawn-in-process'
+- id: agent-teams
+  config:
+    maxMembers: 2
+    memberMaxDepth: 0

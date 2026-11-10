@@ -9,12 +9,16 @@ from fastapi.responses import FileResponse
 
 from api import ai, audio_generation, billing, business, canvas, events, image_agent, image_conversations, image_library, image_tasks, image_uploads, monitoring, prompt_analysis, system, video_agent, video_compositions, video_generation
 from api.feedback import routes as feedback
+from api.dsh_agent import routes as dsh_agent
 from api.platform import alerts, navigation
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
 from services.platform.config import config
 from services.platform.database_maintenance import ensure_database_ready, start_database_maintenance_scheduler
 from services.billing.upstream_usage_service import start_upstream_usage_scheduler
+from services.dsh_agent.store import dsh_agent_store
+from services.dsh_agent.runtime import close_runtime_pool
+from services.dsh_agent.search import close_search_bridge
 from services.image.image_service import start_image_cleanup_scheduler
 from utils.log import logger
 
@@ -41,7 +45,10 @@ def create_app() -> FastAPI:
             yield
         finally:
             await feedback.feedback_realtime.stop()
+            close_runtime_pool()
+            close_search_bridge()
             feedback.feedback_service.store.close()
+            dsh_agent_store.close()
             stop_event.set()
             database_thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
@@ -68,6 +75,7 @@ def create_app() -> FastAPI:
     app.include_router(image_tasks.create_router())
     app.include_router(events.create_router())
     app.include_router(feedback.create_router())
+    app.include_router(dsh_agent.create_router())
     app.include_router(video_generation.create_router())
     app.include_router(video_compositions.create_router())
     app.include_router(video_agent.create_router())

@@ -53,6 +53,7 @@ from services.platform.config import config
 from services.platform.proxy_service import proxy_settings
 from services.platform.runtime_requirements import enterprise_mode_enabled
 from services.providers.openai_relay_pool import current_relay_account, run_with_relay_pool
+from services.providers import openai_relay_service
 from services.image.image_size import normalize_image_size
 from services.image.reference_limits import MAX_GENERATION_REFERENCE_IMAGES, MAX_REFERENCE_IMAGES
 
@@ -916,7 +917,9 @@ def _resolve_user_image_size(value: object, configured_size: object) -> str:
     return configured
 
 
-def _safe_requested_size(value: object, default: str = "1024x1024") -> str:
+def _safe_requested_size(value: object, default: str = "1024x1024", *, model: object = "") -> str:
+    if openai_relay_service._upstream_media_model(model) == "tt-image-2.6":
+        return openai_relay_service.tt_image_2_6_native_size(value)
     return normalize_image_size(value) or default
 
 
@@ -3630,7 +3633,7 @@ class CowAgentRunRuntime:
         checks: list[dict[str, Any]] = []
         repairs: list[str] = []
         text_allowed = constraints.get("textAllowed")
-        non_square = bool(constraints.get("nonSquare"))
+        non_square = bool(constraints.get("nonSquare")) and openai_relay_service._upstream_media_model(self.run.request.get("model")) != "tt-image-2.6"
         if non_square and _size_is_square(resolved_size):
             resolved_size = IMAGE_ASPECT_SIZE_PRESETS["2:3"]
             repairs.append("square_size_replaced_with_2_3")
@@ -3741,9 +3744,10 @@ class CowAgentRunRuntime:
         has_references = bool(self.attachments or self.attachment_urls)
         configured_size = _clean(self.run.request.get("size"), "1024x1024", 40)
         hard_constraints = dict(self.turn_decision.get("hardConstraints") or {})
-        resolved_size = _resolve_user_image_size(
-            self.user_message,
-            hard_constraints.get("resolvedSize") or configured_size,
+        resolved_size = (
+            _safe_requested_size(configured_size, model=self.run.request.get("model"))
+            if openai_relay_service._upstream_media_model(self.run.request.get("model")) == "tt-image-2.6"
+            else _resolve_user_image_size(self.user_message, hard_constraints.get("resolvedSize") or configured_size)
         )
         self.run.request["size"] = resolved_size
         self.run.metadata["resolvedImageSize"] = resolved_size
@@ -4598,14 +4602,18 @@ class CowAgentRunRuntime:
 
     def _reference_files(self, requested: object) -> list[Path]:
         values = requested if isinstance(requested, list) else []
+        limit = 16 if openai_relay_service._upstream_media_model(self.run.request.get("model")) == "tt-image-2.6" else MAX_GENERATION_REFERENCE_IMAGES
         if not values:
-            return list(self.attachments[:MAX_GENERATION_REFERENCE_IMAGES])
-        return [self.resolve_attachment(_clean(value)) for value in values[:MAX_GENERATION_REFERENCE_IMAGES]]
+            return list(self.attachments[:limit])
+        return [self.resolve_attachment(_clean(value)) for value in values[:limit]]
 
     def generate_images(self, params: dict[str, Any], *, progress, cancelled) -> dict[str, Any]:
         params = dict(params or {})
+        image_model = _clean(self.run.request.get("model"), "gpt-image-2", 160)
+        is_image_26 = openai_relay_service._upstream_media_model(image_model) == "tt-image-2.6"
+        selected_size = _safe_requested_size(self.run.request.get("size"), model=image_model)
         configured_size = _clean(params.get("size") or self.run.request.get("size"), "1024x1024", 40)
-        resolved_size = _resolve_user_image_size(self.user_message, configured_size)
+        resolved_size = selected_size if is_image_26 else _resolve_user_image_size(self.user_message, configured_size)
         params["size"] = resolved_size
         subject_mutation_policy = _clean(
             params.get("subject_mutation_policy")
@@ -4684,7 +4692,8 @@ class CowAgentRunRuntime:
             ]
         pages = pages[:NORMAL_AGENT_IMAGE_COUNT_MAX]
         references = self._reference_files(params.get("reference_images"))
-        urls = list(dict.fromkeys(self.attachment_urls))[:max(0, MAX_GENERATION_REFERENCE_IMAGES - len(references))]
+        max_references = 16 if openai_relay_service._upstream_media_model(image_model) == "tt-image-2.6" else MAX_GENERATION_REFERENCE_IMAGES
+        urls = list(dict.fromkeys(self.attachment_urls))[:max(0, max_references - len(references))]
         mode = _clean(params.get("mode"), _clean(self.run.request.get("mode"), "generate", 20), 20)
         if references or urls:
             mode = "edit"
@@ -4696,6 +4705,19 @@ class CowAgentRunRuntime:
             (path.read_bytes(), path.name, mimetypes.guess_type(path.name)[0] or "image/png")
             for path in references
         ]
+        if is_image_26:
+            resolved_size = selected_size
+            self.run.request["size"] = resolved_size
+            self.run.metadata["resolvedImageSize"] = resolved_size
+        image_options = {
+            "background": self.run.request.get("background") or "",
+            "complexity": self.run.request.get("complexity") or "",
+            "output_format": self.run.request.get("output_format") or "",
+            "frame_count": self.run.request.get("frame_count"),
+            "frame_duration_ms": self.run.request.get("frame_duration_ms"),
+            "aspect_ratio": self.run.request.get("aspect_ratio") or "",
+            "image_size": self.run.request.get("image_size") or "",
+        }
         tasks: list[tuple[dict[str, Any], dict[str, Any], int]] = []
         for index, page in enumerate(pages):
             if cancelled():
@@ -4709,9 +4731,10 @@ class CowAgentRunRuntime:
                     self.identity,
                     client_task_id=task_id,
                     prompt=page_prompt,
-                    model=_clean(self.run.request.get("model"), "gpt-image-2", 160),
-                    size=_clean(params.get("size") or self.run.request.get("size"), limit=40) or None,
-                    quality=_clean(params.get("quality") or self.run.request.get("quality"), "auto", 40),
+                    model=image_model,
+                    size=resolved_size,
+                    quality=_clean(self.run.request.get("quality") if is_image_26 else params.get("quality") or self.run.request.get("quality"), "auto", 40),
+                    **image_options,
                     prompt_engine_mode="professional",
                     base_url=_clean(self.run.request.get("base_url"), limit=1000),
                     images=files,
@@ -4731,9 +4754,10 @@ class CowAgentRunRuntime:
                     self.identity,
                     client_task_id=task_id,
                     prompt=page_prompt,
-                    model=_clean(self.run.request.get("model"), "gpt-image-2", 160),
-                    size=_clean(params.get("size") or self.run.request.get("size"), limit=40) or None,
-                    quality=_clean(params.get("quality") or self.run.request.get("quality"), "auto", 40),
+                    model=image_model,
+                    size=resolved_size,
+                    quality=_clean(self.run.request.get("quality") if is_image_26 else params.get("quality") or self.run.request.get("quality"), "auto", 40),
+                    **image_options,
                     prompt_engine_mode="professional",
                     base_url=_clean(self.run.request.get("base_url"), limit=1000),
                     conversation_id=self.conversation_id,
@@ -5251,7 +5275,7 @@ def _run_from_persistent_state(state: Mapping[str, Any]) -> AgentRun:
     result = state.get("result") if isinstance(state.get("result"), Mapping) else {}
     request = dict(state.get("request") or {})
     if "size" in request:
-        request["size"] = _safe_requested_size(request.get("size"))
+        request["size"] = _safe_requested_size(request.get("size"), model=request.get("model"))
     event_rows = ecommerce_agent_memory_service.load_run_events(_clean(state.get("runId"), limit=191))
     events = [
         AgentEvent(
@@ -5303,7 +5327,7 @@ def execute_queued_cow_agent_run(run_id: str, owner_id: str) -> AgentRun | None:
         _persist_run_state(run, status="failed")
         return run
     run.request = dict(persisted_request)
-    run.request["size"] = _safe_requested_size(run.request.get("size"))
+    run.request["size"] = _safe_requested_size(run.request.get("size"), model=run.request.get("model"))
     run.metadata["ownerId"] = owner_id
     if _is_cancel_requested(run):
         _persist_run_state(run, status="canceled")
@@ -5492,7 +5516,7 @@ def start_cow_agent_run(
         "base_url": _clean(base_url, limit=1000),
         "identity": _identity_snapshot(identity),
     }
-    request["size"] = _safe_requested_size(request.get("size"))
+    request["size"] = _safe_requested_size(request.get("size"), model=request.get("model"))
     run = AgentRun(
         run_id=run_id,
         agent_name=COW_AGENT_NAME,

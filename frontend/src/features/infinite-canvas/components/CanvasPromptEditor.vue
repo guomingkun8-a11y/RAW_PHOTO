@@ -3,6 +3,7 @@ import { computed, ref } from 'vue';
 import { ArrowUp, Clock3, Image as ImageIcon, Link2, LoaderCircle, Music2, Upload, Video, X } from '@lucide/vue';
 import type { VideoGenerationModelSpec } from '@/lib/api';
 import { BUILTIN_IMAGE_MODELS, formatImageModel } from '@/lib/image-models';
+import { IMAGE_26_BACKGROUNDS, IMAGE_26_COMPLEXITIES, IMAGE_26_FRAME_COUNTS, IMAGE_26_FRAME_DURATIONS, IMAGE_26_OUTPUT_FORMATS, IMAGE_26_RATIOS, IMAGE_26_QUALITIES, isImage26Model, normalizeImage26Options, type Image26Options } from '@/lib/image-model-parameters';
 import {
   formatVideoDuration,
   formatVideoModelOption,
@@ -58,6 +59,14 @@ const defaultImageModel = computed(() => availableImageModels.value.includes('gp
 const selectedImageModel = computed(() => availableImageModels.value.includes(props.node.model || '')
   ? props.node.model
   : defaultImageModel.value);
+const isImage26 = computed(() => isImage26Model(selectedImageModel.value));
+const imageOptions = computed(() => normalizeImage26Options(props.node.imageOptions));
+const imageOptionChoices = (values: Array<string | number>) => values.map((value) => ({ value: String(value), label: String(value) }));
+const imageComplexityOptions = imageOptionChoices(IMAGE_26_COMPLEXITIES);
+const imageOutputOptions = imageOptionChoices(IMAGE_26_OUTPUT_FORMATS);
+const imageBackgroundOptions = imageOptionChoices(IMAGE_26_BACKGROUNDS);
+const imageFrameCountOptions = imageOptionChoices(IMAGE_26_FRAME_COUNTS);
+const imageFrameDurationOptions = IMAGE_26_FRAME_DURATIONS.map((value) => ({ value: String(value), label: `${value} ms` }));
 const compatibleVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes(props.videoMode)));
 const textVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes('text_to_video')));
 const imageVideoModels = computed(() => props.videoModels.filter((model) => model.modes.includes('image_to_video')));
@@ -140,11 +149,11 @@ const selectedVideoOption = computed(() => {
     : availableVideoOptions.value[0] || spec?.default_option || props.node.quality;
 });
 const aspectRatioSelectOptions = computed(() => (
-  props.node.type === 'video' ? selectedVideoModel.value?.aspect_ratios || [] : CANVAS_IMAGE_ASPECT_RATIOS
+  props.node.type === 'video' ? selectedVideoModel.value?.aspect_ratios || [] : isImage26.value ? IMAGE_26_RATIOS : CANVAS_IMAGE_ASPECT_RATIOS
 ).map((aspectRatio) => ({ value: aspectRatio, label: aspectRatio === 'adaptive' ? '自适应' : aspectRatio })));
 const imageCountSelectOptions = CANVAS_IMAGE_COUNTS.map((value) => ({ value: String(value), label: `${value}张` }));
 const imageSizeSelectOptions = CANVAS_IMAGE_SIZES.map((value) => ({ value, label: value }));
-const imageQualitySelectOptions = CANVAS_IMAGE_QUALITIES.map((value) => ({ value, label: value }));
+const imageQualitySelectOptions = computed(() => imageOptionChoices(isImage26.value ? IMAGE_26_QUALITIES : [...CANVAS_IMAGE_QUALITIES]));
 const imageThinkingSelectOptions = CANVAS_IMAGE_THINKING_LEVELS.map((value) => ({ value, label: value }));
 const videoDurationSelectOptions = computed(() => (selectedVideoModel.value?.durations || [])
   .map((value) => ({ value: String(value), label: formatVideoDuration(value) })));
@@ -175,6 +184,10 @@ const editorStyle = computed(() => {
 
 function updateField(key: keyof CanvasNode, value: CanvasNode[keyof CanvasNode]) {
   emit('updateNode', { key, value });
+}
+
+function updateImageOption(key: keyof Image26Options, value: string | number) {
+  updateField('imageOptions', { ...imageOptions.value, [key]: value });
 }
 
 function selectVideoModel(modelId: string) {
@@ -257,17 +270,26 @@ function focusPrompt() {
     </div>
     <div class="media-prompt-toolbar">
       <div class="media-toolbar-group">
-        <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select media-toolbar-model" :model-value="selectedImageModel || ''" :options="imageModelSelectOptions" label="模型" :aria-label="`${node.title}模型`" title="gpt-image-2 会按服务端规则请求 tt-image-2" @update:model-value="updateField('model', $event)" />
+        <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select media-toolbar-model" :model-value="selectedImageModel || ''" :options="imageModelSelectOptions" label="模型" :aria-label="`${node.title}模型`" @update:model-value="updateField('model', $event)" />
         <CanvasSelect v-else class="media-toolbar-select media-toolbar-model" :model-value="selectedVideoModel?.id || ''" :options="videoModelSelectOptions" label="模型" :aria-label="`${node.title}模型`" @update:model-value="selectVideoModel" />
         <CanvasSelect v-if="node.type === 'video' && videoRequestModeSelectOptions.length" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoRequestMode" :options="videoRequestModeSelectOptions" label="生成方式" :aria-label="`${node.title}生成方式`" @update:model-value="updateField('videoRequestMode', $event)" />
         <CanvasSelect v-if="node.type === 'video' && videoReferenceModeSelectOptions.length && selectedVideoRequestMode === 'cankaosheng' && videoMode === 'video_to_video'" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoReferenceMode" :options="videoReferenceModeSelectOptions" label="视频用法" :aria-label="`${node.title}视频用法`" @update:model-value="updateField('videoReferenceMode', $event)" />
         <CanvasSelect v-if="node.type === 'video' && videoVersionSelectOptions.length" class="media-toolbar-select media-toolbar-mode" :model-value="selectedVideoVersion" :options="videoVersionSelectOptions" label="版本" :aria-label="`${node.title}速度版本`" @update:model-value="selectVideoVersion" />
         <CanvasSelect class="media-toolbar-select" :model-value="node.type === 'video' ? selectedVideoAspectRatio : node.aspectRatio" :options="aspectRatioSelectOptions" label="画幅" :aria-label="`${node.title}画幅`" @update:model-value="updateField('aspectRatio', $event)" />
         <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select" :model-value="String(node.imageCount)" :options="imageCountSelectOptions" label="数量" :aria-label="`${node.title}生成数量`" @update:model-value="updateField('imageCount', Number($event))" />
-        <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select" :model-value="node.imageSize" :options="imageSizeSelectOptions" label="分辨率" :aria-label="`${node.title}分辨率`" @update:model-value="updateField('imageSize', $event)" />
+        <CanvasSelect v-if="node.type === 'image' && !isImage26" class="media-toolbar-select" :model-value="node.imageSize" :options="imageSizeSelectOptions" label="分辨率" :aria-label="`${node.title}分辨率`" @update:model-value="updateField('imageSize', $event)" />
         <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select" :model-value="node.quality" :options="imageQualitySelectOptions" label="质量" :aria-label="`${node.title}质量`" @update:model-value="updateField('quality', $event)" />
-        <CanvasSelect v-if="node.type === 'image'" class="media-toolbar-select media-toolbar-thinking" :model-value="node.thinkingLevel" :options="imageThinkingSelectOptions" label="思考" :aria-label="`${node.title}思考等级`" @update:model-value="updateField('thinkingLevel', $event)" />
-        <CanvasSelect v-else class="media-toolbar-select media-toolbar-duration" :model-value="String(selectedVideoDuration)" :options="videoDurationSelectOptions" label="时长" :aria-label="`${node.title}时长`" @update:model-value="updateField('duration', $event === 'auto' ? 'auto' : Number($event))">
+        <CanvasSelect v-if="node.type === 'image' && !isImage26" class="media-toolbar-select media-toolbar-thinking" :model-value="node.thinkingLevel" :options="imageThinkingSelectOptions" label="思考" :aria-label="`${node.title}思考等级`" @update:model-value="updateField('thinkingLevel', $event)" />
+        <template v-if="node.type === 'image' && isImage26">
+          <CanvasSelect class="media-toolbar-select" :model-value="imageOptions.complexity || 'medium'" :options="imageComplexityOptions" label="复杂度" :aria-label="`${node.title}复杂度`" @update:model-value="updateImageOption('complexity', $event)" />
+          <CanvasSelect class="media-toolbar-select" :model-value="imageOptions.outputFormat || 'png'" :options="imageOutputOptions" label="格式" :aria-label="`${node.title}输出格式`" @update:model-value="updateImageOption('outputFormat', $event)" />
+          <CanvasSelect class="media-toolbar-select" :model-value="imageOptions.background || 'auto'" :options="imageBackgroundOptions" label="背景" :aria-label="`${node.title}背景`" @update:model-value="updateImageOption('background', $event)" />
+          <template v-if="imageOptions.outputFormat === 'gif'">
+            <CanvasSelect class="media-toolbar-select" :model-value="String(imageOptions.frameCount || 9)" :options="imageFrameCountOptions" label="帧数" :aria-label="`${node.title}GIF 帧数`" @update:model-value="updateImageOption('frameCount', Number($event))" />
+            <CanvasSelect class="media-toolbar-select" :model-value="String(imageOptions.frameDurationMs || 200)" :options="imageFrameDurationOptions" label="帧时长" :aria-label="`${node.title}GIF 每帧时长`" @update:model-value="updateImageOption('frameDurationMs', Number($event))" />
+          </template>
+        </template>
+        <CanvasSelect v-if="node.type === 'video'" class="media-toolbar-select media-toolbar-duration" :model-value="String(selectedVideoDuration)" :options="videoDurationSelectOptions" label="时长" :aria-label="`${node.title}时长`" @update:model-value="updateField('duration', $event === 'auto' ? 'auto' : Number($event))">
           <template #prefix><Clock3 :size="12" aria-hidden="true" /></template>
         </CanvasSelect>
         <CanvasSelect v-if="node.type === 'video'" class="media-toolbar-select" :model-value="selectedVideoOption || ''" :options="videoOptionSelectOptions" :label="videoOptionLabel" :aria-label="`${node.title}${videoOptionLabel}`" @update:model-value="updateField('quality', $event)" />

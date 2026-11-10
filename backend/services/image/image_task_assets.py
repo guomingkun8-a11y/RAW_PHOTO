@@ -6,6 +6,7 @@ import time
 from typing import Any
 from pathlib import Path
 from urllib.parse import urlparse
+from xml.etree import ElementTree
 
 from curl_cffi import requests
 from PIL import Image, ImageFilter, ImageOps
@@ -17,6 +18,25 @@ IMAGE_REF_MARKER = "__image_ref__"
 LEGACY_IMAGE_MARKER = "__image_input__"
 RESULT_DOWNLOAD_ATTEMPTS = 5
 ASPECT_RATIO_TOLERANCE = 0.015
+IMAGE_MIME_EXTENSIONS = {
+    "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+    "image/gif": ".gif", "image/avif": ".avif", "image/svg+xml": ".svg",
+}
+
+
+def _verify_svg(payload: bytes) -> None:
+    if b"<!DOCTYPE" in payload.upper() or b"<!ENTITY" in payload.upper():
+        raise ValueError("SVG declarations are not supported")
+    root = ElementTree.fromstring(payload)
+    if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+        raise ValueError("invalid SVG result")
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() in {"script", "foreignobject", "iframe", "object", "embed"}:
+            raise ValueError("active SVG content is not supported")
+        for key, value in element.attrib.items():
+            name = key.rsplit("}", 1)[-1].lower()
+            if name.startswith("on") or (name == "href" and not value.startswith("#")):
+                raise ValueError("active SVG attributes are not supported")
 
 
 class ImageAspectRatioMismatchError(RuntimeError):
@@ -174,18 +194,16 @@ def download_result_image(url: str) -> tuple[bytes, str, str]:
             payload = bytes(response.content)
             if not payload:
                 raise RuntimeError("image result download returned empty content")
-            with Image.open(io.BytesIO(payload)) as image:
-                image.verify()
-
             mime_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            if not mime_type.startswith("image/"):
-                mime_type = "image/png"
-            suffix = Path(urlparse(source_url).path).suffix.lower()
-            if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}:
-                suffix = ".jpg" if mime_type in {"image/jpeg", "image/jpg"} else ".png"
-            filename = Path(urlparse(source_url).path).name or f"generated-result{suffix}"
-            if Path(filename).suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}:
-                filename = f"{filename}{suffix}"
+            if mime_type == "image/svg+xml" or Path(urlparse(source_url).path).suffix.lower() == ".svg":
+                _verify_svg(payload)
+                mime_type = "image/svg+xml"
+            else:
+                with Image.open(io.BytesIO(payload)) as image:
+                    image.verify()
+                    mime_type = Image.MIME.get(image.format, mime_type)
+            suffix = IMAGE_MIME_EXTENSIONS.get(mime_type, ".png")
+            filename = f"{Path(urlparse(source_url).path).stem or 'generated-result'}{suffix}"
             return payload, filename, mime_type
         except Exception as exc:
             last_error = exc
@@ -297,16 +315,20 @@ def normalize_task_result(
             source_actual: tuple[int, int] | None = None
             aspect_corrected = False
             resolution_corrected = False
-            if target is not None:
+            preserve_format = mime_type == "image/svg+xml" or Path(filename).suffix.lower() == ".svg"
+            if preserve_format:
+                _verify_svg(image_data)
+            if target is not None and not preserve_format:
                 with Image.open(io.BytesIO(image_data)) as image:
                     actual = image.size
+                    preserve_format = bool(getattr(image, "is_animated", False))
                 source_actual = actual
                 aspect_matches = _aspect_ratio_matches(actual, target)
                 if not aspect_matches and policy == "reject":
                     raise ImageAspectRatioMismatchError(expected=target, actual=actual)
                 should_conform_aspect = not aspect_matches and policy == "conform"
                 should_correct_resolution = aspect_matches and actual != target
-                if should_conform_aspect or should_correct_resolution:
+                if not preserve_format and (should_conform_aspect or should_correct_resolution):
                     image_data = _resize_image_to_canvas(
                         image_data,
                         target,

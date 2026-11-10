@@ -33,11 +33,17 @@ TT_IMAGE_2_5_VERSIONS = {
     "gpt-image-2.5-flare": "flare",
     "gpt-image-2.5-sunburst": "sunburst",
 }
+TT_IMAGE_2_6_VERSIONS = {
+    "gpt-image-2.6-flare": "flare",
+    "gpt-image-2.6-sunburst": "sunburst",
+}
 MEDIA_IMAGE_MODEL_ALIASES = {
     "gemini-3.1-flash-image-preview": "banana-2",
     "gpt-image-2": "tt-image-2",
     "gpt-image-2.5": "tt-image-2.5",
     **{model: "tt-image-2.5" for model in TT_IMAGE_2_5_VERSIONS},
+    "gpt-image-2.6": "tt-image-2.6",
+    **{model: "tt-image-2.6" for model in TT_IMAGE_2_6_VERSIONS},
 }
 MEDIA_IMAGE_MODELS = {
     "banana-2",
@@ -45,6 +51,7 @@ MEDIA_IMAGE_MODELS = {
     "qwen-image",
     "tt-image-2",
     "tt-image-2.5",
+    "tt-image-2.6",
     "wan2.6-image",
     "wan2.7-image",
 }
@@ -114,6 +121,26 @@ MEDIA_IMAGE_SIZE_OPTIONS = ("0.5K", "1K", "2K", "4K")
 MEDIA_IMAGE_QUALITY_OPTIONS = ("auto", "high", "medium", "low")
 MEDIA_IMAGE_THINKING_OPTIONS = ("minimal", "high")
 MAX_MEDIA_REFERENCE_IMAGES = MAX_GENERATION_REFERENCE_IMAGES
+TT_IMAGE_2_5_ASPECT_RATIOS = (
+    "auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+    "5:4", "4:5", "2:1", "1:2", "21:9", "9:21",
+)
+TT_IMAGE_2_5_RESOLUTIONS = ("auto", "1K", "2K", "4K")
+TT_IMAGE_2_5_QUALITIES = ("auto", "low", "medium", "high", "xhigh", "max")
+TT_IMAGE_2_5_BACKGROUNDS = ("auto", "opaque", "transparent")
+TT_IMAGE_2_6_SIZES = ("auto", "1024x1024", "1536x1024", "1024x1536")
+TT_IMAGE_2_6_FORMATS = ("png", "jpeg", "webp", "svg", "gif")
+
+
+def tt_image_2_6_native_size(value: object) -> str:
+    text = str(value or "auto").strip().lower()
+    if text in TT_IMAGE_2_6_SIZES:
+        return text
+    match = re.fullmatch(r"(\d+)[x:](\d+)", text)
+    if not match or int(match[1]) <= 0 or int(match[2]) <= 0:
+        return "auto"
+    ratio = int(match[1]) / int(match[2])
+    return min(TT_IMAGE_2_6_SIZES[1:], key=lambda size: abs(int(size.split("x")[0]) / int(size.split("x")[1]) - ratio))
 
 
 def settings() -> dict[str, object]:
@@ -384,7 +411,7 @@ def _media_option(value: object, allowed: tuple[str, ...], default: str, field_n
 
 def _media_aspect_ratio(body: dict[str, Any], requested_size: str) -> str:
     explicit = str(body.get("aspect_ratio") or "").strip()
-    if explicit:
+    if explicit and explicit.lower() != "auto":
         by_lower = {item.lower(): item for item in MEDIA_IMAGE_ASPECT_RATIOS}
         selected = by_lower.get(explicit.lower())
         if selected is None:
@@ -422,9 +449,68 @@ def _media_thinking_level(body: dict[str, Any]) -> str:
     )
 
 
+def _tt_image_2_5_aspect_ratio(body: dict[str, Any], requested_size: str) -> str:
+    fallback = _aspect_ratio_from_size(requested_size)
+    if fallback not in TT_IMAGE_2_5_ASPECT_RATIOS:
+        fallback = "auto"
+    if str(body.get("aspect_ratio") or "").strip().lower() == "auto":
+        return fallback
+    return _media_option(body.get("aspect_ratio"), TT_IMAGE_2_5_ASPECT_RATIOS, fallback, "aspect_ratio")
+
+
+def _tt_image_2_5_resolution(body: dict[str, Any], requested_size: str) -> str:
+    fallback = "auto" if requested_size.strip().lower() == "auto" else _image_size_tier_from_size(requested_size)
+    if fallback not in TT_IMAGE_2_5_RESOLUTIONS:
+        fallback = "1K"
+    return _media_option(body.get("image_size"), TT_IMAGE_2_5_RESOLUTIONS, fallback, "image_size")
+
+
+def _tt_image_2_5_quality(body: dict[str, Any]) -> str:
+    requested = str(body.get("quality") or "").strip()
+    if requested.lower() == "standard":
+        requested = "auto"
+    return _media_option(requested, TT_IMAGE_2_5_QUALITIES, "auto", "quality")
+
+
+def _tt_image_2_5_background(body: dict[str, Any]) -> str:
+    return _media_option(body.get("background"), TT_IMAGE_2_5_BACKGROUNDS, "auto", "background")
+
+
+def tt_image_2_6_params(body: dict[str, Any], requested_size: str) -> dict[str, Any]:
+    size = _media_option(requested_size, TT_IMAGE_2_6_SIZES, "auto", "size")
+    ratio = str(body.get("aspect_ratio") or "auto").strip().lower()
+    ratio_sizes = {"1:1": "1024x1024", "3:2": "1536x1024", "2:3": "1024x1536"}
+    if size == "auto" and ratio != "auto":
+        if ratio not in ratio_sizes:
+            raise HTTPException(status_code=400, detail={"error": "tt-image-2.6 aspect_ratio must be auto, 1:1, 3:2 or 2:3"})
+        size = ratio_sizes[ratio]
+    model = str(body.get("model") or "").strip().lower()
+    params: dict[str, Any] = {
+        "size": size,
+        "version": TT_IMAGE_2_6_VERSIONS.get(model, "flare"),
+        "quality": _media_option(body.get("quality"), ("auto", "low", "medium", "high", "xhigh", "max"), "auto", "quality"),
+        "background": _media_option(body.get("background"), ("auto", "opaque", "transparent"), "auto", "background"),
+        "complexity": _media_option(body.get("complexity"), ("low", "medium", "high"), "medium", "complexity"),
+        "output_format": _media_option(body.get("output_format"), TT_IMAGE_2_6_FORMATS, "png", "output_format"),
+    }
+    for field, allowed, default in (
+        ("frame_count", (4, 6, 9, 12, 16), 9),
+        ("frame_duration_ms", (100, 200, 300, 500, 1000), 200),
+    ):
+        value = body.get(field)
+        if value is not None and str(value).strip():
+            if isinstance(value, bool) or str(value).strip() not in {str(item) for item in allowed}:
+                raise HTTPException(status_code=400, detail={"error": f"{field} must be one of {allowed}"})
+            if params["output_format"] != "gif":
+                raise HTTPException(status_code=400, detail={"error": f"{field} is only supported for GIF output"})
+        if params["output_format"] == "gif":
+            params[field] = int(value) if value is not None and str(value).strip() else default
+    return params
+
+
 def _tt_image_size(body: dict[str, Any], requested_size: str) -> str:
     aspect_ratio = str(body.get("aspect_ratio") or "").strip()
-    if aspect_ratio:
+    if aspect_ratio and aspect_ratio.lower() != "auto":
         target = canvas_media_request_size(
             aspect_ratio,
             body.get("image_size") or _media_image_size(body, requested_size),
@@ -467,15 +553,15 @@ def _media_image_params(
     reference_urls: list[str],
 ) -> dict[str, Any]:
     params: dict[str, Any]
-    if upstream_model.lower() == "tt-image-2.5":
+    if upstream_model.lower() == "tt-image-2.6":
+        params = tt_image_2_6_params(body, requested_size)
+    elif upstream_model.lower() == "tt-image-2.5":
         params = {
-            "background": "auto",
-            "quality": _media_quality(body),
-            "resolution": _media_image_size(body, requested_size),
+            "aspect_ratio": _tt_image_2_5_aspect_ratio(body, requested_size),
+            "background": _tt_image_2_5_background(body),
+            "quality": _tt_image_2_5_quality(body),
+            "resolution": _tt_image_2_5_resolution(body, requested_size),
         }
-        aspect_ratio = _media_aspect_ratio(body, requested_size)
-        if aspect_ratio != "auto":
-            params["aspect_ratio"] = aspect_ratio
         version = TT_IMAGE_2_5_VERSIONS.get(str(body.get("model") or "").strip().lower())
         # Unversioned legacy requests keep the provider's default version.
         if version:
@@ -1104,10 +1190,11 @@ def _media_image_generation(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
     requested_size = str(body.get("size") or "auto").strip() or "auto"
     reference_count = len(reference_urls)
-    if reference_count > MAX_MEDIA_REFERENCE_IMAGES:
+    max_reference_images = 16 if upstream_model.lower() == "tt-image-2.6" else MAX_MEDIA_REFERENCE_IMAGES
+    if reference_count > max_reference_images:
         raise HTTPException(
             status_code=400,
-            detail={"error": f"supports at most {MAX_MEDIA_REFERENCE_IMAGES} reference images"},
+            detail={"error": f"supports at most {max_reference_images} reference images"},
         )
     requested_count = _media_count(body.get("n"))
     params = _media_image_params(

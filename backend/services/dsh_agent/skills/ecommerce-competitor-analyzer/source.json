@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/buluslan/ecommerce-competitor-analyzer",
+  "revision": "853c7102b76940be78422ac765fb98a22e76f206",
+  "path": ".",
+  "license": "MIT",
+  "vendored": [
+    "SKILL.md",
+    "references/n8n-workflow-analysis.md",
+    "references/analysis-prompt-base.md",
+    "LICENSE"
+  ],
+  "upstream_sha256": {
+    "SKILL.md": "60ce06d653226d57c06cca26c4555b8dc85ab0c4c6cb8ec54b8b598483f5702e",
+    "references/n8n-workflow-analysis.md": "0e194c96bde8bd7fc53fda56bda6ae00c0054d41039041bd120a9e3d968e931d",
+    "references/analysis-prompt-base.md": "69725cd588daf5c497854a2658ada1d1223bb99fc2a13d9085e100ec639fefdc",
+    "LICENSE": "82a9feafe2eb8b9c8a7c6ff2a986aa4b85f4ac999a92cb93ea17d3cbc4fa8f80"
+  },
+  "integration": "Read-only DSH skill. Explicit per-turn selection required. Existing web_search/web_fetch and uploaded materials only. No third-party scripts, credentials, SDKs, scheduled monitoring, Google Sheets access or model endpoints are installed. Missing metrics must be reported as unavailable."
+}

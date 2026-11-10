@@ -1,0 +1,8 @@
+- id: web-deepseek-api
+  config:
+    baseURL: !!js process.env.DSH_AGENT_SEARCH_BASE_URL || 'http://127.0.0.1:1'
+    apiKeyEnv: DSH_AGENT_SEARCH_API_KEY
+    sendOriginalQuestion: false
+- insert:
+    - id: raw-photo-team-policy
+      name: ./team-policy.mjs

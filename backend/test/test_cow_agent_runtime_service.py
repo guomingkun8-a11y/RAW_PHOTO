@@ -267,6 +267,39 @@ class CowAgentRuntimeTests(unittest.TestCase):
         self.assertEqual(first.parent, self.root / "users")
         self.assertEqual(second.parent, self.root / "users")
 
+    def test_image_26_agent_keeps_selected_options(self):
+        for version in ("flare", "sunburst"):
+            for size in ("auto", "1536x1024"):
+                with self.subTest(version=version, size=size):
+                    run = self._run(turn=f"{version}-{size}")
+                    run.request.update({"model": f"gpt-image-2.6-{version}", "size": size, "quality": "max", "output_format": "gif", "frame_count": 9, "frame_duration_ms": 200})
+                    task = {"id": "test-task", "status": "success", "data": [{"url": "https://example.test/result.gif"}]}
+                    with (
+                        mock.patch.object(cow_runtime.CowAgentRunRuntime, "_build_memory_manager", return_value=_MemoryManager()),
+                        mock.patch.object(cow_runtime.image_task_service, "submit_generation", return_value=task) as submit,
+                    ):
+                        runtime = cow_runtime.CowAgentRunRuntime(run)
+                        runtime.generate_images({"prompt": "Generate an image", "size": "1024x1536", "quality": "low"}, progress=lambda _: None, cancelled=lambda: False)
+                    self.assertEqual(size, submit.call_args.kwargs["size"])
+                    self.assertEqual("max", submit.call_args.kwargs["quality"])
+                    self.assertEqual("gif", submit.call_args.kwargs["output_format"])
+                    self.assertEqual(size, run.request["size"])
+
+    def test_image_26_queued_run_keeps_auto_size(self):
+        run = self._run()
+        run.status = AgentRunStatus.PENDING
+        run.request.update({"model": "gpt-image-2.6-sunburst", "size": "auto"})
+        cow_runtime._persist_run_state(run, status="pending")
+        captured = {}
+
+        def fake_execute(runtime_self):
+            captured.update(runtime_self.run.request)
+            runtime_self.run.status = AgentRunStatus.COMPLETED
+
+        with mock.patch.object(cow_runtime.CowAgentRunRuntime, "execute", new=fake_execute):
+            cow_runtime.execute_queued_cow_agent_run(run.run_id, "cow-user")
+        self.assertEqual("auto", captured["size"])
+
     def test_later_turn_reuses_same_conversation_product_reference(self):
         payload = b"original-product-reference"
         encoded = base64.b64encode(payload).decode("ascii")

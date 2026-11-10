@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import { httpRequest } from "@/lib/request";
 import { BUILTIN_IMAGE_MODELS } from '@/lib/image-models';
+import { image26MimeType, image26Size, isImage26Model, normalizeImage26Options, type Image26Options } from '@/lib/image-model-parameters';
 import { normalizeVideoModelSpecs } from "@/lib/video-models";
 import {
   waitForCanvasImageTask,
@@ -38,13 +39,14 @@ function taskError(task: ImageTask | VideoGenerationTask) {
   return task.error || "生成任务失败";
 }
 
-function imageItemUrl(item: NonNullable<ImageTask["data"]>[number]) {
+function imageItemUrl(item: NonNullable<ImageTask["data"]>[number], outputFormat?: string) {
   if (item.url) return resolveApiAssetUrl(item.url);
-  return item.b64_json ? `data:image/png;base64,${item.b64_json}` : "";
+  const mimeType = item.mime_type || (outputFormat ? image26MimeType(outputFormat) : "image/png");
+  return item.b64_json ? `data:${mimeType};base64,${item.b64_json}` : "";
 }
 
-function imageResultUrls(task: ImageTask) {
-  return (task.data || []).map(imageItemUrl).filter(Boolean);
+function imageResultUrls(task: ImageTask, outputFormat?: string) {
+  return (task.data || []).map((item) => imageItemUrl(item, outputFormat)).filter(Boolean);
 }
 
 function videoResultUrl(task: VideoGenerationTask) {
@@ -138,6 +140,7 @@ export async function generateCanvasImage(input: {
   model: string;
   aspectRatio: string;
   imageSize: string;
+  imageOptions?: Image26Options;
   quality: string;
   thinkingLevel: string;
   imageCount: number;
@@ -147,13 +150,24 @@ export async function generateCanvasImage(input: {
   signal?: AbortSignal;
   onProgress?: (task: ImageTask) => void;
 }) {
+  const nativeSize = isImage26Model(input.model) ? image26Size(input.aspectRatio) : "auto";
+  const imageOptions = {
+    ...(isImage26Model(input.model) ? { ...normalizeImage26Options(input.imageOptions), aspectRatio: input.aspectRatio } : {
+      aspectRatio: input.aspectRatio,
+      imageSize: input.imageSize,
+      thinkingLevel: input.thinkingLevel,
+    }),
+    imageCount: input.imageCount,
+    source: "canvas" as const,
+    canvasUnits: input.imageCount,
+  };
   const task = input.references.length
     ? await createImageEditTask(
       input.taskId,
       [],
       input.prompt,
       input.model,
-      "auto",
+      nativeSize,
       input.quality,
       input.references,
       false,
@@ -167,20 +181,13 @@ export async function generateCanvasImage(input: {
       0,
       0,
         "standard",
-      {
-        aspectRatio: input.aspectRatio,
-        imageSize: input.imageSize,
-        thinkingLevel: input.thinkingLevel,
-        imageCount: input.imageCount,
-        source: "canvas",
-        canvasUnits: input.imageCount,
-      },
+      imageOptions,
     )
     : await createImageGenerationTask(
       input.taskId,
       input.prompt,
       input.model,
-      "auto",
+      nativeSize,
       input.quality,
       input.workflowId,
       input.nodeId,
@@ -190,14 +197,7 @@ export async function generateCanvasImage(input: {
       0,
       1,
         "standard",
-      {
-        aspectRatio: input.aspectRatio,
-        imageSize: input.imageSize,
-        thinkingLevel: input.thinkingLevel,
-        imageCount: input.imageCount,
-        source: "canvas",
-        canvasUnits: input.imageCount,
-      },
+      imageOptions,
     );
   input.onProgress?.(task);
   const result = TERMINAL_TASK_STATUSES.has(task.status)
@@ -207,7 +207,7 @@ export async function generateCanvasImage(input: {
       onProgress: input.onProgress,
     });
   if (result.status !== "success") throw new Error(taskError(result));
-  const resultUrls = imageResultUrls(result);
+  const resultUrls = imageResultUrls(result, input.imageOptions?.outputFormat);
   const resultUrl = resultUrls[0] || "";
   if (!resultUrl) throw new Error("图片任务完成，但没有返回图片地址");
   return { resultUrl, resultUrls, taskId: result.id, cost: result.cost };
@@ -285,13 +285,13 @@ export async function resumeCanvasGeneration(input: {
   return { resultUrl, resultUrls, taskId: result.id, cost: result.cost };
 }
 
-async function downloadCanvasImageIndexes(taskId: string, indexes: number[], archiveName: string) {
+async function downloadCanvasImageIndexes(taskId: string, indexes: number[], archiveName: string, format = "png") {
   const blob = await downloadImageTaskZip({
     folderName: "Canvas-Images",
     items: indexes.map((index) => ({
       taskId,
       imageIndex: index,
-      filename: `canvas-image-${index + 1}.png`,
+      filename: `canvas-image-${index + 1}.${format}`,
     })),
   });
   const href = URL.createObjectURL(blob);
@@ -305,18 +305,19 @@ async function downloadCanvasImageIndexes(taskId: string, indexes: number[], arc
   window.setTimeout(() => URL.revokeObjectURL(href), 0);
 }
 
-export async function downloadCanvasImages(taskId: string, imageCount: number) {
+export async function downloadCanvasImages(taskId: string, imageCount: number, format = "png") {
   const count = Math.min(4, Math.max(1, Math.round(imageCount || 1)));
   return downloadCanvasImageIndexes(
     taskId,
     Array.from({ length: count }, (_, index) => index),
     "Canvas-Images.zip",
+    format === "jpeg" ? "jpg" : format,
   );
 }
 
-export async function downloadCanvasImage(taskId: string, imageIndex: number) {
+export async function downloadCanvasImage(taskId: string, imageIndex: number, format = "png") {
   const index = Math.min(3, Math.max(0, Math.round(imageIndex || 0)));
-  return downloadCanvasImageIndexes(taskId, [index], `Canvas-Image-${index + 1}.zip`);
+  return downloadCanvasImageIndexes(taskId, [index], `Canvas-Image-${index + 1}.zip`, format === "jpeg" ? "jpg" : format);
 }
 
 export const canvasApi = {

@@ -1,0 +1,17 @@
+{
+  "name": "raw-photo-dsh-agent-teams-profile",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2",
+    "@nanmicoder/dsh-agent-teams": "0.1.29"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-sdk-minimal",
+        "@nanmicoder/dsh-agent-teams"
+      ]
+    }
+  }
+}

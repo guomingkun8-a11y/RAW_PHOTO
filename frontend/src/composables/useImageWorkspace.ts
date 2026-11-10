@@ -34,6 +34,7 @@ import {
 } from "@/lib/api";
 import { HttpRequestError } from "@/lib/request";
 import { BUILTIN_IMAGE_MODELS, filterImageModels, formatImageModel, isImageModel } from "@/lib/image-models";
+import { image26Extension, image26MimeType, image26Quality, image26Ratio, image26RequestFields, image26Size, isImage26Model, normalizeImage26Options, type Image26Options } from "@/lib/image-model-parameters";
 import {
   inferImageRatio,
   parseImageSize,
@@ -70,6 +71,7 @@ const IMAGE_RATIO_STORAGE_KEY = storageKey("gmkraw:image_last_ratio");
 const IMAGE_TIER_STORAGE_KEY = storageKey("gmkraw:image_last_tier");
 const IMAGE_QUALITY_STORAGE_KEY = storageKey("gmkraw:image_last_quality");
 const IMAGE_MODEL_STORAGE_KEY = storageKey("gmkraw:image_last_model");
+const IMAGE_OPTIONS_STORAGE_KEY = storageKey("gmkraw:image_26_options");
 const PRESERVE_SUBJECT_STORAGE_KEY = storageKey("gmkraw:image_preserve_subject");
 const PROMPT_ENGINE_MODE_STORAGE_KEY = storageKey("gmkraw:prompt_engine_mode");
 const LONG_TERM_MEMORY_STORAGE_PREFIX = storageKey("gmkraw:agent_long_term_memory");
@@ -871,7 +873,7 @@ function friendlyImageError(value?: string) {
   }
   return text;
 }
-function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage {
+function taskDataToStoredImage(image: StoredImage, task: ImageTask, outputFormat?: string): StoredImage {
   if (task.status === "success") {
     const first = task.data?.[0];
     if (!first?.b64_json && !first?.url) return { ...image, taskId: task.id, status: "error", taskStatus: undefined, progress: undefined, error: "未返回图片数据" };
@@ -883,6 +885,8 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       progress: undefined,
       b64_json: first.url ? undefined : first.b64_json,
       url: first.url,
+      mimeType: first.mime_type || (outputFormat ? image26MimeType(outputFormat) : image.mimeType),
+      sourceName: first.filename || image.sourceName || `${image.id}.${image26Extension(outputFormat || first.mime_type)}`,
       revised_prompt: first.revised_prompt,
       width: first.width,
       height: first.height,
@@ -1137,6 +1141,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   const imageHeight = ref("1024");
   const imageRatioExplicitlySelected = ref(false);
   const imageQuality = ref("auto");
+  const imageOptions = ref<Image26Options>(normalizeImage26Options());
   const imageModel = ref<ImageModel>("gpt-image-2");
   const imageModels = ref<ImageModel[]>([...BUILTIN_IMAGE_MODELS]);
   const referenceImages = ref<StoredReferenceImage[]>([]);
@@ -1444,6 +1449,8 @@ export function useImageWorkspace(isAdmin: boolean) {
                     progress: undefined,
                     b64_json: generated.b64_json || undefined,
                     url: generated.url || undefined,
+                    mimeType: generated.mime_type || (turn.imageOptions?.outputFormat ? image26MimeType(turn.imageOptions.outputFormat) : undefined),
+                    sourceName: generated.filename || undefined,
                     revised_prompt: generated.revised_prompt || undefined,
                     width: generated.width || undefined,
                     height: generated.height || undefined,
@@ -1466,6 +1473,8 @@ export function useImageWorkspace(isAdmin: boolean) {
                     status: "success" as const,
                     b64_json: generated.b64_json || undefined,
                     url: generated.url || undefined,
+                    mimeType: generated.mime_type || (turn.imageOptions?.outputFormat ? image26MimeType(turn.imageOptions.outputFormat) : undefined),
+                    sourceName: generated.filename || undefined,
                     revised_prompt: generated.revised_prompt || undefined,
                     width: generated.width || undefined,
                     height: generated.height || undefined,
@@ -1555,6 +1564,8 @@ export function useImageWorkspace(isAdmin: boolean) {
       model: resolveAllowedImageModel(turn.model),
       size: turn.size,
       quality: turn.quality,
+      ...image26RequestFields(turn.model, turn.imageOptions),
+      ...(isImage26Model(turn.model) ? { aspect_ratio: turn.ratio === "source" ? "auto" : image26Ratio(turn.size) } : {}),
       count: turn.agentRetryImageId ? 1 : Math.min(turn.folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, Math.max(1, turn.count)),
       sceneType: "auto",
       preserveSubject: effectiveMode === "edit",
@@ -1713,6 +1724,8 @@ export function useImageWorkspace(isAdmin: boolean) {
       imageRatio.value = storedTier === "2k" || storedRatio === "source" ? "1:1" : storedRatio || "1:1";
       imageTier.value = storedTier === "2k" ? "1k" : storedTier || "1k";
       imageQuality.value = localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) || "auto";
+      try { imageOptions.value = normalizeImage26Options(JSON.parse(localStorage.getItem(IMAGE_OPTIONS_STORAGE_KEY) || "{}") || {}); }
+      catch { imageOptions.value = normalizeImage26Options(); }
       imageCount.value = clampImageCount(localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) || DEFAULT_IMAGE_COUNT);
       preserveSubject.value = localStorage.getItem(PRESERVE_SUBJECT_STORAGE_KEY) === "true";
       promptEngineMode.value = localStorage.getItem(PROMPT_ENGINE_MODE_STORAGE_KEY) === "professional" ? "professional" : "standard";
@@ -1929,7 +1942,7 @@ export function useImageWorkspace(isAdmin: boolean) {
             if (image.status === "canceled" || canceledImageTaskIds.has(taskId)) return image;
             const task = taskMap.get(taskId);
             if (!task) return image;
-            const next = taskDataToStoredImage({ ...image, taskId }, task);
+            const next = taskDataToStoredImage({ ...image, taskId }, task, turn.imageOptions?.outputFormat);
             if (image.status !== "error" && next.status === "error") failures.push({ taskId: task.id, failureReportId: image.failureReportId || image.id, error: next.error, mode: turn.mode, model: turn.model, productId: turn.productId, templateId: turn.templateId });
             return next;
           });
@@ -1964,10 +1977,12 @@ export function useImageWorkspace(isAdmin: boolean) {
       const taskModel = resolveAllowedImageModel(activeTurn.model);
       const taskPromptEngineMode = activeTurn.promptEngine?.engineMode || (activeTurn.promptEngine ? "professional" : "standard");
       const taskSize = image.requestedSize || activeTurn.size;
-      const taskImageOptions = activeTurn.ratio === "source" ? sourceRatioImageOptions(taskModel) : {};
+      const taskImageOptions = isImage26Model(taskModel)
+        ? { ...normalizeImage26Options(activeTurn.imageOptions), aspectRatio: activeTurn.ratio === "source" ? "auto" : image26Ratio(taskSize) }
+        : activeTurn.ratio === "source" ? sourceRatioImageOptions(taskModel) : {};
       const task = activeTurn.mode === "edit"
         ? await createImageEditTask(taskId, payload.files, taskPrompt, taskModel, taskSize, activeTurn.quality, payload.urls, activeTurn.preserveSubject === true, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, payload.referenceUploadMs, payload.referenceCacheHits, taskPromptEngineMode, taskImageOptions)
-        : await createImageGenerationTask(taskId, taskPrompt, taskModel, taskSize, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, taskPromptEngineMode);
+        : await createImageGenerationTask(taskId, taskPrompt, taskModel, taskSize, activeTurn.quality, conversationId, activeTurn.id, activeTurn.productId, activeTurn.templateId, activeTurn.id, imageIndex, activeTurn.images.length, taskPromptEngineMode, taskImageOptions);
       if (canceledImageTaskIds.has(taskId)) {
         const restoreTracking = async (latest: ImageTask) => {
           canceledImageTaskIds.delete(taskId);
@@ -2475,16 +2490,17 @@ export function useImageWorkspace(isAdmin: boolean) {
         : 0;
       const count = batchReplace ? batchReplace.folderImages.length : batchFolder ? batchFolder.folderImages.length : folderId ? folderCount : resolveImageCountFromPrompt(prompt, selectedCount);
       const submitModel = resolveAllowedImageModel(imageModel.value);
-      const configuredSize = `${imageWidth.value || 1024}x${imageHeight.value || 1024}`;
+      const configuredSize = isImage26Model(submitModel) && imageRatio.value === "auto" ? "auto" : `${imageWidth.value || 1024}x${imageHeight.value || 1024}`;
       const explicitSize = resolveExplicitImageSizeFromPrompt(conversationalPrompt);
       const sourceReference = batchReplace?.folderImages[0]
         || batchFolder?.folderImages[0]
         || preferredSourceReference(effectiveReferences);
       const followsSourceRatio = mode === "edit" && imageRatio.value === "source" && !explicitSize;
-      const resolvedSize = explicitSize
+      const requestedSize = explicitSize
         || (followsSourceRatio ? resolveSourceImageSize(sourceReference, configuredSize) : null)
         || resolveImageSizeFromPrompt(conversationalPrompt, configuredSize);
-      const resolvedRatio = followsSourceRatio ? "source" : inferImageRatio(resolvedSize, imageRatio.value);
+      const resolvedSize = isImage26Model(submitModel) ? image26Size(requestedSize) : requestedSize;
+      const resolvedRatio = followsSourceRatio ? "source" : isImage26Model(submitModel) ? image26Ratio(resolvedSize) : inferImageRatio(resolvedSize, imageRatio.value);
       imageModel.value = submitModel;
       if (promptEngine && !promptEngine.model) promptEngine.model = submitModel;
       const agentCount = isImageAgent ? Math.min(folderId ? AGENT_FOLDER_IMAGE_COUNT_MAX : AGENT_IMAGE_COUNT_MAX, count) : count;
@@ -2500,7 +2516,7 @@ export function useImageWorkspace(isAdmin: boolean) {
           ? batchReplace?.folderImages[image.sourceImageIndex] || batchFolder?.folderImages[image.sourceImageIndex]
           : sourceReference;
         image.requestedSize = followsSourceRatio
-          ? resolveSourceImageSize(itemSource, configuredSize)
+          ? isImage26Model(submitModel) ? image26Size(resolveSourceImageSize(itemSource, configuredSize)) : resolveSourceImageSize(itemSource, configuredSize)
           : resolvedSize;
       });
       const turn: ImageTurn = {
@@ -2523,6 +2539,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         ratio: resolvedRatio,
         tier: imageTier.value,
         quality: imageQuality.value,
+        imageOptions: isImage26Model(submitModel) ? normalizeImage26Options(imageOptions.value) : undefined,
         images: loadingImages,
         createdAt: now,
         status: isImageAgent ? "planning" : "queued",
@@ -2542,6 +2559,8 @@ export function useImageWorkspace(isAdmin: boolean) {
           model: submitModel,
           size: resolvedSize,
           quality: imageQuality.value,
+          ...image26RequestFields(submitModel, turn.imageOptions),
+          ...(isImage26Model(submitModel) ? { aspect_ratio: followsSourceRatio ? "auto" : image26Ratio(resolvedSize) } : {}),
           count: agentCount,
           sceneType: "auto",
           preserveSubject: shouldPreserveSubject,
@@ -2660,6 +2679,7 @@ export function useImageWorkspace(isAdmin: boolean) {
         model: turn.model,
         size: turn.size,
         quality: turn.quality,
+        imageOptions: turn.imageOptions,
       });
       const refreshed = response.items.find((candidate) => candidate.id === itemId);
       await updateConversation(conversation.id, (current) => {
@@ -3007,6 +3027,7 @@ export function useImageWorkspace(isAdmin: boolean) {
     localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier.value);
     localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality.value);
     localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel.value);
+    localStorage.setItem(IMAGE_OPTIONS_STORAGE_KEY, JSON.stringify(imageOptions.value));
     if (parsedCount.value > 0) localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount.value));
     localStorage.setItem(PRESERVE_SUBJECT_STORAGE_KEY, preserveSubject.value ? "true" : "false");
     localStorage.setItem(PROMPT_ENGINE_MODE_STORAGE_KEY, promptEngineMode.value);
@@ -3051,6 +3072,20 @@ export function useImageWorkspace(isAdmin: boolean) {
     canceledImageAgentTurnIds.clear();
     submittedImageTaskIds.clear();
   });
+  watch([imageModel, imageRatio, imageWidth, imageHeight, imageQuality], () => {
+    if (isImage26Model(imageModel.value)) {
+      imageQuality.value = image26Quality(imageModel.value, imageQuality.value);
+      if (imageRatio.value !== "source") {
+        const ratio = ["auto", "1:1", "3:2", "2:3"].includes(imageRatio.value) ? imageRatio.value : image26Ratio(`${imageWidth.value}x${imageHeight.value}`);
+        imageRatio.value = ratio;
+        const parsed = parseImageSize(image26Size(ratio));
+        imageWidth.value = parsed.width;
+        imageHeight.value = parsed.height;
+      }
+      imageTier.value = imageRatio.value === "auto" ? "auto" : "1k";
+    } else if (["xhigh", "max"].includes(imageQuality.value)) imageQuality.value = "auto";
+  });
+  watch(imageOptions, persistPreferences, { deep: true });
   watch([imageRatio, imageTier, imageQuality, imageModel, imageCount, preserveSubject, promptEngineMode, longTermMemoryEnabled], persistPreferences);
   watch(selectedConversationId, (id) => {
     if (id) localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, id);
@@ -3059,6 +3094,7 @@ export function useImageWorkspace(isAdmin: boolean) {
   watch(conversations, scanQueues, { deep: false });
 
   return {
+    imageOptions,
     settingsConfig, imagePrompt, imageCount, imageRatio, imageTier, imageWidth, imageHeight, imageQuality, imageModel, imageModels, referenceImages, agentVideos, batchProductImage, batchFolderImages, agentFolder, preserveSubject, promptEngineMode, longTermMemoryEnabled, conversations, selectedConversationId, appendToSelectedConversation, isSubmitting, submitPhase, isUploadingAgentVideo, isLoadingHistory, isLoadingMoreHistory, hasMoreHistory, historyTotal, availableQuota, historyOpen, deleteConfirm, timeoutRetry, lightboxOpen, lightboxIndex, lightboxImages, isOpenAIRelayEnabled, imageTimeoutRetrySecs, parsedCount, selectedConversation, canResumeAgentWithReferences, activeTaskCount, todayGeneratedCount, totalGeneratedCount, displayModel, deleteConfirmTitle, deleteConfirmDescription, formatConversationTime, createDraft, selectConversation, submit, resumeAgentTurn, loadMoreHistory, appendReferenceFiles, appendAgentVideoFiles, removeReference, removeAgentVideo, pickBatchProduct, pickBatchFolder, clearBatch, markImageRatioExplicit, requestDeletePrompt, requestDeleteResults, requestDeleteConversation, requestDeleteConversations, requestClearHistory, confirmDelete, renameConversation, regenerateTurn, retryImage, retryBatchItem, cancelTurn, continueTimeoutRetry, cancelTimeoutRetry, dismissErrors, reuseTurnConfig, continueEdit, openLightbox, consumePendingPromptTemplate,
   };
 }

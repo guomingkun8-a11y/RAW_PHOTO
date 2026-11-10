@@ -35,6 +35,7 @@ dependencies = [
     "markdownify>=1.2.2",
     "playwright>=1.57.0",
     "ffmpy>=1.0.0",
+    "deepseek-harness-sdk==0.2.1rc2",
 ]
 
 [dependency-groups]

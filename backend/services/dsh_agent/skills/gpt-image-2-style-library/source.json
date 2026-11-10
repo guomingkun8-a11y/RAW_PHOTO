@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/freestylefly/awesome-gpt-image-2",
+  "commit": "53d3927ee3c45f6c54a12d86aabcf5c921670e11",
+  "paths": [
+    "agents/skills/gpt-image-2-style-library/SKILL.md",
+    "agents/skills/gpt-image-2-style-library/references/style-library.md"
+  ],
+  "license": "MIT",
+  "adaptation": "Bundled instruction and structured reference only. Removed unbundled preview image. No executable scripts, gallery images or full third-party case prompts included. Generation uses the existing project tools.",
+  "rights_notice": "Third-party example content retains its own rights; repository licensing does not guarantee its commercial reuse."
+}

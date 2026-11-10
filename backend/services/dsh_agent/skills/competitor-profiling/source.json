@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/coreyhaines31/marketingskills",
+  "revision": "96798cf38736ecdba015a1d2b0521b0c8f8f41dd",
+  "path": "skills/competitor-profiling",
+  "license": "MIT",
+  "vendored": [
+    "SKILL.md",
+    "references/templates.md",
+    "references/tool-reference.md",
+    "LICENSE"
+  ],
+  "upstream_sha256": {
+    "SKILL.md": "66d93cd9c8120d63d45c4154f13bf6b475db99b7628569ed4e42eb271909e254",
+    "references/templates.md": "710d78cb519012eb7e39f63643e22d7b9026c91c569262b44c45535c10717a91",
+    "references/tool-reference.md": "fda64910bc1b3a2bc7df21c15701220849b4b79a58a51f9d3ccae1b7311dbd79"
+  },
+  "integration": "Read-only DSH skill. Explicit per-turn selection required. Existing web_search/web_fetch and uploaded materials only. No third-party scripts, credentials, SDKs, scheduled monitoring, Google Sheets access or model endpoints are installed. Missing metrics must be reported as unavailable."
+}

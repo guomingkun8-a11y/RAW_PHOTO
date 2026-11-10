@@ -17,12 +17,14 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   searchable?: boolean;
   searchPlaceholder?: string;
+  menuMinWidth?: number;
 }>(), {
   ariaLabel: "",
   variant: "compact",
   disabled: false,
   searchable: false,
   searchPlaceholder: "搜索选项",
+  menuMinWidth: 152,
 });
 
 const emit = defineEmits<{
@@ -32,6 +34,7 @@ const emit = defineEmits<{
 
 const triggerRef = ref<HTMLButtonElement | null>(null);
 const menuRef = ref<HTMLElement | null>(null);
+const headerRef = ref<HTMLElement | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
 const isOpen = ref(false);
 const focusedIndex = ref(-1);
@@ -95,11 +98,12 @@ function positionMenu() {
   const viewportHeight = window.innerHeight;
   const targetWidth = props.variant === "wide"
     ? triggerRect.width
-    : Math.max(triggerRect.width, 152);
+    : Math.max(triggerRect.width, props.menuMinWidth);
   const width = Math.min(targetWidth, viewportWidth - edge * 2);
   const searchHeight = props.searchable ? 51 : 0;
+  const headerHeight = headerRef.value?.getBoundingClientRect().height || 0;
   const desiredHeight = Math.min(
-    Math.max(props.searchable ? 100 : 46, visibleOptions.value.length * 38 + 10 + searchHeight),
+    Math.max(props.searchable ? 100 : 46, visibleOptions.value.length * 38 + 10 + searchHeight + headerHeight),
     props.searchable ? 360 : 320,
   );
   const spaceBelow = viewportHeight - triggerRect.bottom - gap - edge;
@@ -138,6 +142,11 @@ function removePositionListeners() {
   window.removeEventListener("scroll", positionMenu, true);
 }
 
+function onBeforeToggle(event: Event) {
+  isOpen.value = (event as ToggleEvent).newState === "open";
+  if (isOpen.value) positionMenu();
+}
+
 function onToggle(event: Event) {
   const nextState = (event as Event & { newState?: string }).newState;
   isOpen.value = nextState === "open";
@@ -152,6 +161,7 @@ function onToggle(event: Event) {
   void nextTick(() => {
     positionMenu();
     requestAnimationFrame(() => {
+      if (!isOpen.value || headerRef.value?.contains(document.activeElement)) return;
       if (props.searchable && focusSearchOnOpen.value) focusSearch();
       else focusOption(focusedIndex.value);
     });
@@ -169,6 +179,7 @@ function showMenu(preferredIndex = selectedIndex(), preferSearch = props.searcha
   }
   focusedIndex.value = preferredIndex;
   void nextTick(() => {
+    if (headerRef.value?.contains(document.activeElement)) return;
     if (props.searchable && preferSearch) focusSearch();
     else focusOption(preferredIndex);
   });
@@ -180,14 +191,6 @@ function closeMenu(restoreFocus = true) {
   isOpen.value = false;
   searchQuery.value = "";
   if (restoreFocus) void nextTick(() => triggerRef.value?.focus({ preventScroll: true }));
-}
-
-function toggleMenu() {
-  if (menuRef.value?.matches(":popover-open")) {
-    closeMenu();
-    return;
-  }
-  showMenu();
 }
 
 function selectOption(option: ComposerSelectOption) {
@@ -272,13 +275,14 @@ onBeforeUnmount(() => {
       :aria-controls="popoverId"
       :aria-expanded="isOpen"
       :disabled="disabled"
+      :popovertarget="popoverId"
       aria-haspopup="listbox"
       data-slot="select-trigger"
-      @click="toggleMenu"
+      @click="focusSearchOnOpen = searchable"
       @keydown="onTriggerKeydown"
     >
       <span v-if="label" class="composer-select__label">{{ label }}</span>
-      <span class="composer-select__value">{{ selectedOption?.label || "请选择" }}</span>
+      <span class="composer-select__value"><slot name="value" :option="selectedOption">{{ selectedOption?.label || "请选择" }}</slot></span>
       <ChevronDown class="composer-select__chevron" aria-hidden="true" />
     </button>
 
@@ -289,9 +293,11 @@ onBeforeUnmount(() => {
       :data-placement="placement"
       :style="menuStyle"
       popover="auto"
+      @beforetoggle="onBeforeToggle"
       @toggle="onToggle"
       @keydown="onMenuKeydown"
     >
+      <div v-if="$slots.header" ref="headerRef" class="composer-select__header"><slot name="header" /></div>
       <div v-if="searchable" class="composer-select__search-wrap">
         <Search class="composer-select__search-icon" aria-hidden="true" />
         <input
@@ -331,7 +337,7 @@ onBeforeUnmount(() => {
           @click="selectOption(option)"
           @focus="focusedIndex = index"
         >
-          <span>{{ option.label }}</span>
+          <span><slot name="option" :option="option">{{ option.label }}</slot></span>
           <Check v-if="option.value === modelValue" class="composer-select__check" aria-hidden="true" />
         </button>
         <div v-if="!visibleOptions.length" class="composer-select__empty" role="status">
@@ -433,13 +439,22 @@ onBeforeUnmount(() => {
   box-shadow: 0 6px 8px rgb(15 23 42 / 0.1);
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-4px) scale(0.985);
+  transform: translateY(-8px) scale(0.985);
   transform-origin: top center;
   transition:
-    opacity 150ms cubic-bezier(0.22, 1, 0.36, 1),
-    transform 150ms cubic-bezier(0.22, 1, 0.36, 1),
-    overlay 150ms allow-discrete,
-    display 150ms allow-discrete;
+    opacity 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    overlay 180ms allow-discrete,
+    display 180ms allow-discrete;
+}
+
+.composer-select__header {
+  flex: none;
+  min-width: 0;
+}
+
+.composer-select__menu:not(:popover-open) {
+  display: none;
 }
 
 .composer-select__search-wrap {
@@ -535,7 +550,7 @@ onBeforeUnmount(() => {
 }
 
 .composer-select__menu[data-placement="top"] {
-  transform: translateY(4px) scale(0.985);
+  transform: translateY(8px) scale(0.985);
   transform-origin: bottom center;
 }
 
@@ -548,11 +563,11 @@ onBeforeUnmount(() => {
 @starting-style {
   .composer-select__menu:popover-open {
     opacity: 0;
-    transform: translateY(-4px) scale(0.985);
+    transform: translateY(-8px) scale(0.985);
   }
 
   .composer-select__menu[data-placement="top"]:popover-open {
-    transform: translateY(4px) scale(0.985);
+    transform: translateY(8px) scale(0.985);
   }
 }
 
@@ -714,10 +729,6 @@ onBeforeUnmount(() => {
   color: var(--foreground);
   transform: none;
   transition: opacity 120ms ease-out, overlay 120ms allow-discrete, display 120ms allow-discrete;
-}
-
-.composer-select--field .composer-select__menu:not(:popover-open) {
-  display: none;
 }
 
 .composer-select--field .composer-select__option {

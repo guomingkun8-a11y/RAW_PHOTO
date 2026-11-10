@@ -19,6 +19,7 @@ import {
   type SubjectMutationPolicy,
 } from "@/lib/api";
 import { storageName } from "@/lib/storage-namespace";
+import { isImage26Model, normalizeImage26Options, type Image26Options } from "@/lib/image-model-parameters";
 import { getStoredAuthKey, getStoredAuthSession } from "@/stores/auth";
 
 export type { ImageConversationCursor } from "@/lib/api";
@@ -72,6 +73,7 @@ export type StoredImage = {
   progress?: string;
   b64_json?: string;
   url?: string;
+  mimeType?: string;
   revised_prompt?: string;
   error?: string;
   startTime?: number;
@@ -136,6 +138,7 @@ export type ImageTurn = {
   ratio: string;
   tier: string;
   quality: string;
+  imageOptions?: Image26Options;
   productId?: number;
   templateId?: number;
   images: StoredImage[];
@@ -232,6 +235,7 @@ function normalizeStoredImage(image: StoredImage): StoredImage {
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
     url: typeof image.url === "string" && image.url ? image.url : undefined,
+    mimeType: typeof image.mimeType === "string" && image.mimeType ? image.mimeType : undefined,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
     startTime: typeof image.startTime === "number" ? image.startTime : undefined,
     elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
@@ -469,6 +473,7 @@ function normalizeTurn(turn: ImageTurn & Record<string, unknown>): ImageTurn {
     ratio: typeof turn.ratio === "string" && turn.ratio ? turn.ratio : "1:1",
     tier: typeof turn.tier === "string" && turn.tier ? turn.tier : "1k",
     quality: typeof turn.quality === "string" && turn.quality ? turn.quality : "auto",
+    imageOptions: isImage26Model(turn.model) ? normalizeImage26Options(turn.imageOptions) : undefined,
     productId: Number(turn.productId || 0) > 0 ? Number(turn.productId) : undefined,
     templateId: Number(turn.templateId || 0) > 0 ? Number(turn.templateId) : undefined,
     images: normalizedImages,

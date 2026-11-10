@@ -31,6 +31,7 @@ import {
 } from '@/lib/api';
 import { HttpRequestError } from '@/lib/request';
 import { BUILTIN_IMAGE_MODELS } from '@/lib/image-models';
+import { image26Quality, image26Ratio, isImage26Model, normalizeImage26Options } from '@/lib/image-model-parameters';
 import {
   videoFrameRole,
   videoModelMediaSpec,
@@ -1285,6 +1286,13 @@ function updateCanvasNode(
   const node = nodeById.value.get(nodeId);
   if (!node) return;
   Object.assign(node, { [payload.key]: payload.value });
+  if (node.type === 'image' && payload.key === 'model') {
+    if (isImage26Model(node.model)) {
+      node.aspectRatio = image26Ratio(node.aspectRatio);
+      node.quality = image26Quality(node.model, node.quality);
+      node.imageOptions = normalizeImage26Options(node.imageOptions);
+    } else if (['xhigh', 'max'].includes(node.quality)) node.quality = 'auto';
+  }
   scheduleCanvasHistoryCommit();
 }
 
@@ -2138,7 +2146,7 @@ async function downloadNodeImages(nodeId: string) {
   const count = node.resultUrls?.filter(Boolean).length || (node.resultUrl ? 1 : node.imageCount);
   downloadingNodeId.value = node.id;
   try {
-    await downloadCanvasImages(node.taskId, count);
+    await downloadCanvasImages(node.taskId, count, node.imageOptions?.outputFormat || "png");
     showToast('图片下载已开始。');
   } catch (error) {
     showToast(messageFrom(error));
@@ -2153,7 +2161,7 @@ async function downloadNodeImage(nodeId: string, imageIndex: number) {
   const key = `${node.id}:${imageIndex}`;
   downloadingImageKey.value = key;
   try {
-    await downloadCanvasImage(node.taskId, imageIndex);
+    await downloadCanvasImage(node.taskId, imageIndex, node.imageOptions?.outputFormat || "png");
     showToast(`第 ${imageIndex + 1} 张图片下载已开始。`);
   } catch (error) {
     showToast(messageFrom(error));
@@ -2196,6 +2204,10 @@ async function generateNode(nodeId: string) {
     : selectedVideoSpec?.id || '';
   if (!model) {
     node.error = node.type === 'video' ? '当前模式没有可用的视频模型。' : '当前没有可用的图片模型。';
+    return;
+  }
+  if (node.type === 'image' && isImage26Model(model) && usableReferences.imageUrls.length > 16) {
+    node.error = 'gpt-image-2.6 最多支持 16 张参考图，请移除多余引用。';
     return;
   }
   if (node.type === 'video' && selectedVideoSpec) {
@@ -2292,6 +2304,7 @@ async function generateNode(nodeId: string) {
         model,
         aspectRatio: node.aspectRatio,
         imageSize: node.imageSize,
+        imageOptions: node.imageOptions,
         quality: node.quality,
         thinkingLevel: node.thinkingLevel,
         imageCount: node.imageCount,
@@ -2426,9 +2439,10 @@ function normalizeCanvasNode(node: CanvasNodeModel): CanvasNodeModel {
   return {
     ...node,
     model: imageModel,
-    aspectRatio: node.aspectRatio || '1:1',
+    aspectRatio: node.type === 'image' && isImage26Model(imageModel) ? image26Ratio(node.aspectRatio || 'auto') : node.aspectRatio || '1:1',
     imageSize: node.imageSize || legacyImageSize(legacy.resolution),
-    quality: node.quality || 'auto',
+    quality: node.type === 'image' ? image26Quality(imageModel, node.quality || 'auto') : node.quality || 'auto',
+    imageOptions: node.type === 'image' && isImage26Model(imageModel) ? normalizeImage26Options(node.imageOptions) : node.imageOptions,
     thinkingLevel: node.thinkingLevel || 'minimal',
     imageCount,
     resultUrls,

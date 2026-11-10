@@ -1,5 +1,5 @@
 import {
-  Activity, AudioLines, History, Library, PanelsTopLeft, ReceiptText,
+  Activity, AudioLines, Bot, History, Library, PanelsTopLeft, ReceiptText,
   Sparkles, Users, Video, WandSparkles,
 } from "@lucide/vue";
 import { ref, type Component } from "vue";
@@ -19,6 +19,8 @@ export type NavDefinition = {
 
 export const navItems: NavDefinition[] = [
   { id: "image", href: "/image", label: "图片生成", detail: "AI 创作台", icon: WandSparkles },
+  { id: "dsh-agent", href: "/ai-agent", label: "AI 智能体", detail: "DeepSeek Harness", icon: Bot },
+  { id: "dsh-agent-monitoring", href: "/ai-agent/monitoring", label: "智能体监控", detail: "对话与 Token 用量", icon: Activity, adminOnly: true },
   { id: "video-generation", href: "/video-generation", label: "视频生成", detail: "文生视频 / 图生视频", icon: Video },
   { id: "audio-generation", href: "/audio-generation", label: "音频生成", detail: "音频创作", icon: AudioLines },
   { id: "infinite-canvas", href: "/infinite-canvas", label: "无限画布", detail: "图片与视频生成", icon: PanelsTopLeft },
@@ -32,6 +34,7 @@ export const navItems: NavDefinition[] = [
 
 export type NavigationItem = { id: string; visible: boolean };
 export const navigationLayout = ref<NavigationItem[]>(navItems.map(({ id }) => ({ id, visible: true })));
+export const dshAgentEnabled = ref(false);
 
 export function applyNavigationLayout(items: NavigationItem[]) {
   const byId = new Map(items.map((item) => [item.id, item]));
@@ -45,6 +48,12 @@ export async function fetchNavigationLayout() {
   const result = await httpRequest<{ items: NavigationItem[] }>("/api/navigation");
   applyNavigationLayout(result.items);
   return result.items;
+}
+
+export async function fetchDshAgentStatus() {
+  const result = await httpRequest<{ enabled: boolean }>("/api/dsh-agent/status");
+  dshAgentEnabled.value = Boolean(result.enabled);
+  return result;
 }
 
 export async function saveNavigationLayout(items: NavigationItem[]) {

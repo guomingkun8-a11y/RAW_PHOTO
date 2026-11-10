@@ -1,0 +1,73 @@
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: subprocess
+  disabled: true
+- id: pty
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: llm-deepseek
+  config:
+    models:
+      - id: tt-5.6-sol
+        name: GPT 5.6 Sol
+        inputModalities: [text, image]
+        contextWindow: !!js Number(process.env.DSH_AGENT_CONTEXT_WINDOW)
+        maxTokens: 8192
+- id: compaction-basic
+  config:
+    auto: true
+    thresholdRatio: 0.8
+    headroomTokens: 8192
+    retainRatio: 0.16
+    maxTokens: 4096
+    compactionRetries: 1
+    maxOverflowRetries: 1
+- insert:
+    - id: raw-photo-context
+      name: ./context-meter.mjs
+    - id: raw-photo-image-tools
+      name: ./image-tools.mjs
+    - id: llm-pi-ai
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers: !!js JSON.parse(process.env.DSH_AGENT_RELAY_PROVIDERS || '{}')
+    - id: web
+      name: '@deepseek-ai/dsh-web'
+      config:
+        searchProvider: deepseek-search-api
+        fetchProvider: http
+    - id: web-deepseek-api
+      name: '@deepseek-ai/dsh-web-deepseek-api'
+      config:
+        count: 5
+        searchBaseURL: !!js process.env.DSH_AGENT_SEARCH_BASE_URL
+        searchApiKeyEnv: DSH_AGENT_SEARCH_API_KEY
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+      config:
+        timeoutMs: 15000
+        maxResponseBytes: 2000000
+        maxBodyChars: 50000
+    - id: tool-web
+      name: '@deepseek-ai/dsh-tool-web'
+      config:
+        search: true
+        fetch: true
+        searchMaxResults: 5
+        searchMaxQueries: 2
+        searchTimeoutMs: 15000
+        fetchTimeoutMs: 15000
+        fetchMaxOutputChars: 20000
+    - id: session-checkpoint-policy
+      name: '@deepseek-ai/dsh-session-checkpoint-policy'
